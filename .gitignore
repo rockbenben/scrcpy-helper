@@ -1,0 +1,20 @@
+# 用户运行时生成的设置
+投屏助手-设置.json
+settings.json
+
+# scrcpy 官方二进制 —— 不入库，发布时再放进 Release zip
+scrcpy.exe
+adb.exe
+scrcpy-server
+*.dll
+open_a_terminal_here.bat
+scrcpy-noconsole.vbs
+disconnected.png
+scrcpy.png
+
+# 打包产物
+*.zip
+
+# 系统杂项
+Thumbs.db
+.DS_Store

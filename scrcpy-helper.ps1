@@ -1,0 +1,687 @@
+﻿# scrcpy 投屏助手（图形界面）
+# 由「投屏助手-双击运行.bat」启动，无需手动运行本文件。
+
+Set-Location -LiteralPath $PSScriptRoot
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName Microsoft.VisualBasic
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+# 配色（墨 + 素纸 + 朱砂印：素纸灰打底护眼，墨黑主操作，红仅作印章点缀）
+$cPaper   = [System.Drawing.Color]::FromArgb(236, 232, 225)   # 素纸灰（暖而不黄，比白柔和）
+$cInk     = [System.Drawing.Color]::FromArgb(43, 41, 38)      # 墨黑·主操作按钮/标题
+$cInkDark = [System.Drawing.Color]::FromArgb(70, 66, 61)      # 主按钮悬停
+$cMuted   = [System.Drawing.Color]::FromArgb(140, 136, 127)   # 次要文字
+$cRed     = [System.Drawing.Color]::FromArgb(167, 43, 42)     # 朱砂印（仅标题竖条）
+$cRedDark = [System.Drawing.Color]::FromArgb(138, 33, 33)
+$cLine    = [System.Drawing.Color]::FromArgb(217, 212, 203)   # 发丝线 / 描边
+$cGreen   = [System.Drawing.Color]::FromArgb(47, 129, 88)     # 已连接
+$cGreenBg = [System.Drawing.Color]::FromArgb(220, 231, 223)
+$cTagBg   = [System.Drawing.Color]::FromArgb(226, 221, 212)   # 未连接药丸
+$cWhite   = [System.Drawing.Color]::FromArgb(252, 251, 249)   # 卡片软白（次要按钮 / 输入）
+$cHover   = [System.Drawing.Color]::FromArgb(243, 240, 234)   # 次要按钮悬停
+
+$exe = Join-Path $PSScriptRoot 'scrcpy.exe'
+$adb = Join-Path $PSScriptRoot 'adb.exe'
+$cfgPath = Join-Path $PSScriptRoot '投屏助手-设置.json'
+$scrcpyProcs = New-Object System.Collections.ArrayList   # 记录本助手启动的所有 scrcpy 进程，关助手时一并停止
+
+if (-not (Test-Path -LiteralPath $exe)) {
+    [System.Windows.Forms.MessageBox]::Show('没找到 scrcpy.exe，请把本程序和 scrcpy.exe 放在同一个文件夹里。', 'scrcpy 投屏助手') | Out-Null
+    return
+}
+
+# 「独立窗口」可一键打开的常见 App（名称 => 包名）
+$apps = [ordered]@{
+    '微信'     = 'com.tencent.mm'
+    'QQ'       = 'com.tencent.mobileqq'
+    '抖音'     = 'com.ss.android.ugc.aweme'
+    '哔哩哔哩' = 'tv.danmaku.bili'
+    '小红书'   = 'com.xingin.xhs'
+    '淘宝'     = 'com.taobao.taobao'
+    '拼多多'   = 'com.xunmeng.pinduoduo'
+}
+
+# ---------------- 设置（在界面里改，自动记忆到 投屏助手-设置.json） ----------------
+$defaults = @{
+    # 画面
+    maxSize = 1496; maxFps = 0; bitRate = 0; videoCodec = ''
+    # 声音
+    audioOn = $true; audioSource = ''; audioCodec = ''
+    # 控制
+    keyboard = ''; mouse = ''; gamepad = $false; noControl = $false
+    screenOff = $false; stayAwake = $true; showTouches = $false
+    # 窗口
+    fullscreen = $false; onTop = $false; borderless = $false
+    # 独立窗口
+    ndSize = ''; ndDpi = ''; ndNoDecor = $false
+    # 录制
+    recFormat = 'mp4'; recTimeLimit = 0; recBackground = $false
+    # 通用
+    liveStatus = $true; autoReconnect = $false; disconnectOnClose = $false; extraArgs = ''; lastWirelessAddr = ''
+}
+$settings = @{}
+foreach ($k in $defaults.Keys) { $settings[$k] = $defaults[$k] }
+
+function Load-Settings {
+    if (-not (Test-Path -LiteralPath $cfgPath)) { return }
+    try {
+        $j = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($k in @($settings.Keys)) {
+            if ($null -ne $j.$k) {
+                if ($settings[$k] -is [bool]) { $settings[$k] = [bool]$j.$k }
+                elseif ($settings[$k] -is [int]) { $settings[$k] = [int]$j.$k }
+                else { $settings[$k] = [string]$j.$k }
+            }
+        }
+    } catch { }
+}
+
+function Save-Settings {
+    try { ($settings | ConvertTo-Json) | Set-Content -LiteralPath $cfgPath -Encoding UTF8 } catch { }
+}
+
+Load-Settings
+
+# ---------------- 参数拼接 ----------------
+function Get-VideoArgs {
+    $a = @()
+    if ([int]$settings.maxSize -gt 0) { $a += @('-m', "$($settings.maxSize)") }
+    if ([int]$settings.maxFps  -gt 0) { $a += "--max-fps=$($settings.maxFps)" }
+    if ([int]$settings.bitRate -gt 0) { $a += "--video-bit-rate=$($settings.bitRate)M" }
+    if ($settings.videoCodec)         { $a += "--video-codec=$($settings.videoCodec)" }
+    return $a
+}
+function Get-AudioArgs {
+    if (-not $settings.audioOn) { return @('--no-audio') }
+    $a = @()
+    if ($settings.audioSource) { $a += "--audio-source=$($settings.audioSource)" }
+    if ($settings.audioCodec)  { $a += "--audio-codec=$($settings.audioCodec)" }
+    return $a
+}
+function Get-ControlArgs {
+    param([bool]$Wireless)
+    $a = @()
+    if ($settings.keyboard)    { $a += "--keyboard=$($settings.keyboard)" }
+    if ($settings.mouse)       { $a += "--mouse=$($settings.mouse)" }
+    if ($settings.gamepad)     { $a += '--gamepad=uhid' }
+    if ($settings.noControl)   { $a += '--no-control' }
+    if ($settings.screenOff)   { $a += '--turn-screen-off' }
+    if ($settings.showTouches) { $a += '--show-touches' }
+    if ($settings.stayAwake)   { $a += $(if ($Wireless) { '--keep-active' } else { '-w' }) }
+    return $a
+}
+function Get-WindowArgs {
+    $a = @()
+    if ($settings.fullscreen) { $a += '-f' }
+    if ($settings.onTop)      { $a += '--always-on-top' }
+    if ($settings.borderless) { $a += '--window-borderless' }
+    return $a
+}
+function Get-MirrorArgs {
+    param([bool]$Wireless)
+    return (Get-VideoArgs) + (Get-AudioArgs) + (Get-ControlArgs -Wireless:$Wireless) + (Get-WindowArgs)
+}
+function Get-NewDisplayArgs {
+    $sz = $settings.ndSize; $dpi = $settings.ndDpi
+    $nd = if ($sz -and $dpi) { "--new-display=$sz/$dpi" } elseif ($sz) { "--new-display=$sz" } elseif ($dpi) { "--new-display=/$dpi" } else { '--new-display' }
+    $a = @($nd, '--flex-display')
+    if ($settings.ndNoDecor) { $a += '--no-vd-system-decorations' }
+    return $a
+}
+
+# 启动 scrcpy（不阻塞界面；自动过滤空参数）
+function Start-Scrcpy {
+    param([string[]]$Options, [switch]$Recording)
+    $extra = @(); if ($settings.extraArgs) { $extra = @($settings.extraArgs -split '\s+' | Where-Object { $_ }) }
+    $clean = @(($Options + $extra) | Where-Object { $_ -ne '' -and $null -ne $_ })
+    $p = if ($clean.Count -gt 0) { Start-Process -FilePath $exe -ArgumentList $clean -WorkingDirectory $PSScriptRoot -PassThru }
+    else { Start-Process -FilePath $exe -WorkingDirectory $PSScriptRoot -PassThru }
+    if ($p) { [void]$scrcpyProcs.Add([pscustomobject]@{ Proc = $p; Rec = [bool]$Recording }) }
+}
+
+# 是否有正在进行的录屏（关助手时据此决定要不要提醒）
+function Test-Recording {
+    foreach ($it in @($scrcpyProcs)) {
+        if ($it.Rec -and $it.Proc -and -not $it.Proc.HasExited) { return $true }
+    }
+    return $false
+}
+# 停止本助手启动的所有投屏：先优雅关闭（让录屏正常收尾、不损坏文件），关不掉再兜底强杀
+function Stop-AllScrcpy {
+    foreach ($it in @($scrcpyProcs)) {
+        try { if ($it.Proc -and -not $it.Proc.HasExited) { [void]$it.Proc.CloseMainWindow() } } catch {}
+    }
+    Start-Sleep -Milliseconds 500
+    foreach ($it in @($scrcpyProcs)) {
+        try { if ($it.Proc -and -not $it.Proc.HasExited) { $it.Proc.Kill() } } catch {}
+    }
+    $scrcpyProcs.Clear()
+}
+
+# 读取已连接设备序列号列表（state=device）
+function Get-DeviceList {
+    try {
+        $out = & $adb devices 2>$null
+        $lines = $out | Select-Object -Skip 1 | Where-Object { $_ -match "`tdevice$" }
+        return @($lines | ForEach-Object { ($_ -split "`t")[0] })
+    } catch { return @() }
+}
+# 是否为无线地址（ip:port）
+function Test-Wireless { param($s) return ($s -match '^\d{1,3}(\.\d{1,3}){3}:') }
+
+# 小工具：建标签
+function New-Lbl {
+    param($text, $x, $y)
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $text; $l.AutoSize = $true; $l.Location = New-Object System.Drawing.Point($x, $y)
+    return $l
+}
+# 小工具：建下拉（DropDownList），按当前值预选
+function New-Combo {
+    param($labels, $values, $current, $x, $y, $w)
+    $c = New-Object System.Windows.Forms.ComboBox
+    $c.DropDownStyle = 'DropDownList'
+    $c.Location = New-Object System.Drawing.Point($x, $y)
+    $c.Size = New-Object System.Drawing.Size($w, 26)
+    $labels | ForEach-Object { [void]$c.Items.Add($_) }
+    $i = [array]::IndexOf($values, $current); if ($i -lt 0) { $i = 0 }
+    $c.SelectedIndex = $i
+    $c | Add-Member -NotePropertyName Vals -NotePropertyValue $values
+    return $c
+}
+function New-Nud {
+    param($val, $min, $max, $step, $x, $y)
+    $n = New-Object System.Windows.Forms.NumericUpDown
+    $n.Minimum = $min; $n.Maximum = $max; $n.Increment = $step
+    $v = [int]$val; if ($v -lt $min) { $v = $min }; if ($v -gt $max) { $v = $max }
+    $n.Value = [decimal]$v
+    $n.Location = New-Object System.Drawing.Point($x, $y); $n.Size = New-Object System.Drawing.Size(90, 26)
+    return $n
+}
+function New-Chk {
+    param($text, $checked, $x, $y)
+    $c = New-Object System.Windows.Forms.CheckBox
+    $c.Text = $text; $c.Checked = [bool]$checked; $c.AutoSize = $true
+    $c.Location = New-Object System.Drawing.Point($x, $y)
+    return $c
+}
+# 主操作按钮（朱砂实心）
+function New-PrimaryBtn {
+    param($text, $x, $y, $w, $h, $fontSize = 13)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $text; $b.Location = New-Object System.Drawing.Point($x, $y); $b.Size = New-Object System.Drawing.Size($w, $h)
+    $b.FlatStyle = 'Flat'; $b.FlatAppearance.BorderSize = 0
+    $b.BackColor = $cInk; $b.ForeColor = $cWhite
+    $b.FlatAppearance.MouseOverBackColor = $cInkDark
+    $b.FlatAppearance.MouseDownBackColor = $cInkDark
+    $b.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', $fontSize, [System.Drawing.FontStyle]::Bold)
+    $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+    return $b
+}
+# 次要操作按钮（描边）
+function New-SecondaryBtn {
+    param($text, $x, $y, $w, $h)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $text; $b.Location = New-Object System.Drawing.Point($x, $y); $b.Size = New-Object System.Drawing.Size($w, $h)
+    $b.FlatStyle = 'Flat'; $b.FlatAppearance.BorderSize = 1; $b.FlatAppearance.BorderColor = $cLine
+    $b.BackColor = $cWhite; $b.ForeColor = $cInk
+    $b.FlatAppearance.MouseOverBackColor = $cHover
+    $b.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
+    $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+    return $b
+}
+# 文字链接按钮（设置/刷新）
+function New-LinkBtn {
+    param($text, $x, $y, $w)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $text; $b.Location = New-Object System.Drawing.Point($x, $y); $b.Size = New-Object System.Drawing.Size($w, 26)
+    $b.FlatStyle = 'Flat'; $b.FlatAppearance.BorderSize = 0
+    $b.BackColor = $cPaper; $b.ForeColor = $cMuted
+    $b.FlatAppearance.MouseOverBackColor = $cLine
+    $b.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
+    $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+    return $b
+}
+# 把控件裁成圆角（用于连接状态药丸）
+function Set-Rounded {
+    param($ctl, $radius)
+    $d = $radius * 2
+    $p = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $p.AddArc(0, 0, $d, $d, 180, 90)
+    $p.AddArc($ctl.Width - $d - 1, 0, $d, $d, 270, 90)
+    $p.AddArc($ctl.Width - $d - 1, $ctl.Height - $d - 1, $d, $d, 0, 90)
+    $p.AddArc(0, $ctl.Height - $d - 1, $d, $d, 90, 90)
+    $p.CloseAllFigures()
+    $ctl.Region = New-Object System.Drawing.Region($p)
+}
+
+# ---------------- 设置窗口（分页） ----------------
+function Show-Settings {
+    param($owner)
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = '设置'
+    $dlg.ClientSize = New-Object System.Drawing.Size(460, 352)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $dlg.Font = $owner.Font
+    $dlg.BackColor = $cPaper
+    $tt = New-Object System.Windows.Forms.ToolTip
+    $tt.AutoPopDelay = 12000
+
+    $tabs = New-Object System.Windows.Forms.TabControl
+    $tabs.Location = New-Object System.Drawing.Point(12, 12)
+    $tabs.Size = New-Object System.Drawing.Size(436, 282)
+
+    # ===== 常用（把最常用 / 最重要的几项聚合在第一页） =====
+    $tabCommon = New-Object System.Windows.Forms.TabPage; $tabCommon.Text = '常用'
+    $chkStay = New-Chk '保持手机唤醒（避免锁屏 / 无线中途断开）' $settings.stayAwake 14 16
+    $chkScreenOff = New-Chk '投屏时关闭手机屏幕（省电、防偷看）' $settings.screenOff 14 44
+    $chkReconnect = New-Chk '无线掉线后自动重连（断了自动连回来）' $settings.autoReconnect 14 72
+    $chkDisconnect = New-Chk '关闭助手时断开无线连接（默认保持，重开即用）' $settings.disconnectOnClose 14 100
+    $chkAudio = New-Chk '把手机声音也传到电脑' $settings.audioOn 14 128
+    $nudSize = New-Nud $settings.maxSize 0 4096 16 250 162
+    $tt.SetToolTip($chkStay, '保持手机不锁屏，避免无线投屏中途断开。想更省电可关掉，让手机自然休眠。')
+    $tt.SetToolTip($chkScreenOff, '投屏时关掉手机屏幕，明显省电、还能防偷看（投屏照常进行）。无线投屏想省电首选它。')
+    $tt.SetToolTip($chkReconnect, '记住最近一次的无线 IP，发现掉线就自动连回去，适合无线投屏中途断开。会略增耗电，按需开启。')
+    $tt.SetToolTip($chkDisconnect, '不勾（默认）：关掉助手后仍保持手机连接，重开即用、几乎不耗电。勾上：关助手时一并断开无线连接，重开需重新连（可能要再插一次线）。')
+    $tt.SetToolTip($chkAudio, '取消勾选则完全不传声音（等同 --no-audio）。')
+    $tt.SetToolTip($nudSize, '画面最大边长(像素)。数值越大越清晰、越小越流畅；0=原画不限制。')
+    $tabCommon.Controls.AddRange(@(
+        $chkStay, $chkScreenOff, $chkReconnect, $chkDisconnect, $chkAudio,
+        (New-Lbl '清晰度（越大越清晰，0=原画）' 14 165), $nudSize))
+
+    # ===== 画面 =====
+    $tabVideo = New-Object System.Windows.Forms.TabPage; $tabVideo.Text = '画面'
+    $nudFps  = New-Nud $settings.maxFps  0 240 5  250 16
+    $nudBit  = New-Nud $settings.bitRate 0 50  1  250 52
+    $cbVCodec = New-Combo @('默认（H.264，兼容最好）', 'H.265（更清晰）', 'AV1（更省流量）') @('', 'h265', 'av1') $settings.videoCodec 110 88 230
+    $tt.SetToolTip($nudFps, '每秒帧数上限。0=用默认；填 60 更顺滑、填 30 更省资源。')
+    $tt.SetToolTip($nudBit, '视频码率(Mbps)。越高越清晰越占带宽；0=用默认(约 8M)。无线卡顿可调小。')
+    $tt.SetToolTip($cbVCodec, 'H.265/AV1 同等清晰度更省带宽，但老机型/老电脑可能不支持，卡顿就换回 H.264。')
+    $tabVideo.Controls.AddRange(@(
+        (New-Lbl '帧率（越高越流畅，0=默认）' 14 19), $nudFps,
+        (New-Lbl '画质（越高越清晰，0=默认）' 14 55), $nudBit,
+        (New-Lbl '视频编码：' 14 91), $cbVCodec))
+
+    # ===== 声音 =====
+    $tabAudio = New-Object System.Windows.Forms.TabPage; $tabAudio.Text = '声音'
+    $cbASrc = New-Combo @('手机外放声音', '麦克风') @('', 'mic') $settings.audioSource 110 50 230
+    $cbACodec = New-Combo @('默认（Opus）', 'AAC（兼容）', 'FLAC（无损）', '原始 PCM') @('', 'aac', 'flac', 'raw') $settings.audioCodec 110 88 230
+    $lblAudioTip = New-Lbl '是否传声音，请到「常用」页开关。下面是进阶项：' 14 18; $lblAudioTip.ForeColor = $cMuted
+    $tt.SetToolTip($cbASrc, '“手机外放声音”把手机正在播放的声音传到电脑；“麦克风”采集手机话筒，适合当摄像头/直播。')
+    $tt.SetToolTip($cbACodec, '一般保持默认即可；个别播放器不出声时可改 AAC。')
+    $tabAudio.Controls.AddRange(@(
+        $lblAudioTip,
+        (New-Lbl '声音来源：' 14 53), $cbASrc,
+        (New-Lbl '音频编码：' 14 91), $cbACodec))
+
+    # ===== 控制 =====
+    $tabCtrl = New-Object System.Windows.Forms.TabPage; $tabCtrl.Text = '控制'
+    $cbKb = New-Combo @('默认（推荐，能打中文）', '游戏模式（更跟手，不能打中文）', 'USB 直连（特殊情况）') @('', 'uhid', 'aoa') $settings.keyboard 110 13 300
+    $cbMouse = New-Combo @('默认（推荐）', '游戏模式（更跟手）', 'USB 直连（特殊情况）') @('', 'uhid', 'aoa') $settings.mouse 110 49 300
+    $chkGamepad = New-Chk '启用手柄（把电脑手柄映射到手机）' $settings.gamepad 14 86
+    $chkNoCtrl = New-Chk '只投屏，不允许控制手机' $settings.noControl 14 114
+    $chkTouches = New-Chk '显示触摸点' $settings.showTouches 14 142
+    $tt.SetToolTip($cbKb, '绝大多数人选「默认」即可，能正常用中文输入法。「游戏模式」让电脑键盘像真键盘一样直接控制游戏，但用不了中文输入法。')
+    $tt.SetToolTip($chkGamepad, '把连在电脑上的游戏手柄映射给手机，适合手游。')
+    $tt.SetToolTip($chkNoCtrl, '只看画面、禁止鼠标键盘操作手机，适合演示/防误触。')
+    $tabCtrl.Controls.AddRange(@(
+        (New-Lbl '键盘模式：' 14 16), $cbKb,
+        (New-Lbl '鼠标模式：' 14 52), $cbMouse,
+        $chkGamepad, $chkNoCtrl, $chkTouches))
+
+    # ===== 窗口 =====
+    $tabWin = New-Object System.Windows.Forms.TabPage; $tabWin.Text = '窗口'
+    $chkFull = New-Chk '启动即全屏' $settings.fullscreen 14 18
+    $chkTop = New-Chk '窗口总在最前' $settings.onTop 14 50
+    $chkBorderless = New-Chk '无边框窗口' $settings.borderless 14 82
+    $tt.SetToolTip($chkTop, '投屏窗口始终浮在其它窗口上方，边看手机边操作电脑很方便。')
+    $tabWin.Controls.AddRange(@($chkFull, $chkTop, $chkBorderless))
+
+    # ===== 独立窗口 =====
+    $tabNd = New-Object System.Windows.Forms.TabPage; $tabNd.Text = '独立窗口'
+    $cbNdSize = New-Object System.Windows.Forms.ComboBox
+    $cbNdSize.DropDownStyle = 'DropDown'
+    $cbNdSize.Location = New-Object System.Drawing.Point(14, 42); $cbNdSize.Size = New-Object System.Drawing.Size(200, 26)
+    @('跟手机一致', '1280x720', '1600x900', '1920x1080') | ForEach-Object { [void]$cbNdSize.Items.Add($_) }
+    $cbNdSize.Text = if ($settings.ndSize) { $settings.ndSize } else { '跟手机一致' }
+    $cbNdDpi = New-Combo @('自动', '小', '中', '大') @('', '160', '240', '320') $settings.ndDpi 110 79 110
+    $chkNoDecor = New-Chk '隐藏虚拟屏的系统状态栏' $settings.ndNoDecor 14 116
+    $tt.SetToolTip($cbNdSize, '独立窗口（虚拟显示器）的分辨率。可直接输入自定义值，如 2560x1440。')
+    $tt.SetToolTip($cbNdDpi, '虚拟屏里界面元素的大小。手机 App 显示太大就选“小”。')
+    $tabNd.Controls.AddRange(@(
+        (New-Lbl '分辨率（可直接输入，如 2560x1440）：' 14 17), $cbNdSize,
+        (New-Lbl '界面缩放：' 14 82), $cbNdDpi,
+        $chkNoDecor))
+
+    # ===== 录制 =====
+    $tabRec = New-Object System.Windows.Forms.TabPage; $tabRec.Text = '录制'
+    $cbRecFmt = New-Combo @('mp4', 'mkv') @('mp4', 'mkv') $settings.recFormat 110 15 110
+    $nudTime = New-Nud $settings.recTimeLimit 0 86400 10 250 51
+    $chkRecBg = New-Chk '后台录制（不显示画面，更省资源）' $settings.recBackground 14 90
+    $tt.SetToolTip($nudTime, '到达该秒数自动停止录制。0=不限时，手动关窗即停。')
+    $tt.SetToolTip($chkRecBg, '勾选后录制时不弹出投屏窗口，画面只写入文件，更省 CPU。')
+    $tabRec.Controls.AddRange(@(
+        (New-Lbl '保存格式：' 14 18), $cbRecFmt,
+        (New-Lbl '录制时长上限（秒，0=不限）：' 14 54), $nudTime,
+        $chkRecBg))
+
+    # ===== 通用 =====
+    $tabGen = New-Object System.Windows.Forms.TabPage; $tabGen.Text = '通用'
+    $chkLive = New-Chk '自动刷新连接状态显示（只更新上方那行文字）' $settings.liveStatus 14 18
+    $txtExtra = New-Object System.Windows.Forms.TextBox
+    $txtExtra.Location = New-Object System.Drawing.Point(14, 78); $txtExtra.Size = New-Object System.Drawing.Size(406, 24)
+    $txtExtra.Text = $settings.extraArgs
+    $lblExHint = New-Lbl '例如：--crop=1080:1920:0:0   --angle=90   --display-id=1' 14 108; $lblExHint.ForeColor = $cMuted
+    $tt.SetToolTip($chkLive, '它只决定窗口顶部「已连接/未连接」多久自动更新一次，不影响投屏。开着时仅在窗口处于前台才每几秒刷一次；关掉后改为手动点「刷新」，更省资源。')
+    $tt.SetToolTip($txtExtra, '高级用法（看不懂就留空，不影响正常使用）：在这里追加 scrcpy 命令行参数，会拼到启动命令末尾，多个用空格分隔。例如 --crop=1080:1920:0:0（裁剪画面）、--angle=90（旋转）、--display-id=1（指定屏幕）。')
+    $tabGen.Controls.AddRange(@(
+        $chkLive,
+        (New-Lbl '高级·其它命令行参数（看不懂就留空，多个用空格隔开）：' 14 52), $txtExtra, $lblExHint))
+
+    $tabs.TabPages.AddRange(@($tabCommon, $tabVideo, $tabAudio, $tabCtrl, $tabWin, $tabNd, $tabRec, $tabGen))
+    foreach ($tp in $tabs.TabPages) { $tp.UseVisualStyleBackColor = $false; $tp.BackColor = $cPaper }
+    $dlg.Controls.Add($tabs)
+
+    $btnSave = New-PrimaryBtn '保存' 266 308 90 32 10
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = '取消'; $btnCancel.Size = New-Object System.Drawing.Size(90, 32); $btnCancel.Location = New-Object System.Drawing.Point(360, 308)
+    $btnCancel.Add_Click({ $dlg.Close() })
+    $btnSave.Add_Click({
+        $ndText = $cbNdSize.Text.Trim()
+        if ($ndText -and $ndText -ne '跟手机一致' -and $ndText -notmatch '^\d{3,4}x\d{3,4}$') {
+            [System.Windows.Forms.MessageBox]::Show('独立窗口分辨率格式应为 宽x高，例如 1920x1080。', '设置') | Out-Null
+            return
+        }
+        $settings.maxSize    = [int]$nudSize.Value
+        $settings.maxFps     = [int]$nudFps.Value
+        $settings.bitRate    = [int]$nudBit.Value
+        $settings.videoCodec = $cbVCodec.Vals[$cbVCodec.SelectedIndex]
+        $settings.audioOn    = $chkAudio.Checked
+        $settings.audioSource = $cbASrc.Vals[$cbASrc.SelectedIndex]
+        $settings.audioCodec = $cbACodec.Vals[$cbACodec.SelectedIndex]
+        $settings.keyboard   = $cbKb.Vals[$cbKb.SelectedIndex]
+        $settings.mouse      = $cbMouse.Vals[$cbMouse.SelectedIndex]
+        $settings.gamepad    = $chkGamepad.Checked
+        $settings.noControl  = $chkNoCtrl.Checked
+        $settings.screenOff  = $chkScreenOff.Checked
+        $settings.stayAwake  = $chkStay.Checked
+        $settings.showTouches = $chkTouches.Checked
+        $settings.fullscreen = $chkFull.Checked
+        $settings.onTop      = $chkTop.Checked
+        $settings.borderless = $chkBorderless.Checked
+        $settings.ndSize     = if ($ndText -eq '跟手机一致') { '' } else { $ndText }
+        $settings.ndDpi      = $cbNdDpi.Vals[$cbNdDpi.SelectedIndex]
+        $settings.ndNoDecor  = $chkNoDecor.Checked
+        $settings.recFormat  = $cbRecFmt.Vals[$cbRecFmt.SelectedIndex]
+        $settings.recTimeLimit = [int]$nudTime.Value
+        $settings.recBackground = $chkRecBg.Checked
+        $settings.liveStatus = $chkLive.Checked
+        $settings.autoReconnect = $chkReconnect.Checked
+        $settings.disconnectOnClose = $chkDisconnect.Checked
+        $settings.extraArgs  = $txtExtra.Text.Trim()
+        Save-Settings
+        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $dlg.Close()
+    })
+    $btnReset = New-Object System.Windows.Forms.Button
+    $btnReset.Text = '恢复默认'; $btnReset.Size = New-Object System.Drawing.Size(100, 32); $btnReset.Location = New-Object System.Drawing.Point(12, 308)
+    $btnReset.Add_Click({
+        if ([System.Windows.Forms.MessageBox]::Show('确定把所有设置恢复为默认值吗？', '恢复默认', 'YesNo', 'Warning') -eq 'Yes') {
+            foreach ($k in @($defaults.Keys)) { $settings[$k] = $defaults[$k] }
+            Save-Settings
+            $dlg.Close()
+            [System.Windows.Forms.MessageBox]::Show('已恢复默认设置。', '设置') | Out-Null
+        }
+    })
+    $dlg.Controls.AddRange(@($btnReset, $btnSave, $btnCancel))
+    $dlg.AcceptButton = $btnSave
+    [void]$dlg.ShowDialog($owner)
+}
+
+# ---------------- 独立窗口：选 App ----------------
+function Show-NewDisplay {
+    param($owner)
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = '独立窗口'; $dlg.ClientSize = New-Object System.Drawing.Size(320, 176)
+    $dlg.StartPosition = 'CenterParent'; $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false; $dlg.Font = $owner.Font
+    $dlg.BackColor = $cPaper
+
+    $l1 = New-Lbl '在电脑上单开一块屏，运行下面这个 App：' 18 18
+    $l2 = New-Lbl '（手机本身照常用，互不影响）' 18 42; $l2.ForeColor = $cMuted
+    $cb = New-Object System.Windows.Forms.ComboBox
+    $cb.DropDownStyle = 'DropDownList'; $cb.Location = New-Object System.Drawing.Point(18, 76); $cb.Size = New-Object System.Drawing.Size(284, 28)
+    foreach ($name in $apps.Keys) { [void]$cb.Items.Add($name) }
+    [void]$cb.Items.Add('其他…（手动输入名字或包名）')
+    $cb.SelectedIndex = 0
+
+    $btnGo = New-PrimaryBtn '打开' 18 120 284 38 11
+    $btnGo.Add_Click({ $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close() })
+    $dlg.Controls.AddRange(@($l1, $l2, $cb, $btnGo))
+    $dlg.AcceptButton = $btnGo
+    if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+        $sel = [string]$cb.SelectedItem
+        if ($sel -like '其他*') {
+            $name = [Microsoft.VisualBasic.Interaction]::InputBox("输入 App 名字（如 chrome）或完整包名（如微信 com.tencent.mm）。`n中文 App 建议用包名，更准确。", '独立窗口 - 打开 App', '')
+            if ([string]::IsNullOrWhiteSpace($name)) { return }
+            $name = $name.Trim()
+            $target = if ($name -match '\.') { "+$name" } else { "+?$name" }
+        } else { $target = '+' + $apps[$sel] }
+        Start-Scrcpy ((Get-NewDisplayArgs) + "--start-app=$target")
+    }
+}
+
+try {
+    # ---------------- 主窗口 ----------------
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'scrcpy 投屏助手'
+    $form.ClientSize = New-Object System.Drawing.Size(468, 306)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedSingle'
+    $form.MaximizeBox = $false
+    $form.BackColor = $cPaper
+    $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
+    $tt = New-Object System.Windows.Forms.ToolTip
+    $tt.AutoPopDelay = 12000
+
+    # 标题（左侧朱砂竖条，是全局唯一的品牌点缀）
+    $brand = New-Object System.Windows.Forms.Panel
+    $brand.Size = New-Object System.Drawing.Size(4, 30); $brand.Location = New-Object System.Drawing.Point(24, 19)
+    $brand.BackColor = $cRed
+    $form.Controls.Add($brand)
+    $lblTitle = New-Object System.Windows.Forms.Label
+    $lblTitle.Text = 'scrcpy 投屏助手'; $lblTitle.AutoSize = $true
+    $lblTitle.Location = New-Object System.Drawing.Point(38, 18)
+    $lblTitle.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 18, [System.Drawing.FontStyle]::Bold)
+    $lblTitle.ForeColor = $cInk
+    $form.Controls.Add($lblTitle)
+    $lblSub = New-Object System.Windows.Forms.Label
+    $lblSub.Text = '把安卓手机投到电脑，鼠标键盘随便用'; $lblSub.AutoSize = $true
+    $lblSub.Location = New-Object System.Drawing.Point(40, 56)
+    $lblSub.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
+    $lblSub.ForeColor = $cMuted
+    $form.Controls.Add($lblSub)
+
+    # 连接状态药丸（信号灯，右上角醒目）
+    $lblStatus = New-Object System.Windows.Forms.Label
+    $lblStatus.Size = New-Object System.Drawing.Size(124, 28)
+    $lblStatus.Location = New-Object System.Drawing.Point(320, 24)
+    $lblStatus.TextAlign = 'MiddleCenter'
+    $lblStatus.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $lblStatus.BackColor = $cTagBg; $lblStatus.ForeColor = $cMuted
+    $lblStatus.Text = '检测中…'
+    $form.Controls.Add($lblStatus)
+    Set-Rounded $lblStatus 13
+
+    # 分隔细线
+    $rule = New-Object System.Windows.Forms.Panel
+    $rule.Size = New-Object System.Drawing.Size(420, 1); $rule.Location = New-Object System.Drawing.Point(24, 84)
+    $rule.BackColor = $cLine
+    $form.Controls.Add($rule)
+
+    # 主操作（最常用，做大做显眼）
+    $btnWired = New-PrimaryBtn '有线投屏' 24 100 198 58
+    $btnWireless = New-PrimaryBtn '无线投屏' 246 100 198 58
+    $form.Controls.AddRange(@($btnWired, $btnWireless))
+    $capWired = New-Object System.Windows.Forms.Label
+    $capWired.Text = '数据线连接 · 最稳定'; $capWired.AutoSize = $true; $capWired.ForeColor = $cMuted
+    $capWired.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5); $capWired.Location = New-Object System.Drawing.Point(28, 162)
+    $capWireless = New-Object System.Windows.Forms.Label
+    $capWireless.Text = '免数据线 · 一次配置'; $capWireless.AutoSize = $true; $capWireless.ForeColor = $cMuted
+    $capWireless.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5); $capWireless.Location = New-Object System.Drawing.Point(250, 162)
+    $form.Controls.AddRange(@($capWired, $capWireless))
+
+    # 更多功能（次要操作）
+    $lblMore = New-Object System.Windows.Forms.Label
+    $lblMore.Text = '更多功能'; $lblMore.AutoSize = $true; $lblMore.ForeColor = $cMuted
+    $lblMore.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9); $lblMore.Location = New-Object System.Drawing.Point(24, 192)
+    $form.Controls.Add($lblMore)
+    $btnCamera = New-SecondaryBtn '手机当摄像头' 24 214 132 38
+    $btnRecord = New-SecondaryBtn '录制屏幕' 168 214 132 38
+    $btnNd = New-SecondaryBtn '独立窗口' 312 214 132 38
+    $form.Controls.AddRange(@($btnCamera, $btnRecord, $btnNd))
+
+    # 底部：提示 + 设置/刷新
+    $lblHint = New-Object System.Windows.Forms.Label
+    $lblHint.Text = '首次连接请在手机上点「允许 USB 调试」'; $lblHint.AutoSize = $true; $lblHint.ForeColor = $cMuted
+    $lblHint.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5); $lblHint.Location = New-Object System.Drawing.Point(24, 274)
+    $form.Controls.Add($lblHint)
+    $btnSettings = New-LinkBtn '设置' 322 270 56
+    $btnRefresh = New-LinkBtn '刷新' 384 270 56
+    $form.Controls.AddRange(@($btnSettings, $btnRefresh))
+
+    $tt.SetToolTip($btnWired, '用数据线连接，最稳定、延迟最低。')
+    $tt.SetToolTip($btnWireless, '不用线。已连手机时直接开始；首次会提示插一次线。')
+    $tt.SetToolTip($btnCamera, '把手机摄像头当电脑摄像头用（需 Android 12+）。')
+    $tt.SetToolTip($btnRecord, '把手机屏幕录制成视频文件。')
+    $tt.SetToolTip($btnNd, '在电脑上单开一块屏运行某个 App，不影响手机。')
+    $tt.SetToolTip($btnSettings, '画质、声音、控制、窗口、独立窗口、录制等都可在这里自定义。')
+    $tt.SetToolTip($btnRefresh, '立即重新检测手机连接状态。')
+
+    # ---------------- 行为 ----------------
+    $updateStatus = {
+        $devs = Get-DeviceList
+        # 掉线且开了自动重连：后台 adb connect 连回上次的无线地址（不阻塞界面，下次刷新生效）
+        if (-not $devs -and $settings.autoReconnect -and $settings.lastWirelessAddr) {
+            Start-Process -FilePath $adb -ArgumentList @('connect', $settings.lastWirelessAddr) -WindowStyle Hidden -WorkingDirectory $PSScriptRoot
+        }
+        if ($devs) {
+            $w = $devs | Where-Object { Test-Wireless $_ } | Select-Object -First 1
+            if ($w) {
+                if ($settings.lastWirelessAddr -ne $w) { $settings.lastWirelessAddr = $w; Save-Settings }
+                $type = '无线'
+            } else { $type = 'USB' }
+            $lblStatus.BackColor = $cGreenBg; $lblStatus.ForeColor = $cGreen
+            $lblStatus.Text = "● 已连接 $type"
+        } else {
+            $lblStatus.BackColor = $cTagBg; $lblStatus.ForeColor = $cMuted
+            $lblStatus.Text = '○ 未连接'
+        }
+    }
+    $btnRefresh.Add_Click($updateStatus)
+    $btnSettings.Add_Click({ Show-Settings $form })
+
+    $btnWired.Add_Click({ Start-Scrcpy (Get-MirrorArgs -Wireless:$false) })
+
+    $btnWireless.Add_Click({
+        $devs = Get-DeviceList
+        $wireless = $devs | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}:' } | Select-Object -First 1
+        $usb = $devs | Where-Object { $_ -notmatch '^\d{1,3}(\.\d{1,3}){3}:' } | Select-Object -First 1
+        if ($wireless) {
+            # 已是无线连接，直接投屏，不打扰
+            Start-Scrcpy (@('-s', $wireless) + (Get-MirrorArgs -Wireless:$true))
+        }
+        elseif ($usb) {
+            # 已用数据线连着，直接切到无线（连上后可拔线），无需提示
+            Start-Scrcpy (@('--tcpip') + (Get-MirrorArgs -Wireless:$true))
+        }
+        else {
+            # 没检测到设备：首次使用 / 连不上时，才给出引导
+            $msg = "没有检测到手机。请先用数据线把手机连上电脑，并点「允许 USB 调试」。`n`n连好后点「确定」，会自动切到无线（连上后即可拔掉数据线）。`n若手机重启过导致连不上，也请重新插线再点一次。"
+            if ([System.Windows.Forms.MessageBox]::Show($msg, '无线投屏', 'OKCancel', 'Information') -eq 'OK') {
+                Start-Scrcpy (@('--tcpip') + (Get-MirrorArgs -Wireless:$true))
+            }
+        }
+    })
+
+    $btnCamera.Add_Click({
+        $dlg = New-Object System.Windows.Forms.Form
+        $dlg.Text = '手机当摄像头'; $dlg.ClientSize = New-Object System.Drawing.Size(264, 232)
+        $dlg.StartPosition = 'CenterParent'; $dlg.FormBorderStyle = 'FixedDialog'
+        $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false; $dlg.Font = $form.Font; $dlg.BackColor = $cPaper
+
+        $gb1 = New-Object System.Windows.Forms.GroupBox
+        $gb1.Text = '摄像头'; $gb1.Location = '16,12'; $gb1.Size = '232,52'
+        $rbBack = New-Object System.Windows.Forms.RadioButton; $rbBack.Text = '后置'; $rbBack.Location = '16,20'; $rbBack.AutoSize = $true; $rbBack.Checked = $true
+        $rbFront = New-Object System.Windows.Forms.RadioButton; $rbFront.Text = '前置'; $rbFront.Location = '124,20'; $rbFront.AutoSize = $true
+        $gb1.Controls.AddRange(@($rbBack, $rbFront))
+
+        $gb2 = New-Object System.Windows.Forms.GroupBox
+        $gb2.Text = '画面方向'; $gb2.Location = '16,74'; $gb2.Size = '232,52'
+        $rbLand = New-Object System.Windows.Forms.RadioButton; $rbLand.Text = '横屏'; $rbLand.Location = '16,20'; $rbLand.AutoSize = $true; $rbLand.Checked = $true
+        $rbPort = New-Object System.Windows.Forms.RadioButton; $rbPort.Text = '竖屏'; $rbPort.Location = '124,20'; $rbPort.AutoSize = $true
+        $gb2.Controls.AddRange(@($rbLand, $rbPort))
+
+        $chkTorch = New-Chk '打开补光灯' $false 18 134
+        $chkMic = New-Chk '同时采集麦克风声音' $false 18 160
+
+        $btnGo = New-PrimaryBtn '开始' 16 190 232 32 11
+        $btnGo.Add_Click({ $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close() })
+
+        $dlg.Controls.AddRange(@($gb1, $gb2, $chkTorch, $chkMic, $btnGo))
+        $dlg.AcceptButton = $btnGo
+        if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+            $a = @('--video-source=camera', "--camera-facing=$(if($rbFront.Checked){'front'}else{'back'})", '--camera-size=1920x1080')
+            if ($rbPort.Checked) { $a += '--capture-orientation=90' }
+            if ($chkTorch.Checked) { $a += '--camera-torch' }
+            if ($chkMic.Checked) { $a += '--audio-source=mic' } else { $a += '--no-audio' }
+            Start-Scrcpy $a
+        }
+    })
+
+    $btnRecord.Add_Click({
+        $sfd = New-Object System.Windows.Forms.SaveFileDialog
+        $sfd.InitialDirectory = $PSScriptRoot
+        $sfd.FileName = "record.$($settings.recFormat)"
+        $sfd.Filter = 'MP4 视频|*.mp4|MKV 视频|*.mkv'
+        if ($sfd.ShowDialog($form) -eq 'OK') {
+            $a = @('-r', $sfd.FileName) + (Get-VideoArgs) + (Get-AudioArgs)
+            if ($settings.stayAwake) { $a += '-w' }
+            if ([int]$settings.recTimeLimit -gt 0) { $a += "--time-limit=$($settings.recTimeLimit)" }
+            if ($settings.recBackground) { $a += @('--no-window', '--no-playback') }
+            Start-Scrcpy $a -Recording
+            $tip = if ($settings.recBackground) { '已在后台开始录制（无画面）。' } else { '已开始录制。' }
+            [System.Windows.Forms.MessageBox]::Show($tip + '关掉投屏窗口或在原命令窗口按 Ctrl+C 即停止保存。', '录制屏幕') | Out-Null
+        }
+    })
+
+    $btnNd.Add_Click({ Show-NewDisplay $form })
+
+    # 设备状态轮询：仅在窗口处于前台时进行；最小化/失焦自动暂停，省电省资源
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 8000
+    $timer.Add_Tick($updateStatus)
+    $form.Add_Shown({ & $updateStatus; if ($settings.liveStatus -or $settings.autoReconnect) { $timer.Start() } })
+    $form.Add_Activated({ & $updateStatus; if ($settings.liveStatus -or $settings.autoReconnect) { $timer.Start() } else { $timer.Stop() } })
+    $form.Add_Deactivate({ $timer.Stop() })
+    # 关闭助手 = 停止它开过的所有投屏；正在录屏时先确认，避免误关丢录像
+    $form.Add_FormClosing({
+        param($formSender, $e)
+        if (Test-Recording) {
+            $r = [System.Windows.Forms.MessageBox]::Show("正在录屏。关闭助手会停止录制（已录部分会保存）。`n`n确定要关闭吗？`n（想继续录、只收起助手，请点最小化）", '正在录屏', 'YesNo', 'Warning')
+            if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { $e.Cancel = $true; return }
+        }
+        Stop-AllScrcpy
+        if ($settings.disconnectOnClose) { try { & $adb disconnect 2>$null | Out-Null } catch {} }
+    })
+    $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose() })
+
+    [void]$form.ShowDialog()
+}
+catch {
+    [System.Windows.Forms.MessageBox]::Show("启动出错：`n$($_.Exception.Message)", 'scrcpy 投屏助手') | Out-Null
+}
