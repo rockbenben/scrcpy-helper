@@ -8,6 +8,10 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName Microsoft.VisualBasic
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# scrcpy 4.0 的命令行输出是 UTF-8；Windows PowerShell 默认按系统 OEM 码页解码，会把中文
+# （如「更多应用」里 --list-apps 列出的 App 中文名）读成乱码。统一按 UTF-8 解码原生命令输出。
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+
 # 任务栏图标：把本进程标识成自己的 App，而不是跟着宿主 powershell.exe 走，
 # 否则任务栏按钮会沿用 PowerShell 的蓝色图标（标题栏图标由 $form.Icon 控制，不受影响）。
 try {
