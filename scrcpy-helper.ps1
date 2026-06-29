@@ -1386,11 +1386,11 @@ try {
     # 底部：提示（左） + 设备/快捷键/设置/刷新 链接 + GitHub 图标（右，归入「工具/关于」这组安静的次要入口）
     $lblHint = New-Caption '首次连接点「允许 USB 调试」' 28 338
     $form.Controls.Add($lblHint)
-    $btnDevices = New-LinkBtn '设备' 232 334 52
-    $btnShortcuts = New-LinkBtn '快捷键' 288 334 62
-    $btnSettings = New-LinkBtn '设置' 354 334 52
-    $btnRefresh = New-LinkBtn '刷新' 410 334 52
-    $form.Controls.AddRange(@($btnDevices, $btnShortcuts, $btnSettings, $btnRefresh))
+    # 不再放「刷新」：状态会在窗口重新获得焦点时自动重测，「设备」管理打开也会重新扫描
+    $btnDevices = New-LinkBtn '设备' 288 334 52
+    $btnShortcuts = New-LinkBtn '快捷键' 344 334 62
+    $btnSettings = New-LinkBtn '设置' 410 334 52
+    $form.Controls.AddRange(@($btnDevices, $btnShortcuts, $btnSettings))
 
     # GitHub 源码 / 反馈入口：用素纸灰描出的 GitHub 标记（透明底、与上面几个链接同色同高），点开仓库主页。
     # 图标以 base64 内嵌，打包不需附带图片文件。
@@ -1412,9 +1412,8 @@ try {
     $tt.SetToolTip($btnNd, '在电脑上单开一块屏运行某个 App，不影响手机（需 Android 11+）。')
     $tt.SetToolTip($btnShortcuts, 'scrcpy 常用快捷键速查（全屏、息屏、旋转、复制粘贴、拖文件装 APK 等）。')
     $tt.SetToolTip($btnSettings, '画质、声音、控制、窗口、独立窗口、录制等都可在这里自定义。')
-    $tt.SetToolTip($btnRefresh, '立即重新检测手机连接状态。')
     $tt.SetToolTip($btnDevices, '管理多台设备：切换、断开、设默认、忘记，或输入 IP 直连。')
-    $tt.SetToolTip($lblStatus, '点击管理设备：切换 / 断开 / 输入 IP 连接。')
+    $tt.SetToolTip($lblStatus, '点击管理设备：切换 / 断开 / 输入 IP 连接（状态会在切回窗口时自动刷新）。')
 
     # ---------------- 行为 ----------------
     $updateStatus = {
@@ -1440,7 +1439,6 @@ try {
             $lblDevInfo.Text = ''
         }
     }
-    $btnRefresh.Add_Click($updateStatus)
     $btnShortcuts.Add_Click({ Show-Shortcuts $form })
     $btnSettings.Add_Click({ Show-Settings $form })
     # 设备管理入口：底部「设备」链接 + 右上角状态药丸都可进；关掉后刷新一次状态
