@@ -40,6 +40,8 @@ $exe = Join-Path $PSScriptRoot 'scrcpy.exe'
 $adb = Join-Path $PSScriptRoot 'adb.exe'
 $cfgPath = Join-Path $PSScriptRoot '投屏助手-设置.json'
 $script:customApps = [ordered]@{}   # 用户自定义的常用 App（名称 => 包名），随设置一起存进 投屏助手-设置.json
+$script:knownDevices = [ordered]@{} # 记住的无线设备（地址 ip:port => 备注名），连接成功自动记下，供「设备管理」切换/重连
+$script:deviceNames  = [ordered]@{} # 用户自定义的设备显示名（序列号/地址 => 名称），优先于型号显示，可在「设备管理」里重命名
 $scrcpyProcs = New-Object System.Collections.ArrayList   # 记录本助手启动的所有 scrcpy 进程，关助手时一并停止
 
 if (-not (Test-Path -LiteralPath $exe)) {
@@ -65,6 +67,8 @@ $defaults = @{
     # 控制
     keyboard = ''; mouse = ''; gamepad = $false; noControl = $false
     screenOff = $false; stayAwake = $true; showTouches = $false; powerOffOnClose = $false
+    # 摄像头
+    camResMax = 1920
     # 窗口
     fullscreen = $false; onTop = $false; borderless = $false
     # 独立窗口
@@ -72,7 +76,7 @@ $defaults = @{
     # 录制
     recFormat = 'mp4'; recTimeLimit = 0; recBackground = $false
     # 通用
-    liveStatus = $true; autoReconnect = $false; disconnectOnClose = $false; extraArgs = ''; lastWirelessAddr = ''
+    liveStatus = $true; autoReconnect = $false; disconnectOnClose = $false; extraArgs = ''; lastWirelessAddr = ''; defaultDevice = ''
 }
 $settings = @{}
 foreach ($k in $defaults.Keys) { $settings[$k] = $defaults[$k] }
@@ -94,6 +98,18 @@ function Load-Settings {
                 if ($p.Name -and $p.Value) { $script:customApps[[string]$p.Name] = [string]$p.Value }
             }
         }
+        # 记住的无线设备同理：knownDevices 是「地址=>备注名」对象
+        if ($j.knownDevices) {
+            foreach ($p in $j.knownDevices.PSObject.Properties) {
+                if ($p.Name -and $p.Value) { $script:knownDevices[[string]$p.Name] = [string]$p.Value }
+            }
+        }
+        # 自定义显示名：deviceNames 是「序列号/地址=>名称」对象
+        if ($j.deviceNames) {
+            foreach ($p in $j.deviceNames.PSObject.Properties) {
+                if ($p.Name -and $p.Value) { $script:deviceNames[[string]$p.Name] = [string]$p.Value }
+            }
+        }
     } catch { }
 }
 
@@ -104,6 +120,12 @@ function Save-Settings {
         $ca = [ordered]@{}
         foreach ($k in $script:customApps.Keys) { $ca[$k] = $script:customApps[$k] }
         $o['customApps'] = $ca
+        $kd = [ordered]@{}
+        foreach ($k in $script:knownDevices.Keys) { $kd[$k] = $script:knownDevices[$k] }
+        $o['knownDevices'] = $kd
+        $dn = [ordered]@{}
+        foreach ($k in $script:deviceNames.Keys) { $dn[$k] = $script:deviceNames[$k] }
+        $o['deviceNames'] = $dn
         ($o | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $cfgPath -Encoding UTF8
     } catch { }
 }
@@ -164,9 +186,17 @@ function Start-Scrcpy {
     param([string[]]$Options, [switch]$Recording)
     $extra = @(); if ($settings.extraArgs) { $extra = @($settings.extraArgs -split '\s+' | Where-Object { $_ }) }
     $clean = @(($Options + $extra) | Where-Object { $_ -ne '' -and $null -ne $_ })
+    # 解析目标设备序列号（来自 -s），用于「投屏中」标记 / 「停止这台」，并据此给窗口起友好标题
+    $serial = ''
+    for ($i = 0; $i -lt $clean.Count - 1; $i++) { if ($clean[$i] -eq '-s') { $serial = $clean[$i + 1]; break } }
+    if ($serial -and -not @($clean | Where-Object { $_ -like '--window-title=*' }).Count) {
+        # 标题去空格（Windows PowerShell 的 Start-Process 数组传参对带空格的参数引号处理不可靠）
+        $title = (Get-FriendlyName $serial) -replace '\s+', '-'
+        if ($title) { $clean += "--window-title=$title" }
+    }
     $p = if ($clean.Count -gt 0) { Start-Process -FilePath $exe -ArgumentList $clean -WorkingDirectory $PSScriptRoot -PassThru }
     else { Start-Process -FilePath $exe -WorkingDirectory $PSScriptRoot -PassThru }
-    if ($p) { [void]$scrcpyProcs.Add([pscustomobject]@{ Proc = $p; Rec = [bool]$Recording }) }
+    if ($p) { [void]$scrcpyProcs.Add([pscustomobject]@{ Proc = $p; Rec = [bool]$Recording; Serial = $serial }) }
 }
 
 # 是否有正在进行的录屏（关助手时据此决定要不要提醒）
@@ -186,6 +216,28 @@ function Stop-AllScrcpy {
         try { if ($it.Proc -and -not $it.Proc.HasExited) { $it.Proc.Kill() } } catch {}
     }
     $scrcpyProcs.Clear()
+}
+# 当前正在投屏的设备序列号列表（进程还活着的）——「设备管理」据此标「▶ 投屏中」
+function Get-ActiveSerials {
+    $res = @()
+    foreach ($it in @($scrcpyProcs)) {
+        if ($it.Serial -and $it.Proc -and -not $it.Proc.HasExited) { $res += $it.Serial }
+    }
+    return $res
+}
+# 只停某一台设备的投屏（不影响其它台）：先优雅关窗，关不掉再强杀，最后清理该设备的已结束记录
+function Stop-DeviceScrcpy {
+    param($serial)
+    if (-not $serial) { return }
+    foreach ($it in @($scrcpyProcs)) {
+        if ($it.Serial -eq $serial -and $it.Proc -and -not $it.Proc.HasExited) { try { [void]$it.Proc.CloseMainWindow() } catch {} }
+    }
+    Start-Sleep -Milliseconds 300
+    foreach ($it in @($scrcpyProcs)) {
+        if ($it.Serial -eq $serial -and $it.Proc -and -not $it.Proc.HasExited) { try { $it.Proc.Kill() } catch {} }
+    }
+    $live = @($scrcpyProcs | Where-Object { $_.Serial -ne $serial -or ($_.Proc -and -not $_.Proc.HasExited) })
+    $scrcpyProcs.Clear(); foreach ($x in $live) { [void]$scrcpyProcs.Add($x) }
 }
 
 # 读取已连接设备序列号列表（state=device）
@@ -217,22 +269,7 @@ function Get-DevInfo {
     $script:devInfo[$serial] = $info
     return $info
 }
-# 当前（唯一）已连手机的安卓大版本号；没连/多设备/读不到都返回 0（=未知，不拦截）
-function Get-AndroidVer {
-    $devs = Get-DeviceList
-    if (-not $devs -or $devs.Count -ne 1) { return 0 }
-    return (Get-DevInfo $devs[0]).Ver
-}
-# 功能需要某安卓版本时，先做友好提示，省得用户点了没反应 / scrcpy 黑窗一闪。返回 $true=可继续
-function Test-AndroidVer {
-    param([int]$Need, [string]$Feature)
-    $ver = Get-AndroidVer
-    if ($ver -gt 0 -and $ver -lt $Need) {
-        [System.Windows.Forms.MessageBox]::Show("「$Feature」需要手机系统为 Android $Need 及以上。`n当前手机是 Android $ver，用不了这个功能。", $Feature) | Out-Null
-        return $false
-    }
-    return $true   # 版本够，或读不到版本（不拦截，交给 scrcpy 自行处理）
-}
+# 版本门控改为「按实际目标设备」检查，见下方 Resolve-TargetForFeature（要先有 Resolve-Target）。
 
 # 小工具：建标签
 function New-Lbl {
@@ -451,13 +488,13 @@ function New-Dialog {
 
 function Show-Settings {
     param($owner)
-    $dlg = New-Dialog '设置' 460 352 $owner
+    $dlg = New-Dialog '设置' 500 396 $owner
     $tt = New-Object System.Windows.Forms.ToolTip
     $tt.AutoPopDelay = 12000
 
     $tabs = New-Object System.Windows.Forms.TabControl
-    $tabs.Location = New-Object System.Drawing.Point(12, 12)
-    $tabs.Size = New-Object System.Drawing.Size(436, 282)
+    $tabs.Location = New-Object System.Drawing.Point(14, 14)
+    $tabs.Size = New-Object System.Drawing.Size(472, 320)
 
     # ===== 常用（把最常用 / 最重要的几项聚合在第一页） =====
     $tabCommon = New-Object System.Windows.Forms.TabPage; $tabCommon.Text = '常用'
@@ -580,9 +617,9 @@ function Show-Settings {
     foreach ($tp in $tabs.TabPages) { $tp.UseVisualStyleBackColor = $false; $tp.BackColor = $cPaper }
     $dlg.Controls.Add($tabs)
 
-    $btnSave = New-PrimaryBtn '保存' 266 308 90 32 10
+    $btnSave = New-PrimaryBtn '保存' 290 350 96 34 10
     $btnCancel = New-Object System.Windows.Forms.Button
-    $btnCancel.Text = '取消'; $btnCancel.Size = New-Object System.Drawing.Size(90, 32); $btnCancel.Location = New-Object System.Drawing.Point(360, 308)
+    $btnCancel.Text = '取消'; $btnCancel.Size = New-Object System.Drawing.Size(96, 34); $btnCancel.Location = New-Object System.Drawing.Point(392, 350)
     $btnCancel.Add_Click({ $dlg.Close() })
     $btnSave.Add_Click({
         $ndText = $cbNdSize.Text.Trim()
@@ -629,7 +666,7 @@ function Show-Settings {
         $dlg.Close()
     })
     $btnReset = New-Object System.Windows.Forms.Button
-    $btnReset.Text = '恢复默认'; $btnReset.Size = New-Object System.Drawing.Size(100, 32); $btnReset.Location = New-Object System.Drawing.Point(12, 308)
+    $btnReset.Text = '恢复默认'; $btnReset.Size = New-Object System.Drawing.Size(110, 34); $btnReset.Location = New-Object System.Drawing.Point(14, 350)
     $btnReset.Add_Click({
         if ([System.Windows.Forms.MessageBox]::Show('确定把所有设置恢复为默认值吗？', '恢复默认', 'YesNo', 'Warning') -eq 'Yes') {
             foreach ($k in @($defaults.Keys)) { $settings[$k] = $defaults[$k] }
@@ -743,7 +780,7 @@ function Show-ManageApps {
 
 # ---------------- 独立窗口：选 App ----------------
 function Show-NewDisplay {
-    param($owner)
+    param($owner, $serial)
     $dlg = New-Dialog '独立窗口' 320 176 $owner
 
     $l1 = New-Lbl '在电脑上单开一块屏，运行下面这个 App：' 18 18
@@ -784,7 +821,8 @@ function Show-NewDisplay {
         elseif ($apps.Contains($sel)) { $target = '+' + $apps[$sel] }
         elseif ($script:customApps.Contains($sel)) { $target = '+' + $script:customApps[$sel] }
         else { return }
-        Start-Scrcpy ((Get-NewDisplayArgs) + "--start-app=$target")
+        $pre = if ($serial) { @('-s', $serial) } else { @() }
+        Start-Scrcpy ($pre + (Get-NewDisplayArgs) + "--start-app=$target")
     }
 }
 
@@ -906,11 +944,303 @@ MOD 键 = 左 Alt 或 左 Super 键
     [void]$dlg.ShowDialog($owner)
 }
 
+# ---------------- 设备：记住 / 友好名 / 选择 / 解析目标 ----------------
+# 给设备起个一眼能认的名字：优先用户记住的备注名，否则取型号，再不行用序列号兜底。
+function Get-FriendlyName {
+    param($serial)
+    if (-not $serial) { return '' }
+    if ($script:deviceNames.Contains($serial))  { return $script:deviceNames[$serial] }   # 用户自定义名优先
+    if ($script:knownDevices.Contains($serial)) { return $script:knownDevices[$serial] }
+    $info = Get-DevInfo $serial
+    if ($info.Text) { return ($info.Text -split ' · ')[-1] }   # 取「Android 13 · Pixel 6」里的型号
+    return $serial
+}
+# 把一个无线地址记进列表（已存在则不动），连接成功后调用，下次可在「设备管理」里直接重连。
+function Add-KnownDevice {
+    param($addr, $name)
+    if (-not $addr) { return }
+    if ($script:knownDevices.Contains($addr)) { return }
+    if (-not $name) { $name = Get-FriendlyName $addr }
+    $script:knownDevices[$addr] = $name
+    Save-Settings
+}
+
+# 多设备时让用户挑一台投屏，返回序列号 / 地址，取消返回 $null。
+function Select-Device {
+    param($owner, $devs, $title = '选择设备')
+    $dlg = New-Dialog $title 340 296 $owner
+    $lbl = New-Lbl '检测到多台设备，选择要投屏的一台：' 16 14
+    $lb = New-Object System.Windows.Forms.ListBox
+    $lb.Location = '16,42'; $lb.Size = '308,160'
+    $lb.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
+    foreach ($s in $devs) {
+        $tp = if (Test-Wireless $s) { '无线' } else { 'USB' }
+        [void]$lb.Items.Add("$(Get-FriendlyName $s)   ·   $tp   ·   $s")
+    }
+    if ($lb.Items.Count -gt 0) { $lb.SelectedIndex = 0 }
+    $btnGo = New-PrimaryBtn '投屏这台' 16 218 308 34 10
+    $result = @{ s = $null }
+    $pick = { if ($lb.SelectedIndex -ge 0) { $result.s = $devs[$lb.SelectedIndex]; $dlg.Close() } }
+    $btnGo.Add_Click($pick); $lb.Add_DoubleClick($pick)
+    $dlg.Controls.AddRange(@($lbl, $lb, $btnGo)); $dlg.AcceptButton = $btnGo
+    [void]$dlg.ShowDialog($owner)
+    return $result.s
+}
+
+# 决定这次投屏用哪台设备。返回 @{ Ok; Serial; Reason }：
+#   Ok=$true 时 Serial 可用；Ok=$false 时 Reason='none'(没设备) 或 'cancel'(多设备时用户取消选择)。
+# 规则：0 台→none；1 台→用它；多台→优先「默认设备」，否则按偏好类型唯一匹配，再否则弹窗让用户选。
+function Resolve-Target {
+    param($owner, [string]$Prefer = '')
+    $devs = @(Get-DeviceList)
+    if ($devs.Count -eq 0) { return @{ Ok = $false; Reason = 'none'; Serial = $null } }
+    if ($devs.Count -eq 1) { return @{ Ok = $true; Serial = $devs[0] } }
+    if ($settings.defaultDevice -and ($devs -contains $settings.defaultDevice)) { return @{ Ok = $true; Serial = $settings.defaultDevice } }
+    if ($Prefer -eq 'usb')      { $m = @($devs | Where-Object { -not (Test-Wireless $_) }); if ($m.Count -eq 1) { return @{ Ok = $true; Serial = $m[0] } } }
+    elseif ($Prefer -eq 'wireless') { $m = @($devs | Where-Object { Test-Wireless $_ });   if ($m.Count -eq 1) { return @{ Ok = $true; Serial = $m[0] } } }
+    $s = Select-Device $owner $devs
+    if ($s) { return @{ Ok = $true; Serial = $s } } else { return @{ Ok = $false; Reason = 'cancel'; Serial = $null } }
+}
+
+# 对「有版本要求」的功能（摄像头需 12+、独立窗口需 11+）：点一下就先定目标设备、查它的实际版本，
+# 不够直接弹提示并返回 $null（调用方据此中止，连功能弹窗都不会打开）。够了/读不到版本则返回目标序列号。
+function Resolve-TargetForFeature {
+    param($owner, [int]$Need, [string]$Feature, [string]$Prefer = '')
+    $t = Resolve-Target $owner -Prefer $Prefer
+    if (-not $t.Ok) {
+        if ($t.Reason -eq 'none') { [System.Windows.Forms.MessageBox]::Show("没检测到手机，请先连接手机再使用「$Feature」。", $Feature) | Out-Null }
+        return $null
+    }
+    $ver = (Get-DevInfo $t.Serial).Ver
+    if ($Need -gt 0 -and $ver -gt 0 -and $ver -lt $Need) {
+        [System.Windows.Forms.MessageBox]::Show("「$Feature」需要手机系统为 Android $Need 及以上。`n这台是 Android $ver，用不了这个功能。", $Feature) | Out-Null
+        return $null
+    }
+    return $t.Serial   # 版本够，或读不到版本（不拦截，交给 scrcpy 自行处理）
+}
+
+# ---------------- 无线：输入 IP 直连（保底连法，不限系统版本；无需配对码） ----------------
+# 只要手机已开启网络 adb（Android 11+ 的「无线调试」，或更早系统 tcpip 过一次），给个 IP 就能连。
+# 成功返回连接地址（ip:port）并自动记住，失败/取消返回 $null。
+function Connect-ByIp {
+    param($owner)
+    $dlg = New-Dialog '输入 IP 连接' 360 214 $owner
+    $l1 = New-Lbl '用 IP 直接连接手机，不需要配对码。' 18 14; $l1.ForeColor = $cMuted
+    $l2 = New-Lbl '保底连法：任何已开网络 adb 的设备都适用，重连也方便。' 18 36; $l2.ForeColor = $cMuted
+    $l3 = New-Lbl 'IP 地址' 18 68
+    $txtIp = New-Object System.Windows.Forms.TextBox; $txtIp.Location = '18,90'; $txtIp.Size = '208,24'
+    $l4 = New-Lbl '端口' 242 68
+    $txtPort = New-Object System.Windows.Forms.TextBox; $txtPort.Location = '242,90'; $txtPort.Size = '100,24'; $txtPort.Text = '5555'
+    $btnGo = New-PrimaryBtn '连接' 18 130 324 38 11
+    $result = @{ addr = $null }
+    $btnGo.Add_Click({
+        $ip = $txtIp.Text.Trim(); $port = $txtPort.Text.Trim()
+        if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { [System.Windows.Forms.MessageBox]::Show('IP 地址格式应为 4 段数字，例如 192.168.1.7。', '输入 IP 连接') | Out-Null; return }
+        if (-not $port) { $port = '5555' }
+        if ($port -notmatch '^\d+$') { [System.Windows.Forms.MessageBox]::Show('端口应为纯数字，常见是 5555。', '输入 IP 连接') | Out-Null; return }
+        $addr = "${ip}:$port"
+        try { $out = (& $adb connect $addr 2>&1) -join "`n" } catch { $out = $_.Exception.Message }
+        if ($out -match 'connected to') {
+            $result.addr = $addr; $dlg.Close()
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("连接 $addr 失败。`n`n多半是手机没开「网络 adb」。Android 11+ 在开发者选项「无线调试」里打开即可；更早的系统可先用主界面「无线投屏 → 插数据线连接」插一次线完成切换，之后即可用 IP 直连。`n`n$out", '输入 IP 连接') | Out-Null
+        }
+    })
+    $dlg.Controls.AddRange(@($l1, $l2, $l3, $txtIp, $l4, $txtPort, $btnGo))
+    $dlg.AcceptButton = $btnGo
+    [void]$dlg.ShowDialog($owner)
+    if ($result.addr) { Add-KnownDevice $result.addr }
+    return $result.addr
+}
+
+# ---------------- 设备管理：切换 / 断开 / 设默认 / 忘记 / IP 直连 ----------------
+function Show-DeviceManager {
+    param($owner)
+    $dlg = New-Dialog '设备管理' 520 420 $owner
+
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.Location = '16,14'; $lv.Size = '488,206'
+    $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.MultiSelect = $true; $lv.HideSelection = $false
+    $lv.HeaderStyle = 'Nonclickable'; $lv.BackColor = $cWhite
+    $lv.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
+    [void]$lv.Columns.Add('设备', 156)
+    [void]$lv.Columns.Add('地址', 138)
+    [void]$lv.Columns.Add('类型 · 系统', 184)   # 这栏要装下「无线 · Android 13  ▶ 投屏中」，给它最宽，别截断
+    # 三列合计 478 < 列表内宽，留点余量，避免出现底部水平滚动条
+    $grpConn  = New-Object System.Windows.Forms.ListViewGroup -ArgumentList '已连接'
+    $grpKnown = New-Object System.Windows.Forms.ListViewGroup -ArgumentList '已记住（未连接）'
+    [void]$lv.Groups.Add($grpConn)   # 逐个加：AddRange 收 PS 的 Object[] 会因类型转换失败
+    [void]$lv.Groups.Add($grpKnown)
+
+    # 两条发丝线把按钮分成「投屏 / 管理 / 全局」三组，组左侧的小字标签说明这组按钮是干嘛的（结构即信息）
+    $line1 = New-Object System.Windows.Forms.Panel; $line1.Size = New-Object System.Drawing.Size(488, 1); $line1.Location = New-Object System.Drawing.Point(16, 230); $line1.BackColor = $cLine
+    $line2 = New-Object System.Windows.Forms.Panel; $line2.Size = New-Object System.Drawing.Size(488, 1); $line2.Location = New-Object System.Drawing.Point(16, 334); $line2.BackColor = $cLine
+
+    # 第一组「投屏」：连接与投屏分开——连接只负责连上，投屏只负责开镜像窗口（已连的才可投）
+    $capCast = New-Caption '投屏' 18 257
+    $btnConnect = New-SecondaryBtn '连接'    58  248 86  34
+    $btnCast    = New-SecondaryBtn '投屏'    150 248 86  34
+    $btnStop    = New-SecondaryBtn '停止投屏' 242 248 92  34
+    $btnAll     = New-SecondaryBtn '全部投屏' 402 248 102 34
+    # 第二组「管理」：对单台设备的设置项
+    $capManage  = New-Caption '管理' 18 299
+    $btnDefault = New-SecondaryBtn '设为默认' 58  290 92 34
+    $btnDisc    = New-SecondaryBtn '断开'    156 290 72 34
+    $btnRename  = New-SecondaryBtn '重命名'   234 290 82 34
+    $btnForget  = New-SecondaryBtn '忘记'    322 290 72 34
+    # 第三组「全局」
+    $btnIp      = New-SecondaryBtn '输入 IP 连接…' 16 346 150 34
+    $btnRefresh2= New-SecondaryBtn '刷新'    326 346 80  34
+    $btnDone    = New-PrimaryBtn   '完成'    414 346 90  34 10
+
+    # refresh 把「已连接设备」「正在投屏的序列号」算一次塞进 $state；updateButtons 只读它，不再每次点都跑 adb
+    $state = @{ Active = @(); Connected = @() }
+
+    # 按选中项启用/禁用：连接=有选中的未连设备；投屏=有选中的已连且未在投；停止=有选中的在投；管理类仅单选有效
+    $updateButtons = {
+        $items = @($lv.SelectedItems | Where-Object { $_.Tag })
+        $one = if ($items.Count -eq 1) { $items[0].Tag } else { $null }
+        $active = $state.Active
+        $btnConnect.Enabled = @($items | Where-Object { -not $_.Tag.Connected }).Count -gt 0
+        $btnCast.Enabled    = @($items | Where-Object { $_.Tag.Connected -and ($active -notcontains $_.Tag.Serial) }).Count -gt 0
+        $btnStop.Enabled    = @($items | Where-Object { $active -contains $_.Tag.Serial }).Count -gt 0
+        $btnAll.Enabled     = @($state.Connected | Where-Object { $active -notcontains $_ }).Count -gt 0
+        $btnDefault.Enabled = [bool]($one -and $one.Connected)
+        $btnDisc.Enabled    = [bool]($one -and $one.Connected -and $one.Wireless)
+        $btnRename.Enabled  = [bool]$one
+        $btnForget.Enabled  = [bool]($one -and -not $one.Connected)
+    }
+    $refresh = {
+        $active = Get-ActiveSerials; $state.Active = $active
+        $lv.BeginUpdate(); $lv.Items.Clear()
+        $connected = @(Get-DeviceList); $state.Connected = $connected
+        foreach ($s in $connected) {
+            $info = Get-DevInfo $s; $wl = Test-Wireless $s
+            $tag = if ($settings.defaultDevice -eq $s) { '  ★默认' } else { '' }
+            $it = New-Object System.Windows.Forms.ListViewItem(('●  ' + (Get-FriendlyName $s) + $tag))
+            $it.Group = $grpConn; $it.ForeColor = $cGreen
+            [void]$it.SubItems.Add($s)
+            $sys = if ($info.Ver -gt 0) { "Android $($info.Ver)" } else { '' }
+            $typ = $(if ($wl) { '无线' } else { 'USB' }) + $(if ($sys) { " · $sys" } else { '' })
+            if ($active -contains $s) { $typ += '  ▶ 投屏中' }   # 正在投屏的标注出来（与整行同为绿色）
+            [void]$it.SubItems.Add($typ)
+            $it.Tag = @{ Serial = $s; Connected = $true; Wireless = $wl }
+            [void]$lv.Items.Add($it)
+        }
+        foreach ($addr in $script:knownDevices.Keys) {
+            if ($connected -contains $addr) { continue }
+            $it = New-Object System.Windows.Forms.ListViewItem(('○  ' + (Get-FriendlyName $addr)))
+            $it.Group = $grpKnown; $it.ForeColor = $cMuted
+            [void]$it.SubItems.Add($addr)
+            [void]$it.SubItems.Add('无线 · 未连接')
+            $it.Tag = @{ Serial = $addr; Connected = $false; Wireless = $true }
+            [void]$lv.Items.Add($it)
+        }
+        if ($lv.Items.Count -eq 0) {
+            $empty = New-Object System.Windows.Forms.ListViewItem('（没有已连接或记住的设备，点下方「输入 IP 连接」或回主界面无线投屏）')
+            $empty.ForeColor = $cMuted; [void]$lv.Items.Add($empty)
+        }
+        $lv.EndUpdate(); & $updateButtons
+    }
+
+    # 连接选中的未连设备（只连，不投）：连成功后它会进到「已连接」组，再点「投屏」即可
+    $connectSelected = {
+        $items = @($lv.SelectedItems | Where-Object { $_.Tag -and -not $_.Tag.Connected })
+        if ($items.Count -eq 0) { return }
+        $fail = @()
+        $owner.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        foreach ($it in $items) {
+            $addr = $it.Tag.Serial
+            try { $out = (& $adb connect $addr 2>&1) -join "`n" } catch { $out = $_.Exception.Message }
+            if ($out -match 'connected to') { Add-KnownDevice $addr } else { $fail += "$addr：$out" }
+        }
+        $owner.Cursor = [System.Windows.Forms.Cursors]::Default
+        if ($fail) { [System.Windows.Forms.MessageBox]::Show("有设备没连上（可能不在线或网络 adb 已关）：`n`n" + ($fail -join "`n"), '设备管理') | Out-Null }
+        & $refresh
+    }
+    # 投屏选中的已连设备（只投，不连）：已在投的跳过不重复开，窗口保持打开方便继续管理
+    $castSelected = {
+        foreach ($it in @($lv.SelectedItems | Where-Object { $_.Tag -and $_.Tag.Connected })) {
+            $addr = $it.Tag.Serial
+            if ($state.Active -contains $addr) { continue }
+            Start-Scrcpy (@('-s', $addr) + (Get-MirrorArgs -Wireless:(Test-Wireless $addr)))
+        }
+        & $refresh
+    }
+    # 全部投屏：把所有已连、尚未投屏的设备各开一个窗口
+    $castAll = {
+        $active = Get-ActiveSerials
+        foreach ($s in @(Get-DeviceList)) {
+            if ($active -contains $s) { continue }
+            Start-Scrcpy (@('-s', $s) + (Get-MirrorArgs -Wireless:(Test-Wireless $s)))
+        }
+        & $refresh
+    }
+    # 停止投屏：只关掉选中设备的投屏窗口，不影响其它台
+    $stopSelected = {
+        foreach ($it in @($lv.SelectedItems | Where-Object { $_.Tag })) { Stop-DeviceScrcpy $it.Tag.Serial }
+        & $refresh
+    }
+    # 双击某行＝对它做最顺手的那一步：未连就连、已连未投就投（不关窗口，方便接着操作）
+    $rowDouble = {
+        $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
+        $tag = $items[0].Tag
+        if (-not $tag.Connected) { & $connectSelected }
+        elseif ($state.Active -notcontains $tag.Serial) { & $castSelected }
+    }
+
+    $lv.Add_SelectedIndexChanged($updateButtons)
+    $lv.Add_DoubleClick($rowDouble)
+    $btnConnect.Add_Click($connectSelected)
+    $btnCast.Add_Click($castSelected)
+    $btnStop.Add_Click($stopSelected)
+    $btnAll.Add_Click($castAll)
+    $btnDisc.Add_Click({
+        $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
+        $addr = $items[0].Tag.Serial
+        Stop-DeviceScrcpy $addr   # 断开前先停掉它的投屏窗口，避免悬空
+        try { & $adb disconnect $addr 2>$null | Out-Null } catch {}
+        if ($settings.defaultDevice -eq $addr) { $settings.defaultDevice = ''; Save-Settings }
+        & $refresh
+    })
+    $btnDefault.Add_Click({
+        $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
+        $s = $items[0].Tag.Serial
+        $settings.defaultDevice = if ($settings.defaultDevice -eq $s) { '' } else { $s }   # 再点一次取消默认
+        Save-Settings; & $refresh
+    })
+    $btnRename.Add_Click({
+        $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
+        $s = $items[0].Tag.Serial
+        $name = [Microsoft.VisualBasic.Interaction]::InputBox("给这台设备起个名字（如 客厅电视）：", '重命名设备', (Get-FriendlyName $s))
+        $name = $name.Trim()
+        if ($name -and $name -ne (Get-FriendlyName $s)) { $script:deviceNames[$s] = $name; Save-Settings; & $refresh }
+    })
+    $btnForget.Add_Click({
+        $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
+        $addr = $items[0].Tag.Serial
+        if ($script:knownDevices.Contains($addr)) { $script:knownDevices.Remove($addr) }
+        if ($script:deviceNames.Contains($addr)) { $script:deviceNames.Remove($addr) }   # 忘记设备时一并清掉它的自定义名
+        if ($settings.defaultDevice -eq $addr) { $settings.defaultDevice = '' }
+        Save-Settings; & $refresh
+    })
+    $btnIp.Add_Click({ if (Connect-ByIp $dlg) { & $refresh } })
+    $btnRefresh2.Add_Click($refresh)
+    $btnDone.Add_Click({ $dlg.Close() })
+
+    $dlg.Controls.AddRange(@($lv, $line1, $line2, $capCast, $capManage,
+        $btnConnect, $btnCast, $btnStop, $btnAll, $btnDefault, $btnDisc, $btnRename, $btnForget,
+        $btnIp, $btnRefresh2, $btnDone))
+    $dlg.AcceptButton = $btnDone
+    & $refresh
+    [void]$dlg.ShowDialog($owner)
+}
+
 try {
     # ---------------- 主窗口 ----------------
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'scrcpy 投屏助手'
-    $form.ClientSize = New-Object System.Drawing.Size(468, 306)
+    $form.ClientSize = New-Object System.Drawing.Size(512, 384)
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedSingle'
     $form.MaximizeBox = $false
@@ -922,18 +1252,18 @@ try {
 
     # 标题（左侧朱砂竖条，是全局唯一的品牌点缀）
     $brand = New-Object System.Windows.Forms.Panel
-    $brand.Size = New-Object System.Drawing.Size(4, 30); $brand.Location = New-Object System.Drawing.Point(24, 19)
+    $brand.Size = New-Object System.Drawing.Size(4, 34); $brand.Location = New-Object System.Drawing.Point(28, 24)
     $brand.BackColor = $cRed
     $form.Controls.Add($brand)
     $lblTitle = New-Object System.Windows.Forms.Label
     $lblTitle.Text = 'scrcpy 投屏助手'; $lblTitle.AutoSize = $true
-    $lblTitle.Location = New-Object System.Drawing.Point(38, 18)
+    $lblTitle.Location = New-Object System.Drawing.Point(44, 22)
     $lblTitle.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 18, [System.Drawing.FontStyle]::Bold)
     $lblTitle.ForeColor = $cInk
     $form.Controls.Add($lblTitle)
     $lblSub = New-Object System.Windows.Forms.Label
     $lblSub.Text = '把安卓手机投到电脑，鼠标键盘随便用'; $lblSub.AutoSize = $true
-    $lblSub.Location = New-Object System.Drawing.Point(40, 56)
+    $lblSub.Location = New-Object System.Drawing.Point(46, 62)
     $lblSub.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
     $lblSub.ForeColor = $cMuted
     $form.Controls.Add($lblSub)
@@ -941,18 +1271,19 @@ try {
     # 连接状态药丸（信号灯，右上角醒目）
     $lblStatus = New-Object System.Windows.Forms.Label
     $lblStatus.Size = New-Object System.Drawing.Size(124, 28)
-    $lblStatus.Location = New-Object System.Drawing.Point(320, 24)
+    $lblStatus.Location = New-Object System.Drawing.Point(360, 28)
     $lblStatus.TextAlign = 'MiddleCenter'
     $lblStatus.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
     $lblStatus.BackColor = $cTagBg; $lblStatus.ForeColor = $cMuted
     $lblStatus.Text = '检测中…'
+    $lblStatus.Cursor = [System.Windows.Forms.Cursors]::Hand   # 点状态药丸 = 进入设备管理（状态→管理，语义自洽）
     $form.Controls.Add($lblStatus)
     Set-Rounded $lblStatus 13
 
     # 设备信息小字（型号 + 安卓版本），让用户一眼看出摄像头(12+)/独立窗口(11+)能不能用
     $lblDevInfo = New-Object System.Windows.Forms.Label
     $lblDevInfo.Size = New-Object System.Drawing.Size(160, 16)
-    $lblDevInfo.Location = New-Object System.Drawing.Point(284, 54)
+    $lblDevInfo.Location = New-Object System.Drawing.Point(324, 60)
     $lblDevInfo.TextAlign = 'MiddleRight'
     $lblDevInfo.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
     $lblDevInfo.ForeColor = $cMuted
@@ -960,35 +1291,55 @@ try {
 
     # 分隔细线
     $rule = New-Object System.Windows.Forms.Panel
-    $rule.Size = New-Object System.Drawing.Size(420, 1); $rule.Location = New-Object System.Drawing.Point(24, 84)
+    $rule.Size = New-Object System.Drawing.Size(456, 1); $rule.Location = New-Object System.Drawing.Point(28, 102)
     $rule.BackColor = $cLine
     $form.Controls.Add($rule)
 
     # 主操作（最常用，做大做显眼）
-    $btnWired = New-PrimaryBtn '有线投屏' 24 100 198 58
-    $btnWireless = New-PrimaryBtn '无线投屏' 246 100 198 58
+    $btnWired = New-PrimaryBtn '有线投屏' 28 120 220 64
+    $btnWireless = New-PrimaryBtn '无线投屏' 264 120 220 64
     $form.Controls.AddRange(@($btnWired, $btnWireless))
-    $capWired = New-Caption '数据线连接 · 最稳定' 28 162
-    $capWireless = New-Caption '免数据线 · 一次配置' 250 162
+    $capWired = New-Caption '数据线连接 · 最稳定' 32 190
+    $capWireless = New-Caption '免数据线 · 一次配置' 268 190
     $form.Controls.AddRange(@($capWired, $capWireless))
 
     # 更多功能（次要操作）
     $lblMore = New-Object System.Windows.Forms.Label
     $lblMore.Text = '更多功能'; $lblMore.AutoSize = $true; $lblMore.ForeColor = $cMuted
-    $lblMore.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9); $lblMore.Location = New-Object System.Drawing.Point(24, 192)
+    $lblMore.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9); $lblMore.Location = New-Object System.Drawing.Point(28, 222)
     $form.Controls.Add($lblMore)
-    $btnCamera = New-SecondaryBtn '手机当摄像头' 24 214 132 38
-    $btnRecord = New-SecondaryBtn '录制屏幕' 168 214 132 38
-    $btnNd = New-SecondaryBtn '独立窗口' 312 214 132 38
+    $btnCamera = New-SecondaryBtn '手机当摄像头' 28 246 141 42
+    $btnRecord = New-SecondaryBtn '录制屏幕' 185 246 141 42
+    $btnNd = New-SecondaryBtn '独立窗口' 343 246 141 42
     $form.Controls.AddRange(@($btnCamera, $btnRecord, $btnNd))
 
-    # 底部：提示 + 设置/刷新
-    $lblHint = New-Caption '首次连接手机点「允许 USB 调试」' 24 274
+    # 底部细线：把「功能区」和下面这排「工具 / 关于」次要入口分开（分隔=信息，不是装饰）
+    $rule2 = New-Object System.Windows.Forms.Panel
+    $rule2.Size = New-Object System.Drawing.Size(456, 1); $rule2.Location = New-Object System.Drawing.Point(28, 318)
+    $rule2.BackColor = $cLine
+    $form.Controls.Add($rule2)
+
+    # 底部：提示（左） + 设备/快捷键/设置/刷新 链接 + GitHub 图标（右，归入「工具/关于」这组安静的次要入口）
+    $lblHint = New-Caption '首次连接点「允许 USB 调试」' 28 338
     $form.Controls.Add($lblHint)
-    $btnShortcuts = New-LinkBtn '快捷键' 250 270 56
-    $btnSettings = New-LinkBtn '设置' 322 270 56
-    $btnRefresh = New-LinkBtn '刷新' 384 270 56
-    $form.Controls.AddRange(@($btnShortcuts, $btnSettings, $btnRefresh))
+    $btnDevices = New-LinkBtn '设备' 232 334 52
+    $btnShortcuts = New-LinkBtn '快捷键' 288 334 62
+    $btnSettings = New-LinkBtn '设置' 354 334 52
+    $btnRefresh = New-LinkBtn '刷新' 410 334 52
+    $form.Controls.AddRange(@($btnDevices, $btnShortcuts, $btnSettings, $btnRefresh))
+
+    # GitHub 源码 / 反馈入口：用素纸灰描出的 GitHub 标记（透明底、与上面几个链接同色同高），点开仓库主页。
+    # 图标以 base64 内嵌，打包不需附带图片文件。
+    $ghB64 = 'iVBORw0KGgoAAAANSUhEUgAAACQAAAAkCAYAAADhAJiYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAOkSURBVFhH7ZdXU1sxEIX550lIo5liSgyG0EzL0DEEDMEYMAyYYooxvYQAaf9hM58cORfp2r4OkwkPPJxBSGd3j3RX2nXJz69X8phQYk78bzwJKoQHCbq5OpbTw6Qc7CbkYHddjZkzecWgaEFXZweyOD8l/aGgNDdWSX3NG6mteqnAmLm+7qDiwDXtC8GzoLvrU4lMDUuTv1yqyp5JTWWp+KtfS33NW2mozYAxc6zBaawrk5nJIbn9fGL5ywVPgtJ7CWlrrlVBCEggLSIX4MDFpjVQqz6r6dcNBQUlN5alzpfZtRchJrDBFh/biSXLv4m8glI761Lne6VAfvjKn0t1xQs1zieONThwsWGMIPJsP7lmxfEk6MvlkUpQnOCso7Ve1uKfJDzarwISSIPAOrgGnImRPmXT2daQFYTP64tDK15BQTjTiUmA6fBgdu38eE8mRnplanxAVhYjsrkWU2A8Nf5Bxod75exoN8vnMmiR+GTdjJdX0Ek6+fszZT4BzqKzExbPK2KfJpUPfOGTkzo+2LZ4wFUQu9Q70oLGhnosnldw2lqQPvHJsQGLByxB327O1TXlhHSSkh+rS7OWsVesxefVTdP+8N0aqFGxTK4l6Ci1dU8Mx9vTGbAMiwWvN76coo5SmxbPEpRYjWaPV3+uhbmwZVgsKCWm3/WVqMWzBLkZcuQmr1gkVhcsv8QyeZYgTsM0fEj+aPAemX7dTt4StLwwbRnOTY9ahsViPjJu+SWWybMEba0vqlulDUnE3q4Wy7BY0K44bxoxiGXyLEG8wtQeZ1uBKOqayfUKuoVMv5Txx19iEMvkWoJ+3F1K1/vG7BVlVxwvb9PlacpyUAjY0Lo4rzxjYhDL5FuCAMlGzcGYuhPqeKf+pzDGY5G8xVEDTjw2o2ycrYuuZ24JDVwF4YzOsLqiVCUjO0EYjvj2gYZKCXUEXOvRSXpbrcHhZKnyzlaFpq3JX5FzU66CAG8EAgCimOOY9VxLk8/16WeuPei/dzGcwNbt/dHIKYhT6etuUQ5IQHb0/fZClqIf1TNAiTFtNMKjf4qphi6q+HTLHY2cgsD1RVolM6K4+l5/RVDJnYK0GHzh0+Q7kVcQ4JbQLSKKvOoPtSpx+fojukqnIGzbg/WebmlBQYCfMfRDOn/A6GDI4mnQTSKIS0EujQ2FPP8U8iRIY2czns2rfA2bFg8XG3M9H4oSpHG4vyEXJ/vWvAZrcMx5L/grQf8ST4IK4dEJ+gX3m3AeIyd/VAAAAABJRU5ErkJggg=='
+    $btnGh = New-Object System.Windows.Forms.PictureBox
+    # 与链接按钮同 y、同高(26)，Zoom 把图标在框内垂直居中 → 和「刷新」等文字基线对齐
+    $btnGh.Size = New-Object System.Drawing.Size(18, 26); $btnGh.Location = New-Object System.Drawing.Point(466, 334)
+    $btnGh.SizeMode = 'Zoom'; $btnGh.BackColor = $cPaper
+    $btnGh.Cursor = [System.Windows.Forms.Cursors]::Hand
+    try { $btnGh.Image = [System.Drawing.Image]::FromStream((New-Object System.IO.MemoryStream(,[Convert]::FromBase64String($ghB64)))) } catch {}
+    $btnGh.Add_Click({ try { Start-Process 'https://github.com/rockbenben/scrcpy-helper' } catch {} })
+    $form.Controls.Add($btnGh)
+    $tt.SetToolTip($btnGh, '在 GitHub 查看源码 / 反馈问题')
 
     $tt.SetToolTip($btnWired, '用数据线连接，最稳定、延迟最低。')
     $tt.SetToolTip($btnWireless, '不用线。已连手机时直接开始；首次可选插一次线，或 Android 11+ 用配对码免插线。')
@@ -998,6 +1349,8 @@ try {
     $tt.SetToolTip($btnShortcuts, 'scrcpy 常用快捷键速查（全屏、息屏、旋转、复制粘贴、拖文件装 APK 等）。')
     $tt.SetToolTip($btnSettings, '画质、声音、控制、窗口、独立窗口、录制等都可在这里自定义。')
     $tt.SetToolTip($btnRefresh, '立即重新检测手机连接状态。')
+    $tt.SetToolTip($btnDevices, '管理多台设备：切换、断开、设默认、忘记，或输入 IP 直连。')
+    $tt.SetToolTip($lblStatus, '点击管理设备：切换 / 断开 / 输入 IP 连接。')
 
     # ---------------- 行为 ----------------
     $updateStatus = {
@@ -1010,6 +1363,7 @@ try {
             $w = $devs | Where-Object { Test-Wireless $_ } | Select-Object -First 1
             if ($w) {
                 if ($settings.lastWirelessAddr -ne $w) { $settings.lastWirelessAddr = $w; Save-Settings }
+                Add-KnownDevice $w   # 任何方式连上的无线设备都自动记住，供「设备管理」重连
                 $type = '无线'
             } else { $type = 'USB' }
             $lblStatus.BackColor = $cGreenBg; $lblStatus.ForeColor = $cGreen
@@ -1025,34 +1379,56 @@ try {
     $btnRefresh.Add_Click($updateStatus)
     $btnShortcuts.Add_Click({ Show-Shortcuts $form })
     $btnSettings.Add_Click({ Show-Settings $form })
+    # 设备管理入口：底部「设备」链接 + 右上角状态药丸都可进；关掉后刷新一次状态
+    $openDevices = { Show-DeviceManager $form; & $updateStatus }
+    $btnDevices.Add_Click($openDevices)
+    $lblStatus.Add_Click($openDevices)
 
-    $btnWired.Add_Click({ Start-Scrcpy (Get-MirrorArgs -Wireless:$false) })
+    $btnWired.Add_Click({
+        $devs = @(Get-DeviceList)
+        if ($devs.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('没检测到手机。请用数据线连接并点「允许 USB 调试」，或点右上角状态药丸用无线连接。', '有线投屏') | Out-Null; return }
+        $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
+        $wl  = @($devs | Where-Object { Test-Wireless $_ })
+        # 有线优先：只要有 USB 设备就在 USB 里选；没有 USB 才退回无线。
+        # 必须用 @(...) 重新包成数组：PowerShell 会把 if 分支里的单元素数组拆成标量字符串，
+        # 那样 $pool[0] 取到的是首字符（serial 被截成 "N"），scrcpy 就会报 Could not find ADB device。
+        $pool = @(if ($usb.Count -gt 0) { $usb } else { $wl })
+        $t = if ($pool.Count -eq 1) { $pool[0] }
+             elseif ($settings.defaultDevice -and ($pool -contains $settings.defaultDevice)) { $settings.defaultDevice }
+             else { Select-Device $form $pool '有线投屏 · 选择设备' }   # 多台同类设备 → 弹窗问要投哪台
+        if ($t) { Start-Scrcpy (@('-s', $t) + (Get-MirrorArgs -Wireless:(Test-Wireless $t))) }
+    })
 
     $btnWireless.Add_Click({
-        $devs = Get-DeviceList
-        $wireless = $devs | Where-Object { Test-Wireless $_ } | Select-Object -First 1
-        $usb = $devs | Where-Object { -not (Test-Wireless $_) } | Select-Object -First 1
-        if ($wireless) {
-            # 已是无线连接，直接投屏，不打扰
-            Start-Scrcpy (@('-s', $wireless) + (Get-MirrorArgs -Wireless:$true))
+        $devs = @(Get-DeviceList)
+        $wl = @($devs | Where-Object { Test-Wireless $_ })
+        $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
+        if ($wl.Count -ge 1) {
+            # 已是无线连接：单台直接投；多台优先默认设备，否则让用户挑
+            $t = if ($wl.Count -eq 1) { $wl[0] } elseif ($settings.defaultDevice -and ($wl -contains $settings.defaultDevice)) { $settings.defaultDevice } else { Select-Device $form $wl }
+            if ($t) { Start-Scrcpy (@('-s', $t) + (Get-MirrorArgs -Wireless:$true)) }
         }
-        elseif ($usb) {
-            # 已用数据线连着，直接切到无线（连上后可拔线），无需提示
-            Start-Scrcpy (@('--tcpip') + (Get-MirrorArgs -Wireless:$true))
+        elseif ($usb.Count -ge 1) {
+            # 只有数据线连着：切到无线（连上后可拔线）。多台先选一台再切
+            $t = if ($usb.Count -eq 1) { $usb[0] } else { Select-Device $form $usb }
+            if ($t) { Start-Scrcpy (@('-s', $t, '--tcpip') + (Get-MirrorArgs -Wireless:$true)) }
         }
         else {
-            # 没检测到设备：给两条路——插线切无线（最省事），或 Android 11+ 用配对码免插线
-            $pick = New-Dialog '无线投屏' 360 226 $form
+            # 没检测到设备：三条路——插线切无线（最省事）/ 配对码（11+）/ 输入 IP 直连（保底·无需配对码）
+            $pick = New-Dialog '无线投屏' 360 292 $form
 
-            $pl = New-Lbl '没有检测到手机，选一种无线连接方式：' 20 18
-            $btnCable = New-PrimaryBtn '插数据线连接（推荐 · 最省事）' 20 50 320 48 11
-            $capCable = New-Caption '插一次线即可，连上后自动切无线、可拔线。' 24 100
-            $btnPair = New-SecondaryBtn '用配对码连接（Android 11+ · 免插线）' 20 128 320 44
-            $capPair = New-Caption '手机开「无线调试」，与电脑连同一个 Wi-Fi。' 24 174
+            $pl = New-Lbl '没有检测到手机，选一种无线连接方式：' 20 16
+            $btnCable = New-PrimaryBtn '插数据线连接（推荐 · 最省事）' 20 46 320 46 11
+            $capCable = New-Caption '插一次线即可，连上后自动切无线、可拔线。' 24 94
+            $btnPair = New-SecondaryBtn '用配对码连接（Android 11+ · 免插线）' 20 120 320 40
+            $capPair = New-Caption '手机开「无线调试 → 使用配对码配对设备」。' 24 162
+            $btnIpc = New-SecondaryBtn '输入 IP 直接连接（保底 · 无需配对码）' 20 188 320 40
+            $capIp = New-Caption '手机已开网络 adb 时，给个 IP 即可，新旧设备都行。' 24 230
 
             $btnCable.Add_Click({ $pick.Tag = 'cable'; $pick.Close() })
             $btnPair.Add_Click({ $pick.Tag = 'pair'; $pick.Close() })
-            $pick.Controls.AddRange(@($pl, $btnCable, $capCable, $btnPair, $capPair))
+            $btnIpc.Add_Click({ $pick.Tag = 'ip'; $pick.Close() })
+            $pick.Controls.AddRange(@($pl, $btnCable, $capCable, $btnPair, $capPair, $btnIpc, $capIp))
             [void]$pick.ShowDialog($form)
 
             if ($pick.Tag -eq 'cable') {
@@ -1065,6 +1441,14 @@ try {
                 $addr = Show-WirelessPair $form
                 if ($addr) {
                     if ($settings.lastWirelessAddr -ne $addr) { $settings.lastWirelessAddr = $addr; Save-Settings }
+                    Add-KnownDevice $addr
+                    Start-Scrcpy (@('-s', $addr) + (Get-MirrorArgs -Wireless:$true))
+                }
+            }
+            elseif ($pick.Tag -eq 'ip') {
+                $addr = Connect-ByIp $form   # 内部已成功即记住
+                if ($addr) {
+                    if ($settings.lastWirelessAddr -ne $addr) { $settings.lastWirelessAddr = $addr; Save-Settings }
                     Start-Scrcpy (@('-s', $addr) + (Get-MirrorArgs -Wireless:$true))
                 }
             }
@@ -1072,8 +1456,9 @@ try {
     })
 
     $btnCamera.Add_Click({
-        if (-not (Test-AndroidVer 12 '手机当摄像头')) { return }
-        $dlg = New-Dialog '手机当摄像头' 264 232 $form
+        $serial = Resolve-TargetForFeature $form 12 '手机当摄像头'   # 点击即定设备、查版本，不够直接弹提示并中止
+        if (-not $serial) { return }
+        $dlg = New-Dialog '手机当摄像头' 264 308 $form
 
         $gb1 = New-Object System.Windows.Forms.GroupBox
         $gb1.Text = '摄像头'; $gb1.Location = '16,12'; $gb1.Size = '232,52'
@@ -1087,16 +1472,24 @@ try {
         $rbPort = New-Object System.Windows.Forms.RadioButton; $rbPort.Text = '竖屏'; $rbPort.Location = '124,20'; $rbPort.AutoSize = $true
         $gb2.Controls.AddRange(@($rbLand, $rbPort))
 
-        $chkTorch = New-Chk '打开补光灯' $false 18 134
-        $chkMic = New-Chk '同时采集麦克风声音' $false 18 160
+        # 分辨率按「宽高比 + 最大边长」选，scrcpy 只会在该摄像头实际支持的尺寸里挑，避免写死尺寸导致的
+        # “Camera configuration error”（很多机型/前置摄像头并不支持精确的 1920x1080）。
+        $lblRes = New-Lbl '分辨率' 18 140
+        $cbRes = New-Combo @('高（约 1080p，推荐）', '中（更流畅）', '原始最高') @(1920, 1280, 0) ([int]$settings.camResMax) 78 137 170
 
-        $btnGo = New-PrimaryBtn '开始' 16 190 232 32 11
+        $chkTorch = New-Chk '打开补光灯' $false 18 174
+        $chkMic = New-Chk '同时采集麦克风声音' $false 18 200
+
+        $btnGo = New-PrimaryBtn '开始' 16 234 232 32 11
         $btnGo.Add_Click({ $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close() })
 
-        $dlg.Controls.AddRange(@($gb1, $gb2, $chkTorch, $chkMic, $btnGo))
+        $dlg.Controls.AddRange(@($gb1, $gb2, $lblRes, $cbRes, $chkTorch, $chkMic, $btnGo))
         $dlg.AcceptButton = $btnGo
         if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
-            $a = @('--video-source=camera', "--camera-facing=$(if($rbFront.Checked){'front'}else{'back'})", '--camera-size=1920x1080')
+            $camMax = [int]$cbRes.Vals[$cbRes.SelectedIndex]
+            if ([int]$settings.camResMax -ne $camMax) { $settings.camResMax = $camMax; Save-Settings }
+            $a = @('-s', $serial, '--video-source=camera', "--camera-facing=$(if($rbFront.Checked){'front'}else{'back'})", '--camera-ar=16:9')
+            if ($camMax -gt 0) { $a += @('-m', "$camMax") }
             if ($rbPort.Checked) { $a += '--capture-orientation=90' }
             if ($chkTorch.Checked) { $a += '--camera-torch' }
             if ($chkMic.Checked) { $a += '--audio-source=mic' } else { $a += '--no-audio' }
@@ -1105,12 +1498,14 @@ try {
     })
 
     $btnRecord.Add_Click({
+        $tgt = Resolve-Target $form
+        if (-not $tgt.Ok) { if ($tgt.Reason -eq 'none') { [System.Windows.Forms.MessageBox]::Show('没检测到手机，请先连接手机再录制。', '录制屏幕') | Out-Null }; return }
         $sfd = New-Object System.Windows.Forms.SaveFileDialog
         $sfd.InitialDirectory = $PSScriptRoot
         $sfd.FileName = "录屏-$(Get-Date -Format 'yyyyMMdd-HHmmss').$($settings.recFormat)"
         $sfd.Filter = 'MP4 视频|*.mp4|MKV 视频|*.mkv'
         if ($sfd.ShowDialog($form) -eq 'OK') {
-            $a = @('-r', $sfd.FileName) + (Get-VideoArgs) + (Get-AudioArgs)
+            $a = @('-s', $tgt.Serial, '-r', $sfd.FileName) + (Get-VideoArgs) + (Get-AudioArgs)
             if ($settings.stayAwake) { $a += '-w' }
             if ([int]$settings.recTimeLimit -gt 0) { $a += "--time-limit=$($settings.recTimeLimit)" }
             if ($settings.recBackground) { $a += @('--no-window', '--no-playback') }
@@ -1120,7 +1515,11 @@ try {
         }
     })
 
-    $btnNd.Add_Click({ if (Test-AndroidVer 11 '独立窗口') { Show-NewDisplay $form } })
+    $btnNd.Add_Click({
+        $serial = Resolve-TargetForFeature $form 11 '独立窗口'   # 点击即定设备、查版本，不够直接弹提示并中止
+        if (-not $serial) { return }
+        Show-NewDisplay $form $serial
+    })
 
     # 设备状态轮询：仅在窗口处于前台时进行；最小化/失焦自动暂停，省电省资源
     $timer = New-Object System.Windows.Forms.Timer
