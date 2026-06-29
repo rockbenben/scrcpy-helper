@@ -1161,13 +1161,20 @@ function Show-DeviceManager {
         $btnCast.Enabled    = @($items | Where-Object { $_.Tag.Connected -and ($active -notcontains $_.Tag.Serial) }).Count -gt 0
         $btnStop.Enabled    = @($items | Where-Object { $active -contains $_.Tag.Serial }).Count -gt 0
         $btnAll.Enabled     = @($state.Connected | Where-Object { $active -notcontains $_ }).Count -gt 0
-        $btnDefault.Enabled = [bool]($one -and $one.Connected)
+        # 设为默认 ↔ 取消默认：选中的就是当前默认时，按钮变「取消默认」，让人知道再点是取消
+        if ($one -and $one.Connected) {
+            $btnDefault.Enabled = $true
+            $btnDefault.Text = if ($settings.defaultDevice -eq $one.Serial) { '取消默认' } else { '设为默认' }
+        } else {
+            $btnDefault.Enabled = $false; $btnDefault.Text = '设为默认'
+        }
         $btnDisc.Enabled    = [bool]($one -and $one.Connected -and $one.Wireless)
         $btnRename.Enabled  = [bool]$one
         $btnForget.Enabled  = [bool]($one -and -not $one.Connected)
     }
     $refresh = {
         $active = Get-ActiveSerials; $state.Active = $active
+        $selSerials = @($lv.SelectedItems | Where-Object { $_.Tag } | ForEach-Object { $_.Tag.Serial })   # 刷新前记住选中项
         $lv.BeginUpdate(); $lv.Items.Clear()
         $connected = @(Get-DeviceList); $state.Connected = $connected
         foreach ($s in $connected) {
@@ -1196,6 +1203,7 @@ function Show-DeviceManager {
             $empty = New-Object System.Windows.Forms.ListViewItem('（没有已连接或记住的设备，点下方「输入 IP 连接」或回主界面无线投屏）')
             $empty.ForeColor = $cMuted; [void]$lv.Items.Add($empty)
         }
+        foreach ($it in $lv.Items) { if ($it.Tag -and ($selSerials -contains $it.Tag.Serial)) { $it.Selected = $true } }   # 还原选中
         $lv.EndUpdate(); & $updateButtons
     }
 
@@ -1417,22 +1425,27 @@ try {
 
     # ---------------- 行为 ----------------
     $updateStatus = {
-        $devs = Get-DeviceList
+        $devs = @(Get-DeviceList)
         # 掉线且开了自动重连：后台 adb connect 连回上次的无线地址（不阻塞界面，下次刷新生效）
-        if (-not $devs -and $settings.autoReconnect -and $settings.lastWirelessAddr) {
+        if ($devs.Count -eq 0 -and $settings.autoReconnect -and $settings.lastWirelessAddr) {
             Start-Process -FilePath $adb -ArgumentList @('connect', $settings.lastWirelessAddr) -WindowStyle Hidden -WorkingDirectory $PSScriptRoot
         }
-        if ($devs) {
+        if ($devs.Count -gt 0) {
             $w = $devs | Where-Object { Test-Wireless $_ } | Select-Object -First 1
             if ($w) {
                 if ($settings.lastWirelessAddr -ne $w) { $settings.lastWirelessAddr = $w; Save-Settings }
                 Add-KnownDevice $w   # 任何方式连上的无线设备都自动记住，供「设备管理」重连
-                $type = '无线'
-            } else { $type = 'USB' }
+            }
+            # 状态显示哪台：默认设备（若在线）优先，否则无线优先，再否则第一台
+            $isDefault = $settings.defaultDevice -and ($devs -contains $settings.defaultDevice)
+            $dev = if ($isDefault) { $settings.defaultDevice } elseif ($w) { $w } else { $devs[0] }
+            $type = if (Test-Wireless $dev) { '无线' } else { 'USB' }
             $lblStatus.BackColor = $cGreenBg; $lblStatus.ForeColor = $cGreen
             $lblStatus.Text = "● 已连接 $type"
-            $dev = if ($w) { $w } else { $devs | Select-Object -First 1 }
-            $lblDevInfo.Text = (Get-DevInfo $dev).Text
+            $info = Get-DevInfo $dev
+            $ver = if ($info.Ver -gt 0) { " · Android $($info.Ver)" } else { '' }
+            $star = if ($isDefault -and $devs.Count -gt 1) { '★ ' } else { '' }   # 多设备时标出当前是默认那台
+            $lblDevInfo.Text = "$star$(Get-FriendlyName $dev)$ver"
         } else {
             $lblStatus.BackColor = $cTagBg; $lblStatus.ForeColor = $cMuted
             $lblStatus.Text = '○ 未连接'
