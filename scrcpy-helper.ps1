@@ -77,6 +77,8 @@ $defaults = @{
     recFormat = 'mp4'; recTimeLimit = 0; recBackground = $false
     # 通用
     liveStatus = $true; autoReconnect = $false; disconnectOnClose = $false; extraArgs = ''; lastWirelessAddr = ''; defaultDevice = ''
+    # 记住主窗口位置（-1 = 还没记，居中显示）
+    winX = -1; winY = -1
 }
 $settings = @{}
 foreach ($k in $defaults.Keys) { $settings[$k] = $defaults[$k] }
@@ -480,24 +482,67 @@ function New-Dialog {
     $d = New-Object System.Windows.Forms.Form
     $d.Text = $title; $d.ClientSize = New-Object System.Drawing.Size($w, $h)
     $d.Icon = Get-AppIcon
-    $d.StartPosition = 'CenterParent'; $d.FormBorderStyle = 'FixedDialog'
+    $d.FormBorderStyle = 'FixedDialog'
     $d.MaximizeBox = $false; $d.MinimizeBox = $false
     $d.Font = $owner.Font; $d.BackColor = $cPaper
+    # 不遮挡父窗口：弹窗放到父窗口右侧（放不下就放左侧），顶部对齐；都放不下才退回居中。最后夹到屏幕工作区内。
+    try {
+        $gap = 12
+        $sa = [System.Windows.Forms.Screen]::FromControl($owner).WorkingArea
+        $ob = $owner.Bounds
+        $dw = $d.Width; $dh = $d.Height
+        $x = $ob.Right + $gap
+        if (($x + $dw) -gt $sa.Right) { $x = $ob.Left - $gap - $dw }     # 右侧放不下 → 左侧
+        if ($x -lt $sa.Left -or ($x + $dw) -gt $sa.Right) {              # 两侧都放不下 → 居中于父窗
+            $x = $ob.Left + [int](($ob.Width - $dw) / 2)
+        }
+        $y = $ob.Top
+        if ($x -lt $sa.Left) { $x = $sa.Left }
+        if (($x + $dw) -gt $sa.Right) { $x = $sa.Right - $dw }
+        if ($y -lt $sa.Top) { $y = $sa.Top }
+        if (($y + $dh) -gt $sa.Bottom) { $y = $sa.Bottom - $dh }
+        $d.StartPosition = 'Manual'
+        $d.Location = New-Object System.Drawing.Point($x, $y)
+    } catch { $d.StartPosition = 'CenterParent' }
     return $d
 }
 
 function Show-Settings {
     param($owner)
-    $dlg = New-Dialog '设置' 500 396 $owner
+    $dlg = New-Dialog '设置' 570 340 $owner
     $tt = New-Object System.Windows.Forms.ToolTip
     $tt.AutoPopDelay = 12000
 
-    $tabs = New-Object System.Windows.Forms.TabControl
-    $tabs.Location = New-Object System.Drawing.Point(14, 14)
-    $tabs.Size = New-Object System.Drawing.Size(472, 320)
+    # 左侧分类导轨（取代横排标签页）：选中项＝朱砂竖条 + 墨黑粗体（呼应主界面品牌竖条），未选＝素纸灰。
+    # 右侧是对应的设置面板，按选中项切换显示。
+    $nav = New-Object System.Windows.Forms.ListBox
+    $nav.Location = New-Object System.Drawing.Point(14, 14)
+    $nav.Size = New-Object System.Drawing.Size(110, 264)
+    $nav.BorderStyle = 'None'; $nav.BackColor = $cPaper
+    $nav.DrawMode = 'OwnerDrawFixed'; $nav.ItemHeight = 33; $nav.IntegralHeight = $false
+    $nav.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10.5)
+    $nav.Add_DrawItem({
+        param($navSender, $e)
+        if ($e.Index -lt 0) { return }
+        $sel = ($e.Index -eq $nav.SelectedIndex)   # 按 SelectedIndex 判定，失焦也保持高亮
+        $g = $e.Graphics; $r = $e.Bounds
+        $bg = New-Object System.Drawing.SolidBrush($(if ($sel) { $cWhite } else { $cPaper }))
+        $g.FillRectangle($bg, $r); $bg.Dispose()
+        if ($sel) {
+            $red = New-Object System.Drawing.SolidBrush($cRed)
+            $g.FillRectangle($red, [int]$r.Left, [int]($r.Top + 7), 3, [int]($r.Height - 14)); $red.Dispose()
+        }
+        $fg = New-Object System.Drawing.SolidBrush($(if ($sel) { $cInk } else { $cMuted }))
+        $f = New-Object System.Drawing.Font('Microsoft YaHei UI', 10.5, $(if ($sel) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }))
+        $ty = $r.Top + ($r.Height - $f.GetHeight($g)) / 2
+        $g.DrawString([string]$nav.Items[$e.Index], $f, $fg, [single]($r.Left + 16), [single]$ty)
+        $fg.Dispose(); $f.Dispose()
+    })
+    $navDivider = New-Object System.Windows.Forms.Panel
+    $navDivider.Size = New-Object System.Drawing.Size(1, 264); $navDivider.Location = New-Object System.Drawing.Point(131, 14); $navDivider.BackColor = $cLine
 
     # ===== 常用（把最常用 / 最重要的几项聚合在第一页） =====
-    $tabCommon = New-Object System.Windows.Forms.TabPage; $tabCommon.Text = '常用'
+    $tabCommon = New-Object System.Windows.Forms.Panel
     # 顺序按使用度：人人都调的清晰度/声音在前，只无线用户才碰的两项沉到最后
     $nudSize = New-Nud $settings.maxSize 0 4096 16 250 13
     $chkAudio = New-Chk '把手机声音也传到电脑' $settings.audioOn 14 46
@@ -516,7 +561,7 @@ function Show-Settings {
         $chkAudio, $chkStay, $chkScreenOff, $chkReconnect, $chkDisconnect))
 
     # ===== 画面 =====
-    $tabVideo = New-Object System.Windows.Forms.TabPage; $tabVideo.Text = '画面'
+    $tabVideo = New-Object System.Windows.Forms.Panel
     $nudFps  = New-Nud $settings.maxFps  0 240 5  250 16
     $nudBit  = New-Nud $settings.bitRate 0 50  1  250 52
     $cbVCodec = New-Combo @('默认（H.264，兼容最好）', 'H.265（更清晰）', 'AV1（更省流量）') @('', 'h265', 'av1') $settings.videoCodec 110 88 230
@@ -535,7 +580,7 @@ function Show-Settings {
         (New-Caption '宽:高:左:上，留空=投整屏。例 1080:1080:0:300' 14 150)))
 
     # ===== 声音 =====
-    $tabAudio = New-Object System.Windows.Forms.TabPage; $tabAudio.Text = '声音'
+    $tabAudio = New-Object System.Windows.Forms.Panel
     $cbASrc = New-Combo @('手机外放声音', '麦克风') @('', 'mic') $settings.audioSource 110 50 230
     $cbACodec = New-Combo @('默认（Opus）', 'AAC（兼容）', 'FLAC（无损）', '原始 PCM') @('', 'aac', 'flac', 'raw') $settings.audioCodec 110 88 230
     $lblAudioTip = New-Lbl '是否传声音，请到「常用」页开关。下面是进阶项：' 14 18; $lblAudioTip.ForeColor = $cMuted
@@ -547,7 +592,7 @@ function Show-Settings {
         (New-Lbl '音频编码：' 14 91), $cbACodec))
 
     # ===== 控制 =====
-    $tabCtrl = New-Object System.Windows.Forms.TabPage; $tabCtrl.Text = '控制'
+    $tabCtrl = New-Object System.Windows.Forms.Panel
     $cbKb = New-Combo @('默认（推荐，能打中文）', '游戏模式（更跟手，不能打中文）', 'USB 直连（特殊情况）') @('', 'uhid', 'aoa') $settings.keyboard 110 13 300
     $cbMouse = New-Combo @('默认（推荐）', '游戏模式（更跟手）', 'USB 直连（特殊情况）') @('', 'uhid', 'aoa') $settings.mouse 110 49 300
     # 顺序按使用度：键鼠模式在前，常用的「只投屏」「关窗息屏」次之，niche 的触摸点 / 手柄沉底
@@ -565,7 +610,7 @@ function Show-Settings {
         $chkNoCtrl, $chkPowerOff, $chkTouches, $chkGamepad))
 
     # ===== 窗口 =====
-    $tabWin = New-Object System.Windows.Forms.TabPage; $tabWin.Text = '窗口'
+    $tabWin = New-Object System.Windows.Forms.Panel
     $chkFull = New-Chk '启动即全屏' $settings.fullscreen 14 18
     $chkTop = New-Chk '窗口总在最前' $settings.onTop 14 50
     $chkBorderless = New-Chk '无边框窗口' $settings.borderless 14 82
@@ -573,7 +618,7 @@ function Show-Settings {
     $tabWin.Controls.AddRange(@($chkFull, $chkTop, $chkBorderless))
 
     # ===== 独立窗口 =====
-    $tabNd = New-Object System.Windows.Forms.TabPage; $tabNd.Text = '独立窗口'
+    $tabNd = New-Object System.Windows.Forms.Panel
     $cbNdSize = New-Object System.Windows.Forms.ComboBox
     $cbNdSize.DropDownStyle = 'DropDown'
     $cbNdSize.Location = New-Object System.Drawing.Point(14, 42); $cbNdSize.Size = New-Object System.Drawing.Size(200, 26)
@@ -589,7 +634,7 @@ function Show-Settings {
         $chkNoDecor))
 
     # ===== 录制 =====
-    $tabRec = New-Object System.Windows.Forms.TabPage; $tabRec.Text = '录制'
+    $tabRec = New-Object System.Windows.Forms.Panel
     $cbRecFmt = New-Combo @('mp4', 'mkv') @('mp4', 'mkv') $settings.recFormat 110 15 110
     $nudTime = New-Nud $settings.recTimeLimit 0 86400 10 250 51
     $chkRecBg = New-Chk '后台录制（不显示画面，更省资源）' $settings.recBackground 14 90
@@ -601,10 +646,10 @@ function Show-Settings {
         $chkRecBg))
 
     # ===== 通用 =====
-    $tabGen = New-Object System.Windows.Forms.TabPage; $tabGen.Text = '通用'
+    $tabGen = New-Object System.Windows.Forms.Panel
     $chkLive = New-Chk '自动刷新连接状态显示（只更新上方那行文字）' $settings.liveStatus 14 18
     $txtExtra = New-Object System.Windows.Forms.TextBox
-    $txtExtra.Location = New-Object System.Drawing.Point(14, 78); $txtExtra.Size = New-Object System.Drawing.Size(406, 24)
+    $txtExtra.Location = New-Object System.Drawing.Point(14, 78); $txtExtra.Size = New-Object System.Drawing.Size(392, 24)
     $txtExtra.Text = $settings.extraArgs
     $lblExHint = New-Lbl '例如：--angle=90   --display-id=1   --time-limit=300' 14 108; $lblExHint.ForeColor = $cMuted
     $tt.SetToolTip($chkLive, '它只决定窗口顶部「已连接/未连接」多久自动更新一次，不影响投屏。开着时仅在窗口处于前台才每几秒刷一次；关掉后改为手动点「刷新」，更省资源。')
@@ -613,13 +658,23 @@ function Show-Settings {
         $chkLive,
         (New-Lbl '高级·其它命令行参数（看不懂就留空，多个用空格隔开）：' 14 52), $txtExtra, $lblExHint))
 
-    $tabs.TabPages.AddRange(@($tabCommon, $tabVideo, $tabAudio, $tabCtrl, $tabWin, $tabNd, $tabRec, $tabGen))
-    foreach ($tp in $tabs.TabPages) { $tp.UseVisualStyleBackColor = $false; $tp.BackColor = $cPaper }
-    $dlg.Controls.Add($tabs)
+    # 把 8 个面板叠放到右侧内容区，只显示选中的那个；导轨切换驱动显示
+    $panels = @($tabCommon, $tabVideo, $tabAudio, $tabCtrl, $tabWin, $tabNd, $tabRec, $tabGen)
+    foreach ($p in $panels) {
+        $p.Location = New-Object System.Drawing.Point(140, 14); $p.Size = New-Object System.Drawing.Size(416, 264)
+        $p.BackColor = $cPaper; $p.Visible = $false; $dlg.Controls.Add($p)
+    }
+    @('常用', '画面', '声音', '控制', '窗口', '独立窗口', '录制', '通用') | ForEach-Object { [void]$nav.Items.Add($_) }
+    $nav.Add_SelectedIndexChanged({
+        for ($i = 0; $i -lt $panels.Count; $i++) { $panels[$i].Visible = ($i -eq $nav.SelectedIndex) }
+        $nav.Invalidate()   # 强制整条导轨重绘，否则上一个选中项的朱砂高亮可能不刷新、看起来两个都选中
+    })
+    $dlg.Controls.Add($nav); $dlg.Controls.Add($navDivider)
+    $nav.SelectedIndex = 0
 
-    $btnSave = New-PrimaryBtn '保存' 290 350 96 34 10
+    $btnSave = New-PrimaryBtn '保存' 358 292 96 34 10
     $btnCancel = New-Object System.Windows.Forms.Button
-    $btnCancel.Text = '取消'; $btnCancel.Size = New-Object System.Drawing.Size(96, 34); $btnCancel.Location = New-Object System.Drawing.Point(392, 350)
+    $btnCancel.Text = '取消'; $btnCancel.Size = New-Object System.Drawing.Size(96, 34); $btnCancel.Location = New-Object System.Drawing.Point(460, 292)
     $btnCancel.Add_Click({ $dlg.Close() })
     $btnSave.Add_Click({
         $ndText = $cbNdSize.Text.Trim()
@@ -666,7 +721,7 @@ function Show-Settings {
         $dlg.Close()
     })
     $btnReset = New-Object System.Windows.Forms.Button
-    $btnReset.Text = '恢复默认'; $btnReset.Size = New-Object System.Drawing.Size(110, 34); $btnReset.Location = New-Object System.Drawing.Point(14, 350)
+    $btnReset.Text = '恢复默认'; $btnReset.Size = New-Object System.Drawing.Size(110, 34); $btnReset.Location = New-Object System.Drawing.Point(14, 292)
     $btnReset.Add_Click({
         if ([System.Windows.Forms.MessageBox]::Show('确定把所有设置恢复为默认值吗？', '恢复默认', 'YesNo', 'Warning') -eq 'Yes') {
             foreach ($k in @($defaults.Keys)) { $settings[$k] = $defaults[$k] }
@@ -1005,18 +1060,19 @@ function Resolve-Target {
 # 对「有版本要求」的功能（摄像头需 12+、独立窗口需 11+）：点一下就先定目标设备、查它的实际版本，
 # 不够直接弹提示并返回 $null（调用方据此中止，连功能弹窗都不会打开）。够了/读不到版本则返回目标序列号。
 function Resolve-TargetForFeature {
-    param($owner, [int]$Need, [string]$Feature, [string]$Prefer = '')
-    $t = Resolve-Target $owner -Prefer $Prefer
-    if (-not $t.Ok) {
-        if ($t.Reason -eq 'none') { [System.Windows.Forms.MessageBox]::Show("没检测到手机，请先连接手机再使用「$Feature」。", $Feature) | Out-Null }
+    param($owner, [int]$Need, [string]$Feature)
+    $devs = @(Get-DeviceList)
+    if ($devs.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show("没检测到手机，请先连接手机再使用「$Feature」。", $Feature) | Out-Null; return $null }
+    # 先把版本不够的设备排除在候选之外，再在「合格设备」里定目标：
+    # 2 台里排掉 1 台后只剩 1 台就直接用，不必再弹窗问。读不到版本的当「未知」、不排除（交给 scrcpy 兜底）。
+    $eligible = @($devs | Where-Object { $v = (Get-DevInfo $_).Ver; ($v -eq 0) -or ($v -ge $Need) })
+    if ($eligible.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("「$Feature」需要手机系统为 Android $Need 及以上。`n当前连接的设备都不满足，换一台或升级系统后再试。", $Feature) | Out-Null
         return $null
     }
-    $ver = (Get-DevInfo $t.Serial).Ver
-    if ($Need -gt 0 -and $ver -gt 0 -and $ver -lt $Need) {
-        [System.Windows.Forms.MessageBox]::Show("「$Feature」需要手机系统为 Android $Need 及以上。`n这台是 Android $ver，用不了这个功能。", $Feature) | Out-Null
-        return $null
-    }
-    return $t.Serial   # 版本够，或读不到版本（不拦截，交给 scrcpy 自行处理）
+    if ($eligible.Count -eq 1) { return $eligible[0] }
+    if ($settings.defaultDevice -and ($eligible -contains $settings.defaultDevice)) { return $settings.defaultDevice }
+    return (Select-Device $owner $eligible "$Feature · 选择设备")
 }
 
 # ---------------- 无线：输入 IP 直连（保底连法，不限系统版本；无需配对码） ----------------
@@ -1241,7 +1297,15 @@ try {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'scrcpy 投屏助手'
     $form.ClientSize = New-Object System.Drawing.Size(512, 384)
-    $form.StartPosition = 'CenterScreen'
+    # 记住上次的位置：存过且仍落在可见屏幕范围内就沿用，否则居中（换了显示器/分辨率也不会跑到屏幕外）
+    $savedX = [int]$settings.winX; $savedY = [int]$settings.winY
+    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    if (($savedX -ge 0 -or $savedY -ge 0) -and $savedX -ge $vs.Left -and $savedX -le ($vs.Right - 120) -and $savedY -ge $vs.Top -and $savedY -le ($vs.Bottom - 60)) {
+        $form.StartPosition = 'Manual'
+        $form.Location = New-Object System.Drawing.Point($savedX, $savedY)
+    } else {
+        $form.StartPosition = 'CenterScreen'
+    }
     $form.FormBorderStyle = 'FixedSingle'
     $form.MaximizeBox = $false
     $form.BackColor = $cPaper
@@ -1332,8 +1396,8 @@ try {
     # 图标以 base64 内嵌，打包不需附带图片文件。
     $ghB64 = 'iVBORw0KGgoAAAANSUhEUgAAACQAAAAkCAYAAADhAJiYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAOkSURBVFhH7ZdXU1sxEIX550lIo5liSgyG0EzL0DEEDMEYMAyYYooxvYQAaf9hM58cORfp2r4OkwkPPJxBSGd3j3RX2nXJz69X8phQYk78bzwJKoQHCbq5OpbTw6Qc7CbkYHddjZkzecWgaEFXZweyOD8l/aGgNDdWSX3NG6mteqnAmLm+7qDiwDXtC8GzoLvrU4lMDUuTv1yqyp5JTWWp+KtfS33NW2mozYAxc6zBaawrk5nJIbn9fGL5ywVPgtJ7CWlrrlVBCEggLSIX4MDFpjVQqz6r6dcNBQUlN5alzpfZtRchJrDBFh/biSXLv4m8glI761Lne6VAfvjKn0t1xQs1zieONThwsWGMIPJsP7lmxfEk6MvlkUpQnOCso7Ve1uKfJDzarwISSIPAOrgGnImRPmXT2daQFYTP64tDK15BQTjTiUmA6fBgdu38eE8mRnplanxAVhYjsrkWU2A8Nf5Bxod75exoN8vnMmiR+GTdjJdX0Ek6+fszZT4BzqKzExbPK2KfJpUPfOGTkzo+2LZ4wFUQu9Q70oLGhnosnldw2lqQPvHJsQGLByxB327O1TXlhHSSkh+rS7OWsVesxefVTdP+8N0aqFGxTK4l6Ci1dU8Mx9vTGbAMiwWvN76coo5SmxbPEpRYjWaPV3+uhbmwZVgsKCWm3/WVqMWzBLkZcuQmr1gkVhcsv8QyeZYgTsM0fEj+aPAemX7dTt4StLwwbRnOTY9ahsViPjJu+SWWybMEba0vqlulDUnE3q4Wy7BY0K44bxoxiGXyLEG8wtQeZ1uBKOqayfUKuoVMv5Txx19iEMvkWoJ+3F1K1/vG7BVlVxwvb9PlacpyUAjY0Lo4rzxjYhDL5FuCAMlGzcGYuhPqeKf+pzDGY5G8xVEDTjw2o2ycrYuuZ24JDVwF4YzOsLqiVCUjO0EYjvj2gYZKCXUEXOvRSXpbrcHhZKnyzlaFpq3JX5FzU66CAG8EAgCimOOY9VxLk8/16WeuPei/dzGcwNbt/dHIKYhT6etuUQ5IQHb0/fZClqIf1TNAiTFtNMKjf4qphi6q+HTLHY2cgsD1RVolM6K4+l5/RVDJnYK0GHzh0+Q7kVcQ4JbQLSKKvOoPtSpx+fojukqnIGzbg/WebmlBQYCfMfRDOn/A6GDI4mnQTSKIS0EujQ2FPP8U8iRIY2czns2rfA2bFg8XG3M9H4oSpHG4vyEXJ/vWvAZrcMx5L/grQf8ST4IK4dEJ+gX3m3AeIyd/VAAAAABJRU5ErkJggg=='
     $btnGh = New-Object System.Windows.Forms.PictureBox
-    # 与链接按钮同 y、同高(26)，Zoom 把图标在框内垂直居中 → 和「刷新」等文字基线对齐
-    $btnGh.Size = New-Object System.Drawing.Size(18, 26); $btnGh.Location = New-Object System.Drawing.Point(466, 334)
+    # 与链接按钮同高(26)、但整体上移 2px：octocat 的包围盒含底部小尾巴，几何居中会显得偏低，微提更平
+    $btnGh.Size = New-Object System.Drawing.Size(18, 26); $btnGh.Location = New-Object System.Drawing.Point(466, 332)
     $btnGh.SizeMode = 'Zoom'; $btnGh.BackColor = $cPaper
     $btnGh.Cursor = [System.Windows.Forms.Cursors]::Hand
     try { $btnGh.Image = [System.Drawing.Image]::FromStream((New-Object System.IO.MemoryStream(,[Convert]::FromBase64String($ghB64)))) } catch {}
@@ -1534,6 +1598,12 @@ try {
         if (Test-Recording) {
             $r = [System.Windows.Forms.MessageBox]::Show("正在录屏。关闭助手会停止录制（已录部分会保存）。`n`n确定要关闭吗？`n（想继续录、只收起助手，请点最小化）", '正在录屏', 'YesNo', 'Warning')
             if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { $e.Cancel = $true; return }
+        }
+        # 记住这次的窗口位置（仅正常状态，避免存到最小化时的 -32000）
+        if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Normal) {
+            if ($settings.winX -ne $form.Location.X -or $settings.winY -ne $form.Location.Y) {
+                $settings.winX = $form.Location.X; $settings.winY = $form.Location.Y; Save-Settings
+            }
         }
         Stop-AllScrcpy
         if ($settings.disconnectOnClose) { try { & $adb disconnect 2>$null | Out-Null } catch {} }
