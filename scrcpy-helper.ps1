@@ -49,6 +49,37 @@ if (-not (Test-Path -LiteralPath $exe)) {
     return
 }
 
+# 同步执行 adb/scrcpy 并取回输出（用于 devices/getprop/connect/--list-* 等一次性查询）。
+# 不用 `& $adb ...` 调用操作符：宿主虽是 -WindowStyle Hidden 的 powershell，但它的控制台仍然存在（只是被隐藏），
+# `&` 启动 adb.exe/scrcpy.exe 这类控制台子程序时仍可能瞬间闪出一个新控制台窗口。改用 ProcessStartInfo 显式
+# CreateNoWindow=true，从源头不创建窗口，而不是创建后再隐藏。顺带用 UTF8 直读输出，不再依赖宿主控制台编码。
+function Invoke-Hidden {
+    param([string]$FilePath, [string[]]$ArgumentList = @(), [switch]$DiscardStderr)
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $FilePath
+    # 不用 ProcessStartInfo.ArgumentList：本助手宿主是 Windows PowerShell 5.1（投屏助手-双击运行.bat 里调用的
+    # powershell.exe），实测该属性取出来是 $null、Add 直接报错（“cannot call a method on a null-valued expression”）。
+    # 改拼 Arguments 命令行串，和 Start-Scrcpy（上面 234 行）给含空格参数补引号的写法保持一致。
+    $psi.Arguments = (@($ArgumentList | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    try { $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8 } catch {}
+    try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { return @() }
+    # 并发读 stdout/stderr 再 WaitForExit：先 ReadToEnd 一路再读另一路，输出量大时（如 --list-apps 装机多）
+    # 会把另一路的管道缓冲区写满，子进程卡在 write 上不退出，PowerShell 卡在 ReadToEnd 上——互相等死。
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    [System.Threading.Tasks.Task]::WaitAll(@($outTask, $errTask))
+    $proc.WaitForExit()
+    $stdout = $outTask.Result
+    $stderr = if ($DiscardStderr) { '' } else { $errTask.Result }
+    $combined = if ($stderr) { "$stdout`n$stderr" } else { $stdout }
+    if (-not $combined) { return @() }
+    return @($combined -split "`r?`n")
+}
+
 # 「独立窗口」可一键打开的最常用 App（按使用度排，购物类靠后）；其余 App 用「更多应用…」从手机列表里挑
 $apps = [ordered]@{
     '微信'   = 'com.tencent.mm'
@@ -192,7 +223,7 @@ function Get-CameraSizes {
     $result = @{ back = @(); front = @() }
     try {
         $argv = @(); if ($serial) { $argv += @('-s', $serial) }; $argv += '--list-camera-sizes'
-        $out = (& $exe $argv 2>&1 | Out-String)
+        $out = (Invoke-Hidden -FilePath $exe -ArgumentList $argv) -join "`n"
     } catch { return $result }
     if (-not $out) { return $result }
     $facing = $null
@@ -281,7 +312,7 @@ function Stop-DeviceScrcpy {
 # 读取已连接设备序列号列表（state=device）
 function Get-DeviceList {
     try {
-        $out = & $adb devices 2>$null
+        $out = Invoke-Hidden -FilePath $adb -ArgumentList @('devices') -DiscardStderr
         $lines = $out | Select-Object -Skip 1 | Where-Object { $_ -match "`tdevice$" }
         return @($lines | ForEach-Object { ($_ -split "`t")[0] })
     } catch { return @() }
@@ -297,8 +328,8 @@ function Get-DevInfo {
     if ($script:devInfo.ContainsKey($serial)) { return $script:devInfo[$serial] }
     $ver = 0; $txt = ''
     try {
-        $vraw  = ((& $adb -s $serial shell getprop ro.build.version.release 2>$null | Select-Object -First 1) | Out-String).Trim()
-        $model = ((& $adb -s $serial shell getprop ro.product.model       2>$null | Select-Object -First 1) | Out-String).Trim()
+        $vraw  = ((Invoke-Hidden -FilePath $adb -ArgumentList @('-s', $serial, 'shell', 'getprop', 'ro.build.version.release') -DiscardStderr | Select-Object -First 1) | Out-String).Trim()
+        $model = ((Invoke-Hidden -FilePath $adb -ArgumentList @('-s', $serial, 'shell', 'getprop', 'ro.product.model') -DiscardStderr | Select-Object -First 1) | Out-String).Trim()
         if ($vraw -match '^(\d+)') { $ver = [int]$matches[1] }
         if ($vraw)  { $txt = "Android $vraw" }
         if ($model) { $txt = if ($txt) { "$txt · $model" } else { $model } }
@@ -779,7 +810,7 @@ function Show-AppPicker {
     $owner.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     # 必须带 -s 指定设备：多设备连接时 scrcpy --list-apps 不指定设备会因「有多台设备」直接失败、列不出 App
     $listArgs = if ($serial) { @('-s', $serial, '--list-apps') } else { @('--list-apps') }
-    try { $raw = (& $exe @listArgs 2>&1) -join "`n" } catch { $raw = '' }
+    try { $raw = (Invoke-Hidden -FilePath $exe -ArgumentList $listArgs) -join "`n" } catch { $raw = '' }
     $owner.Cursor = [System.Windows.Forms.Cursors]::Default
     $list = @()
     foreach ($line in ($raw -split "`n")) {
@@ -976,7 +1007,7 @@ function Show-WirelessPair {
         if ($pairAddr -notmatch '^(\d{1,3}(\.\d{1,3}){3}):\d+$') { [System.Windows.Forms.MessageBox]::Show('配对地址格式应为 IP:端口，例如 192.168.1.5:37123。', '配对') | Out-Null; return }
         $ip = $matches[1]
         if ($code -notmatch '^\d{6}$') { [System.Windows.Forms.MessageBox]::Show('配对码应为 6 位数字。', '配对') | Out-Null; return }
-        try { $pairOut = (& $adb pair $pairAddr $code 2>&1) -join "`n" } catch { $pairOut = $_.Exception.Message }
+        try { $pairOut = (Invoke-Hidden -FilePath $adb -ArgumentList @('pair', $pairAddr, $code)) -join "`n" } catch { $pairOut = $_.Exception.Message }
         if ($pairOut -notmatch 'Successfully paired') {
             [System.Windows.Forms.MessageBox]::Show("配对失败。请核对配对地址和配对码（配对码会过期，必要时在手机上重新生成一个）。`n`n$pairOut", '配对') | Out-Null
             return
@@ -984,7 +1015,7 @@ function Show-WirelessPair {
         # 配对成功：用 mdns 自动发现连接端口（同一 IP，端口不同），轮询几次等服务出现
         $connAddr = $null
         for ($i = 0; $i -lt 5 -and -not $connAddr; $i++) {
-            try { $mdns = (& $adb mdns services 2>&1) -join "`n" } catch { $mdns = '' }
+            try { $mdns = (Invoke-Hidden -FilePath $adb -ArgumentList @('mdns', 'services')) -join "`n" } catch { $mdns = '' }
             foreach ($line in ($mdns -split "`n")) {
                 if ($line -match '_adb-tls-connect\._tcp' -and $line -match "($([regex]::Escape($ip)):\d+)") { $connAddr = $matches[1]; break }
             }
@@ -998,7 +1029,7 @@ function Show-WirelessPair {
             if ($port -notmatch '^\d+$') { [System.Windows.Forms.MessageBox]::Show('端口应为纯数字。', '配对') | Out-Null; return }
             $connAddr = "${ip}:$port"
         }
-        try { $connOut = (& $adb connect $connAddr 2>&1) -join "`n" } catch { $connOut = $_.Exception.Message }
+        try { $connOut = (Invoke-Hidden -FilePath $adb -ArgumentList @('connect', $connAddr)) -join "`n" } catch { $connOut = $_.Exception.Message }
         if ($connOut -match 'connected to') {
             $result.addr = $connAddr
             $dlg.Close()
@@ -1156,7 +1187,7 @@ function Ensure-Devices {
     } catch { $busy = $null }
 
     foreach ($addr in $reachable) {
-        try { & $adb connect $addr 2>&1 | Out-Null } catch {}
+        try { Invoke-Hidden -FilePath $adb -ArgumentList @('connect', $addr) | Out-Null } catch {}
     }
 
     if ($busy) { try { $busy.Close(); $busy.Dispose() } catch {} }
@@ -1213,7 +1244,7 @@ function Connect-ByIp {
         if (-not $port) { $port = '5555' }
         if ($port -notmatch '^\d+$') { [System.Windows.Forms.MessageBox]::Show('端口应为纯数字，常见是 5555。', '输入 IP 连接') | Out-Null; return }
         $addr = "${ip}:$port"
-        try { $out = (& $adb connect $addr 2>&1) -join "`n" } catch { $out = $_.Exception.Message }
+        try { $out = (Invoke-Hidden -FilePath $adb -ArgumentList @('connect', $addr)) -join "`n" } catch { $out = $_.Exception.Message }
         if ($out -match 'connected to') {
             $result.addr = $addr; $dlg.Close()
         } else {
@@ -1333,7 +1364,7 @@ function Show-DeviceManager {
         $owner.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         foreach ($it in $items) {
             $addr = $it.Tag.Serial
-            try { $out = (& $adb connect $addr 2>&1) -join "`n" } catch { $out = $_.Exception.Message }
+            try { $out = (Invoke-Hidden -FilePath $adb -ArgumentList @('connect', $addr)) -join "`n" } catch { $out = $_.Exception.Message }
             if ($out -match 'connected to') { Add-KnownDevice $addr } else { $fail += "$addr：$out" }
         }
         $owner.Cursor = [System.Windows.Forms.Cursors]::Default
@@ -1381,7 +1412,7 @@ function Show-DeviceManager {
         $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
         $addr = $items[0].Tag.Serial
         Stop-DeviceScrcpy $addr   # 断开前先停掉它的投屏窗口，避免悬空
-        try { & $adb disconnect $addr 2>$null | Out-Null } catch {}
+        try { Invoke-Hidden -FilePath $adb -ArgumentList @('disconnect', $addr) -DiscardStderr | Out-Null } catch {}
         if ($settings.defaultDevice -eq $addr) { $settings.defaultDevice = ''; Save-Settings }
         & $refresh
     })
@@ -1781,10 +1812,10 @@ try {
             }
         }
         Stop-AllScrcpy
-        if ($settings.disconnectOnClose) { try { & $adb disconnect 2>$null | Out-Null } catch {} }
+        if ($settings.disconnectOnClose) { try { Invoke-Hidden -FilePath $adb -ArgumentList @('disconnect') -DiscardStderr | Out-Null } catch {} }
         # 关助手时顺手结束自带 adb.exe 的常驻 server 进程，避免它残留在后台、还得去任务管理器手动杀。
         # 用本助手目录里的 adb 自己 kill-server（只停默认端口的 server，下次用到会自动重启）。
-        try { & $adb kill-server 2>$null | Out-Null } catch {}
+        try { Invoke-Hidden -FilePath $adb -ArgumentList @('kill-server') -DiscardStderr | Out-Null } catch {}
     })
     $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose() })
 
