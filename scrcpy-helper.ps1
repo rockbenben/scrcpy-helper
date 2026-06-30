@@ -196,7 +196,10 @@ function Start-Scrcpy {
         $title = (Get-FriendlyName $serial) -replace '\s+', '-'
         if ($title) { $clean += "--window-title=$title" }
     }
-    $p = if ($clean.Count -gt 0) { Start-Process -FilePath $exe -ArgumentList $clean -WorkingDirectory $PSScriptRoot -PassThru }
+    # Start-Process 数组传参不会给「含空格的参数」加引号——会把录屏路径 C:\My Videos\x.mp4 拆成多段、
+    # 让 scrcpy 收到的 -r 路径残缺、录屏失败。这里自己给含空格/引号的参数补引号，整体作为命令行串传。
+    $cmd = (@($clean | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
+    $p = if ($cmd) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru }
     else { Start-Process -FilePath $exe -WorkingDirectory $PSScriptRoot -PassThru }
     if ($p) { [void]$scrcpyProcs.Add([pscustomobject]@{ Proc = $p; Rec = [bool]$Recording; Serial = $serial }) }
 }
@@ -738,9 +741,11 @@ function Show-Settings {
 # ---------------- 从手机已装 App 里挑一个（可搜索） ----------------
 # 用 scrcpy --list-apps 列出手机所有 App（带中文名），免去手动查包名。返回包名，取消返回 $null。
 function Show-AppPicker {
-    param($owner)
+    param($owner, $serial)
     $owner.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    try { $raw = (& $exe --list-apps 2>&1) -join "`n" } catch { $raw = '' }
+    # 必须带 -s 指定设备：多设备连接时 scrcpy --list-apps 不指定设备会因「有多台设备」直接失败、列不出 App
+    $listArgs = if ($serial) { @('-s', $serial, '--list-apps') } else { @('--list-apps') }
+    try { $raw = (& $exe @listArgs 2>&1) -join "`n" } catch { $raw = '' }
     $owner.Cursor = [System.Windows.Forms.Cursors]::Default
     $list = @()
     foreach ($line in ($raw -split "`n")) {
@@ -857,7 +862,7 @@ function Show-NewDisplay {
         $sel = [string]$cb.SelectedItem
         if ($sel -eq '管理我的常用应用…') { Show-ManageApps $owner; return }
         if ($sel -like '更多应用*') {
-            $app = Show-AppPicker $owner
+            $app = Show-AppPicker $owner $serial
             if (-not $app) { return }
             $target = "+$($app.Pkg)"
             # 挑完顺手问一句要不要记住，下次直接在下拉里选
