@@ -265,6 +265,30 @@ function Get-CameraSizes {
     return $result
 }
 
+# 读设备真实分辨率与密度（adb shell wm size / wm density），供「独立窗口·手机版面」用真实尺寸而非写死值。
+# 优先 Override（当前生效）再 Physical；按设备会话缓存（同一台只读一次）；读不到返回 $null 由调用方兜底。
+$script:devDisplayCache = @{}
+function Get-DeviceDisplay {
+    param($serial)
+    if (-not $serial) { return $null }
+    if ($script:devDisplayCache.ContainsKey($serial)) { return $script:devDisplayCache[$serial] }
+    $res = $null
+    try {
+        $szArgs = @(); if ($serial) { $szArgs += @('-s', $serial) }; $szArgs += @('shell', 'wm', 'size')
+        $dnArgs = @(); if ($serial) { $dnArgs += @('-s', $serial) }; $dnArgs += @('shell', 'wm', 'density')
+        $szOut = (Invoke-Hidden -FilePath $adb -ArgumentList $szArgs -DiscardStderr) -join "`n"
+        $dnOut = (Invoke-Hidden -FilePath $adb -ArgumentList $dnArgs -DiscardStderr) -join "`n"
+        $w = 0; $h = 0; $dpi = 0
+        if     ($szOut -match 'Override size:\s*(\d+)x(\d+)') { $w = [int]$matches[1]; $h = [int]$matches[2] }
+        elseif ($szOut -match 'Physical size:\s*(\d+)x(\d+)') { $w = [int]$matches[1]; $h = [int]$matches[2] }
+        if     ($dnOut -match 'Override density:\s*(\d+)') { $dpi = [int]$matches[1] }
+        elseif ($dnOut -match 'Physical density:\s*(\d+)') { $dpi = [int]$matches[1] }
+        if ($w -gt 0 -and $h -gt 0) { $res = @{ W = $w; H = $h; Dpi = $dpi } }
+    } catch {}
+    if ($res) { $script:devDisplayCache[$serial] = $res }   # 只缓存成功结果，失败下次可重试
+    return $res
+}
+
 # 启动 scrcpy（不阻塞界面；自动过滤空参数）
 function Start-Scrcpy {
     param([string[]]$Options, [switch]$Recording)
@@ -974,7 +998,14 @@ function Show-NewDisplay {
         $ndModeSel = [string]$cbMode.Vals[$cbMode.SelectedIndex]
         $ndSz = $settings.ndSize; $ndDpi = $settings.ndDpi
         switch ($ndModeSel) {
-            'portrait'  { $ndSz = '1080x2340'; $ndDpi = '420' }   # 手机竖屏比例 + 高 DPI → 应用走手机版面
+            'portrait'  {
+                # 手机版面：用设备真实分辨率/密度，确保虚拟屏和手机比例完全一致、不裁切；读不到才兜底通用竖屏值
+                $disp = Get-DeviceDisplay $serial
+                if ($disp) {
+                    $w = [Math]::Min($disp.W, $disp.H); $h = [Math]::Max($disp.W, $disp.H)   # 保证竖屏 W<H
+                    $ndSz = "${w}x${h}"; $ndDpi = if ($disp.Dpi -gt 0) { "$($disp.Dpi)" } else { '420' }
+                } else { $ndSz = '1080x2340'; $ndDpi = '420' }
+            }
             'landscape' { $ndSz = '1920x1080'; $ndDpi = '240' }
             'custom'    {
                 $ndSz  = ([Microsoft.VisualBasic.Interaction]::InputBox("分辨率（宽x高），如 1080x2340。`n留空 = 跟设备一致。", '独立窗口 - 自定义尺寸', $settings.ndSize)).Trim()
