@@ -1,5 +1,9 @@
 ﻿# scrcpy 投屏助手（图形界面）
 # 由「投屏助手-双击运行.bat」启动，无需手动运行本文件。
+# 启动器用 `conhost.exe --headless powershell ... -File 本文件`：Windows 11 默认终端是 Windows Terminal，
+# 它会无视 `powershell -WindowStyle Hidden`、始终留一个可见终端窗口；conhost --headless 则无窗口运行、
+# 且不移交给 Windows Terminal，从而彻底不出现残留窗口（纯脚本方案，不依赖 .vbs / 编译 exe）。
+# 注意：.bat 里不要写 rem 注释——cmd 对 rem 行的解析很脆弱，多条 rem 会导致整个 .bat 不执行；说明放这里。
 
 Set-Location -LiteralPath $PSScriptRoot
 
