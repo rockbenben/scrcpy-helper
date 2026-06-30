@@ -929,7 +929,15 @@ function Show-NewDisplay {
             'landscape' { $ndSz = '1920x1080'; $ndDpi = '240' }
             'custom'    {
                 $ndSz  = ([Microsoft.VisualBasic.Interaction]::InputBox("分辨率（宽x高），如 1080x2340。`n留空 = 跟设备一致。", '独立窗口 - 自定义尺寸', $settings.ndSize)).Trim()
+                if ($ndSz -and $ndSz -notmatch '^\d{3,4}x\d{3,4}$') {
+                    [System.Windows.Forms.MessageBox]::Show('分辨率格式应为 宽x高（用小写字母 x），例如 1080x2340。留空表示跟设备一致。', '独立窗口') | Out-Null
+                    return
+                }
                 $ndDpi = ([Microsoft.VisualBasic.Interaction]::InputBox("DPI（数字），如 420。留空 = 默认。`n数值越大，应用界面越像手机版。", '独立窗口 - 自定义 DPI', $settings.ndDpi)).Trim()
+                if ($ndDpi -and $ndDpi -notmatch '^\d+$') {
+                    [System.Windows.Forms.MessageBox]::Show('DPI 应为纯数字，例如 420。留空表示用默认。', '独立窗口') | Out-Null
+                    return
+                }
                 $settings.ndSize = $ndSz; $settings.ndDpi = $ndDpi
             }
         }
