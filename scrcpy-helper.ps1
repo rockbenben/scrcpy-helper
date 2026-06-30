@@ -67,12 +67,12 @@ $defaults = @{
     # 控制
     keyboard = ''; mouse = ''; gamepad = $false; noControl = $false
     screenOff = $false; stayAwake = $true; showTouches = $false; powerOffOnClose = $false
-    # 摄像头
-    camResMax = 1920
+    # 摄像头（存“最大边长档位”如 1920/1280/0，或实测精确尺寸如 1920x1080；统一按字符串存，避免重载时类型转换报错）
+    camResMax = '1920'
     # 窗口
     fullscreen = $false; onTop = $false; borderless = $false
     # 独立窗口
-    ndSize = ''; ndDpi = ''; ndNoDecor = $false
+    ndSize = ''; ndDpi = ''; ndNoDecor = $false; ndMode = 'settings'; ndFixed = $false
     # 录制
     recFormat = 'mp4'; recTimeLimit = 0; recBackground = $false
     # 通用
@@ -176,11 +176,44 @@ function Get-MirrorArgs {
     return (Get-VideoArgs) + (Get-AudioArgs) + (Get-ControlArgs -Wireless:$Wireless) + (Get-WindowArgs)
 }
 function Get-NewDisplayArgs {
-    $sz = $settings.ndSize; $dpi = $settings.ndDpi
+    param($sz = $settings.ndSize, $dpi = $settings.ndDpi, [bool]$fixed = $settings.ndFixed, [bool]$noDecor = $settings.ndNoDecor)
     $nd = if ($sz -and $dpi) { "--new-display=$sz/$dpi" } elseif ($sz) { "--new-display=$sz" } elseif ($dpi) { "--new-display=/$dpi" } else { '--new-display' }
-    $a = @($nd, '--flex-display')
-    if ($settings.ndNoDecor) { $a += '--no-vd-system-decorations' }
+    $a = @($nd)
+    # 固定方向时不加 --flex-display：虚拟屏不再跟着窗口尺寸变，避免最大化/全屏时画面循环自转。
+    if (-not $fixed) { $a += '--flex-display' }
+    if ($noDecor) { $a += '--no-vd-system-decorations' }
     return $a
+}
+# 运行 scrcpy --list-camera-sizes，按朝向解析出本机真正支持的采集分辨率。
+# 不同机型差别很大，写死 1080p 之类会触发 “Camera configuration error”（录像支持 ≠ 投屏采集支持），
+# 所以运行时按设备实拉，让用户只在“一定能开”的尺寸里选。任何失败都返回空表，调用方自行回退到通用档位。
+function Get-CameraSizes {
+    param([string]$serial)
+    $result = @{ back = @(); front = @() }
+    try {
+        $argv = @(); if ($serial) { $argv += @('-s', $serial) }; $argv += '--list-camera-sizes'
+        $out = (& $exe $argv 2>&1 | Out-String)
+    } catch { return $result }
+    if (-not $out) { return $result }
+    $facing = $null
+    foreach ($line in ($out -split "`r?`n")) {
+        if ($line -match '--camera-id=\d') {
+            # 摄像头分组头，如：--camera-id=0  (back, 4000x3000, fps=[...])；括号内 WxH 是传感器最大值，不计为可选项
+            if     ($line -match '\bfront\b')    { $facing = 'front' }
+            elseif ($line -match '\bback\b')     { $facing = 'back' }
+            elseif ($line -match '\bexternal\b') { $facing = 'back' }
+            else   { $facing = $null }
+            continue
+        }
+        if ($facing -and $line -match '(\d{3,5})x(\d{3,5})') {
+            $size = "$($Matches[1])x$($Matches[2])"
+            if ($result[$facing] -notcontains $size) { $result[$facing] += $size }
+        }
+    }
+    foreach ($f in @('back', 'front')) {
+        $result[$f] = @($result[$f] | Sort-Object -Property @{ Expression = { [int]($_ -split 'x')[0] * [int]($_ -split 'x')[1] } } -Descending)
+    }
+    return $result
 }
 
 # 启动 scrcpy（不阻塞界面；自动过滤空参数）
@@ -607,10 +640,11 @@ function Show-Settings {
     $tt.SetToolTip($chkNoCtrl, '只看画面、禁止鼠标键盘操作手机，适合演示/防误触。')
     $tt.SetToolTip($chkPowerOff, '结束投屏（关掉投屏窗口）时，顺手把手机屏幕熄灭，省电、防亮屏。')
     $tt.SetToolTip($chkGamepad, '把连在电脑上的游戏手柄映射给手机，适合手游。')
+    $capKbCn = New-Caption "中文打不进投屏窗口？这是 scrcpy 与 Windows 输入法的已知限制：电脑输入法「组词」阶段的字 scrcpy 收不到。`n· 临时：电脑里复制好，再在投屏窗口按 Ctrl+V 粘贴。`n· 彻底：手机装「ADBKeyboard」设为当前输入法；或键盘模式选「游戏模式」，用手机自带输入法打拼音。" 14 200
     $tabCtrl.Controls.AddRange(@(
         (New-Lbl '键盘模式：' 14 16), $cbKb,
         (New-Lbl '鼠标模式：' 14 52), $cbMouse,
-        $chkNoCtrl, $chkPowerOff, $chkTouches, $chkGamepad))
+        $chkNoCtrl, $chkPowerOff, $chkTouches, $chkGamepad, $capKbCn))
 
     # ===== 窗口 =====
     $tabWin = New-Object System.Windows.Forms.Panel
@@ -841,7 +875,7 @@ function Show-ManageApps {
 # ---------------- 独立窗口：选 App ----------------
 function Show-NewDisplay {
     param($owner, $serial)
-    $dlg = New-Dialog '独立窗口' 320 176 $owner
+    $dlg = New-Dialog '独立窗口' 320 308 $owner
 
     $l1 = New-Lbl '在电脑上单开一块屏，运行下面这个 App：' 18 18
     $l2 = New-Lbl '（手机本身照常用，互不影响；需 Android 11+）' 18 42; $l2.ForeColor = $cMuted
@@ -854,9 +888,15 @@ function Show-NewDisplay {
     [void]$cb.Items.Add('管理我的常用应用…')
     $cb.SelectedIndex = 0
 
-    $btnGo = New-PrimaryBtn '打开' 18 120 284 38 11
+    # 窗口比例/方向：微信、QQ 等手机应用在“横屏平板”虚拟屏上会用平板版面、显示不全，选「竖屏·手机」即用手机版面
+    $lblMode = New-Lbl '窗口比例' 18 120
+    $cbMode = New-Combo @('竖屏·手机版面（推荐微信/QQ）', '横屏·平板版面', '跟随“设置”里的尺寸', '自定义…') @('portrait', 'landscape', 'settings', 'custom') $settings.ndMode 86 117 216
+    $chkFixed = New-Chk '固定方向（最大化时画面不乱转）' $settings.ndFixed 18 152
+    $capMode = New-Caption "竖屏适合聊天/刷信息；横屏适合看视频。乱转就勾上「固定方向」。`n应用双开/分身在独立窗口常黑屏、点不到，建议改用普通投屏在手机上开分身。" 18 176
+
+    $btnGo = New-PrimaryBtn '打开' 18 228 284 38 11
     $btnGo.Add_Click({ $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close() })
-    $dlg.Controls.AddRange(@($l1, $l2, $cb, $btnGo))
+    $dlg.Controls.AddRange(@($l1, $l2, $cb, $lblMode, $cbMode, $chkFixed, $capMode, $btnGo))
     $dlg.AcceptButton = $btnGo
     if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
         $sel = [string]$cb.SelectedItem
@@ -881,8 +921,21 @@ function Show-NewDisplay {
         elseif ($apps.Contains($sel)) { $target = '+' + $apps[$sel] }
         elseif ($script:customApps.Contains($sel)) { $target = '+' + $script:customApps[$sel] }
         else { return }
+        # 按所选比例/方向算出虚拟屏尺寸与 DPI
+        $ndModeSel = [string]$cbMode.Vals[$cbMode.SelectedIndex]
+        $ndSz = $settings.ndSize; $ndDpi = $settings.ndDpi
+        switch ($ndModeSel) {
+            'portrait'  { $ndSz = '1080x2340'; $ndDpi = '420' }   # 手机竖屏比例 + 高 DPI → 应用走手机版面
+            'landscape' { $ndSz = '1920x1080'; $ndDpi = '240' }
+            'custom'    {
+                $ndSz  = ([Microsoft.VisualBasic.Interaction]::InputBox("分辨率（宽x高），如 1080x2340。`n留空 = 跟设备一致。", '独立窗口 - 自定义尺寸', $settings.ndSize)).Trim()
+                $ndDpi = ([Microsoft.VisualBasic.Interaction]::InputBox("DPI（数字），如 420。留空 = 默认。`n数值越大，应用界面越像手机版。", '独立窗口 - 自定义 DPI', $settings.ndDpi)).Trim()
+                $settings.ndSize = $ndSz; $settings.ndDpi = $ndDpi
+            }
+        }
+        $settings.ndMode = $ndModeSel; $settings.ndFixed = $chkFixed.Checked; Save-Settings
         $pre = if ($serial) { @('-s', $serial) } else { @() }
-        Start-Scrcpy ($pre + (Get-NewDisplayArgs) + "--start-app=$target")
+        Start-Scrcpy ($pre + (Get-NewDisplayArgs $ndSz $ndDpi $chkFixed.Checked $settings.ndNoDecor) + "--start-app=$target")
     }
 }
 
@@ -1050,9 +1103,61 @@ function Select-Device {
 # 决定这次投屏用哪台设备。返回 @{ Ok; Serial; Reason }：
 #   Ok=$true 时 Serial 可用；Ok=$false 时 Reason='none'(没设备) 或 'cancel'(多设备时用户取消选择)。
 # 规则：0 台→none；1 台→用它；多台→优先「默认设备」，否则按偏好类型唯一匹配，再否则弹窗让用户选。
+# 快速探测「ip:port」此刻是否可连（TCP 半连接 + 超时）。关键：离线设备若直接 adb connect 会卡满
+# 系统 TCP 超时（Windows 上每个死地址约 21 秒），先用它筛掉不可达地址，自动重连就不会一直转圈。
+function Test-TcpOpen {
+    param([string]$addr, [int]$timeoutMs = 700)
+    $parts = $addr -split ':'
+    $ip = $parts[0]; $port = if ($parts.Count -gt 1 -and $parts[1]) { [int]$parts[1] } else { 5555 }
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect($ip, $port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($timeoutMs)) { return $false }
+        $client.EndConnect($iar); return $true
+    } catch { return $false } finally { try { $client.Close() } catch {} }
+}
+
+# 没检测到设备、但有「记住的无线设备」时，先尝试连回来，再返回刷新后的设备列表。
+# 先 TCP 探测筛掉离线地址（只对在线的 adb connect），期间弹「正在连接…」小提示而非干转圈；
+# 连不上不弹错，交给调用方走原有兜底（选连接方式 / 没检测到手机）。
+function Ensure-Devices {
+    param($owner)
+    $devs = @(Get-DeviceList)
+    if ($devs.Count -gt 0 -or $script:knownDevices.Count -eq 0) { return $devs }
+
+    # 先快速探测哪些记住的设备此刻在线，不可达的直接跳过，避免对死地址 adb connect 卡很久
+    $reachable = @(@($script:knownDevices.Keys) | Where-Object { Test-TcpOpen $_ 700 })
+    if ($reachable.Count -eq 0) { return @(Get-DeviceList) }
+
+    # 非阻塞小提示，避免用户只看到光标转圈以为卡死
+    $busy = $null
+    try {
+        $busy = New-Object System.Windows.Forms.Form
+        $busy.FormBorderStyle = 'None'; $busy.BackColor = $cPaper; $busy.ShowInTaskbar = $false
+        $busy.Size = New-Object System.Drawing.Size(260, 64)
+        $bl = New-Object System.Windows.Forms.Label
+        $bl.Text = '正在连接已记住的设备…'; $bl.Dock = 'Fill'; $bl.TextAlign = 'MiddleCenter'
+        $bl.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
+        $busy.Controls.Add($bl)
+        if ($owner) {
+            $ob = $owner.Bounds; $busy.StartPosition = 'Manual'
+            $busy.Location = New-Object System.Drawing.Point(($ob.Left + [int](($ob.Width - 260) / 2)), ($ob.Top + [int](($ob.Height - 64) / 2)))
+            $busy.Show($owner)
+        } else { $busy.StartPosition = 'CenterScreen'; $busy.Show() }
+        $busy.Refresh(); [System.Windows.Forms.Application]::DoEvents()
+    } catch { $busy = $null }
+
+    foreach ($addr in $reachable) {
+        try { & $adb connect $addr 2>&1 | Out-Null } catch {}
+    }
+
+    if ($busy) { try { $busy.Close(); $busy.Dispose() } catch {} }
+    return @(Get-DeviceList)
+}
+
 function Resolve-Target {
     param($owner, [string]$Prefer = '')
-    $devs = @(Get-DeviceList)
+    $devs = @(Ensure-Devices $owner)
     if ($devs.Count -eq 0) { return @{ Ok = $false; Reason = 'none'; Serial = $null } }
     if ($devs.Count -eq 1) { return @{ Ok = $true; Serial = $devs[0] } }
     if ($settings.defaultDevice -and ($devs -contains $settings.defaultDevice)) { return @{ Ok = $true; Serial = $settings.defaultDevice } }
@@ -1066,7 +1171,7 @@ function Resolve-Target {
 # 不够直接弹提示并返回 $null（调用方据此中止，连功能弹窗都不会打开）。够了/读不到版本则返回目标序列号。
 function Resolve-TargetForFeature {
     param($owner, [int]$Need, [string]$Feature)
-    $devs = @(Get-DeviceList)
+    $devs = @(Ensure-Devices $owner)
     if ($devs.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show("没检测到手机，请先连接手机再使用「$Feature」。", $Feature) | Out-Null; return $null }
     # 先把版本不够的设备排除在候选之外，再在「合格设备」里定目标：
     # 2 台里排掉 1 台后只剩 1 台就直接用，不必再弹窗问。读不到版本的当「未知」、不排除（交给 scrcpy 兜底）。
@@ -1465,7 +1570,7 @@ try {
     $lblStatus.Add_Click($openDevices)
 
     $btnWired.Add_Click({
-        $devs = @(Get-DeviceList)
+        $devs = @(Ensure-Devices $form)
         if ($devs.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('没检测到手机。请用数据线连接并点「允许 USB 调试」，或点右上角状态药丸用无线连接。', '有线投屏') | Out-Null; return }
         $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
         $wl  = @($devs | Where-Object { Test-Wireless $_ })
@@ -1480,7 +1585,7 @@ try {
     })
 
     $btnWireless.Add_Click({
-        $devs = @(Get-DeviceList)
+        $devs = @(Ensure-Devices $form)
         $wl = @($devs | Where-Object { Test-Wireless $_ })
         $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
         if ($wl.Count -ge 1) {
@@ -1538,7 +1643,12 @@ try {
     $btnCamera.Add_Click({
         $serial = Resolve-TargetForFeature $form 12 '手机当摄像头'   # 点击即定设备、查版本，不够直接弹提示并中止
         if (-not $serial) { return }
-        $dlg = New-Dialog '手机当摄像头' 264 308 $form
+        # 自动读取这台设备真正支持的采集分辨率（约 1~2 秒），让分辨率下拉只列“一定能开”的尺寸
+        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $camSizes = Get-CameraSizes $serial
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        $camDetected = ((@($camSizes.back).Count + @($camSizes.front).Count) -gt 0)
+        $dlg = New-Dialog '手机当摄像头' 264 344 $form
 
         $gb1 = New-Object System.Windows.Forms.GroupBox
         $gb1.Text = '摄像头'; $gb1.Location = '16,12'; $gb1.Size = '232,52'
@@ -1552,24 +1662,65 @@ try {
         $rbPort = New-Object System.Windows.Forms.RadioButton; $rbPort.Text = '竖屏'; $rbPort.Location = '124,20'; $rbPort.AutoSize = $true
         $gb2.Controls.AddRange(@($rbLand, $rbPort))
 
-        # 分辨率按「宽高比 + 最大边长」选，scrcpy 只会在该摄像头实际支持的尺寸里挑，避免写死尺寸导致的
-        # “Camera configuration error”（很多机型/前置摄像头并不支持精确的 1920x1080）。
+        # 分辨率：优先用实测支持尺寸（精确 --camera-size，一定能开）；读不到时回退到「最大边长」通用档位。
+        # 下拉内容随「后置/前置」切换重填——两个摄像头支持的尺寸常常不一样。
         $lblRes = New-Lbl '分辨率' 18 140
-        $cbRes = New-Combo @('高（约 1080p，推荐）', '中（更流畅）', '原始最高') @(1920, 1280, 0) ([int]$settings.camResMax) 78 137 170
+        $cbRes = New-Combo @('自动') @('auto') 'auto' 78 137 170
+        $capRes = New-Caption '' 78 166
+        $fillRes = {
+            param($facing)
+            $list = @($camSizes[$facing])
+            $cbRes.Items.Clear()
+            if ($list.Count -gt 0) {
+                for ($i = 0; $i -lt $list.Count; $i++) {
+                    $tag = if ($i -eq 0) { '  · 最清晰' } elseif ($i -eq $list.Count - 1) { '  · 最流畅' } else { '' }
+                    [void]$cbRes.Items.Add("$($list[$i])$tag")
+                }
+                $cbRes.Vals = [array]$list
+            } else {
+                [void]$cbRes.Items.Add('高（约 1080p，推荐）')
+                [void]$cbRes.Items.Add('中（更流畅）')
+                [void]$cbRes.Items.Add('原始最高')
+                $cbRes.Vals = @('1920', '1280', '0')
+            }
+            # 优先恢复上次选择；否则默认选「长边 ≤1920 里最清晰的」，兼顾清晰与稳定
+            $vals = [array]$cbRes.Vals
+            $idx = [array]::IndexOf($vals, [string]$settings.camResMax)
+            if ($idx -lt 0) {
+                $idx = 0
+                if ($list.Count -gt 0) {
+                    for ($i = 0; $i -lt $list.Count; $i++) {
+                        if ([Math]::Max([int]($list[$i] -split 'x')[0], [int]($list[$i] -split 'x')[1]) -le 1920) { $idx = $i; break }
+                    }
+                }
+            }
+            $cbRes.SelectedIndex = $idx
+        }
+        $capRes.Text = if ($camDetected) { '✓ 已读取本机支持的尺寸，随便选都能开' } else { '没读到支持列表，用通用档位（打不开就选低一档）' }
+        & $fillRes 'back'
+        $rbBack.Add_CheckedChanged({ if ($rbBack.Checked) { & $fillRes 'back' } })
+        $rbFront.Add_CheckedChanged({ if ($rbFront.Checked) { & $fillRes 'front' } })
 
-        $chkTorch = New-Chk '打开补光灯' $false 18 174
-        $chkMic = New-Chk '同时采集麦克风声音' $false 18 200
+        $chkTorch = New-Chk '打开补光灯' $false 18 196
+        $chkMic = New-Chk '同时采集麦克风声音' $false 18 222
 
-        $btnGo = New-PrimaryBtn '开始' 16 234 232 32 11
+        $btnGo = New-PrimaryBtn '开始' 16 262 232 32 11
         $btnGo.Add_Click({ $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close() })
 
-        $dlg.Controls.AddRange(@($gb1, $gb2, $lblRes, $cbRes, $chkTorch, $chkMic, $btnGo))
+        $dlg.Controls.AddRange(@($gb1, $gb2, $lblRes, $cbRes, $capRes, $chkTorch, $chkMic, $btnGo))
         $dlg.AcceptButton = $btnGo
         if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
-            $camMax = [int]$cbRes.Vals[$cbRes.SelectedIndex]
-            if ([int]$settings.camResMax -ne $camMax) { $settings.camResMax = $camMax; Save-Settings }
-            $a = @('-s', $serial, '--video-source=camera', "--camera-facing=$(if($rbFront.Checked){'front'}else{'back'})", '--camera-ar=16:9')
-            if ($camMax -gt 0) { $a += @('-m', "$camMax") }
+            $selVal = [string]$cbRes.Vals[$cbRes.SelectedIndex]
+            if ([string]$settings.camResMax -ne $selVal) { $settings.camResMax = $selVal; Save-Settings }
+            $a = @('-s', $serial, '--video-source=camera', "--camera-facing=$(if($rbFront.Checked){'front'}else{'back'})")
+            if ($selVal -match '^\d+x\d+$') {
+                # 设备实测支持的精确采集尺寸：直接用 --camera-size，不再加 --camera-ar 以免比例冲突
+                $a += "--camera-size=$selVal"
+            } else {
+                # 回退档位：宽高比 + 最大边长，让 scrcpy 自己在支持范围里挑
+                $a += '--camera-ar=16:9'
+                if ([int]$selVal -gt 0) { $a += @('-m', "$selVal") }
+            }
             if ($rbPort.Checked) { $a += '--capture-orientation=90' }
             if ($chkTorch.Checked) { $a += '--camera-torch' }
             if ($chkMic.Checked) { $a += '--audio-source=mic' } else { $a += '--no-audio' }
@@ -1623,6 +1774,9 @@ try {
         }
         Stop-AllScrcpy
         if ($settings.disconnectOnClose) { try { & $adb disconnect 2>$null | Out-Null } catch {} }
+        # 关助手时顺手结束自带 adb.exe 的常驻 server 进程，避免它残留在后台、还得去任务管理器手动杀。
+        # 用本助手目录里的 adb 自己 kill-server（只停默认端口的 server，下次用到会自动重启）。
+        try { & $adb kill-server 2>$null | Out-Null } catch {}
     })
     $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose() })
 
