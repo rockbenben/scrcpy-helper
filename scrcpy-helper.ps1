@@ -26,6 +26,17 @@ public static extern int SetCurrentProcessExplicitAppUserModelID(string AppID);
     [Native.Shell]::SetCurrentProcessExplicitAppUserModelID('rockbenben.scrcpyHelper') | Out-Null
 } catch {}
 
+# 控制台信号 API：关闭 / 停止时给「录制中」的 scrcpy 发 Ctrl+C 让它优雅收尾（见 Stop-ScrcpyGraceful）。
+# 「后台录制」带 --no-window，没有窗口可 CloseMainWindow，只能靠这个信号，否则直接 Kill 会截断 mp4（尾原子没写、文件打不开）。
+try {
+    Add-Type -Namespace Native -Name ConIO -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern bool AttachConsole(uint dwProcessId);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern bool FreeConsole();
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleCtrlHandler(System.IntPtr HandlerRoutine, bool Add);
+'@
+} catch {}
+
 # 配色（墨 + 素纸 + 朱砂印：素纸灰打底护眼，墨黑主操作，红仅作印章点缀）
 $cPaper   = [System.Drawing.Color]::FromArgb(236, 232, 225)   # 素纸灰（暖而不黄，比白柔和）
 $cInk     = [System.Drawing.Color]::FromArgb(43, 41, 38)      # 墨黑·主操作按钮/标题
@@ -407,8 +418,31 @@ function Test-Recording {
     }
     return $false
 }
-# 停止本助手启动的所有投屏：先优雅关闭（让录屏正常收尾、不损坏文件），关不掉再兜底强杀
+# 优雅停止一个 scrcpy：给它的控制台发 Ctrl+C，让 scrcpy 正常收尾（录制时写好文件尾原子，否则 mp4 会损坏、打不开）。
+# 无窗口的「后台录制」没有窗口可关，只能靠这个信号。做法（Windows 标准套路）：先让本进程忽略 Ctrl+C（护住自己）→
+# 脱离自己的控制台 FreeConsole → AttachConsole 挂到目标进程的控制台 → 广播 CTRL_C_EVENT（只会打到该控制台里的 scrcpy）→
+# 等它退出 → FreeConsole 脱离 → 恢复自己的 Ctrl+C 处理。任何失败/超时都返回 $false，交调用方强杀兜底（退回原行为，无回归）。
+function Stop-ScrcpyGraceful {
+    param($proc, [int]$WaitMs = 5000)
+    if (-not $proc -or $proc.HasExited) { return $true }
+    $ok = $false
+    try {
+        [void][Native.ConIO]::SetConsoleCtrlHandler([System.IntPtr]::Zero, $true)   # 先护住自己：忽略即将广播的 Ctrl+C
+        [void][Native.ConIO]::FreeConsole()
+        if ([Native.ConIO]::AttachConsole([uint32]$proc.Id)) {
+            [void][Native.ConIO]::GenerateConsoleCtrlEvent(0, 0)   # 0 = CTRL_C_EVENT；进程组 0 = 本控制台所有进程（即 scrcpy）
+            $ok = $proc.WaitForExit($WaitMs)
+            [void][Native.ConIO]::FreeConsole()
+        }
+    } catch { $ok = $false }
+    try { [void][Native.ConIO]::SetConsoleCtrlHandler([System.IntPtr]::Zero, $false) } catch {}   # 恢复自己的 Ctrl+C 处理
+    return $ok
+}
+# 停止本助手启动的所有投屏：录制中的先发 Ctrl+C 优雅收尾（保住文件），再对其余优雅关窗，最后关不掉的强杀兜底
 function Stop-AllScrcpy {
+    foreach ($it in @($scrcpyProcs)) {   # 录制进程优先优雅停：后台录制无窗口，只能靠 Ctrl+C 收尾，否则强杀会损坏视频
+        if ($it.Rec -and $it.Proc -and -not $it.Proc.HasExited) { [void](Stop-ScrcpyGraceful $it.Proc) }
+    }
     foreach ($it in @($scrcpyProcs)) {
         try { if ($it.Proc -and -not $it.Proc.HasExited) { [void]$it.Proc.CloseMainWindow() } } catch {}
     }
@@ -430,6 +464,9 @@ function Get-ActiveSerials {
 function Stop-DeviceScrcpy {
     param($serial)
     if (-not $serial) { return }
+    foreach ($it in @($scrcpyProcs)) {   # 这台的录制进程先发 Ctrl+C 优雅收尾（后台录制无窗口，强杀会损坏视频）
+        if ($it.Serial -eq $serial -and $it.Rec -and $it.Proc -and -not $it.Proc.HasExited) { [void](Stop-ScrcpyGraceful $it.Proc) }
+    }
     foreach ($it in @($scrcpyProcs)) {
         if ($it.Serial -eq $serial -and $it.Proc -and -not $it.Proc.HasExited) { try { [void]$it.Proc.CloseMainWindow() } catch {} }
     }
