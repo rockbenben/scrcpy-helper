@@ -1862,17 +1862,20 @@ function Show-DeviceManager {
 # 关键：这是本进程激活自己的窗口（比外部进程抢前台可靠得多），加上后启动实例已 AllowSetForegroundWindow 授权，
 # SetForegroundWindow 基本必成；万一仍被前台锁挡住，就用「最小化→还原」兜底——还原自最小化是系统允许的前台切换，必定把窗口带到最前并聚焦。
 # 直接用 Win32 对 HWND 操作（跨线程安全、作用于窗口所属线程），不碰 WinForms 对象，避免跨 runspace 的线程亲和/死锁问题。
+$script:actStop = [hashtable]::Synchronized(@{ stop = $false })   # 关闭时置 stop=$true 让等待线程退出循环——否则它永远阻塞在 WaitOne 上，会把整个进程钉住不退出（残留 powershell.exe 占着单实例 mutex，下次启动被误判成"已在运行"）
 function Start-ActivationWaiter {
     param($hwnd, $evt)
     if (-not $evt -or $hwnd -eq [System.IntPtr]::Zero) { return }
     $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
     $rs.SessionStateProxy.SetVariable('evt', $evt)
     $rs.SessionStateProxy.SetVariable('hwnd', $hwnd)
+    $rs.SessionStateProxy.SetVariable('shared', $script:actStop)
     $ps = [powershell]::Create(); $ps.Runspace = $rs
     [void]$ps.AddScript({
-        while ($true) {
+        while (-not $shared.stop) {
             $sig = $false
             try { $sig = $evt.WaitOne() } catch { break }   # 事件被销毁/异常 → 退出等待
+            if ($shared.stop) { break }                       # 关闭时唤醒：检出停止标记就退出，让线程结束、进程可正常退出
             if (-not $sig) { continue }
             try {
                 if ([Native.Win]::IsIconic($hwnd)) { [void][Native.Win]::ShowWindow($hwnd, 9) }   # SW_RESTORE：最小化先还原
@@ -1883,7 +1886,12 @@ function Start-ActivationWaiter {
         }
     })
     [void]$ps.BeginInvoke()
-    $script:actWaiter = @{ Rs = $rs; Ps = $ps }   # 钉住防 GC；进程退出时后台线程随之结束
+    $script:actWaiter = @{ Rs = $rs; Ps = $ps }
+}
+# 关闭时调用：置停止标记并 Set 事件唤醒等待线程，令其退出循环，进程随即可正常退出。
+function Stop-ActivationWaiter {
+    try { $script:actStop.stop = $true } catch {}
+    try { if ($script:actEvent) { [void]$script:actEvent.Set() } } catch {}
 }
 
 try {
@@ -2254,6 +2262,9 @@ try {
         if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() }
         Connect-RememberedAsync ({ param($connected) & $updateStatus }.GetNewClosure())
         Start-ActivationWaiter $form.Handle $script:actEvent   # 开始监听"再次启动时激活本窗口"的信号
+        # 首次显示主动抢一次前台：conhost --headless 启动的进程窗口有时不会自动到前台/不聚焦，用户以为"没反应"。
+        # 本进程激活自己的窗口是可靠的：Activate + TopMost 翻转 + SetForegroundWindow(自身句柄)。
+        try { $form.Activate(); $form.TopMost = $true; $form.TopMost = $false; [void][Native.Win]::SetForegroundWindow($form.Handle) } catch {}
     })
     $form.Add_Activated({ & $updateStatus; if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() } else { $timer.Stop() } })
     $form.Add_Deactivate({ $timer.Stop() })
@@ -2276,7 +2287,7 @@ try {
         # 用本助手目录里的 adb 自己 kill-server（只停默认端口的 server，下次用到会自动重启）。
         try { Invoke-Hidden -FilePath $adb -ArgumentList @('kill-server') -DiscardStderr | Out-Null } catch {}
     })
-    $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose() })
+    $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose(); Stop-ActivationWaiter })   # 让激活等待线程退出，否则它阻塞 WaitOne 会钉住进程不退出
 
     [void]$form.ShowDialog()
 }
