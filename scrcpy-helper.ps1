@@ -99,7 +99,8 @@ $apps = [ordered]@{
 }
 
 # ---------------- 设置（在界面里改，自动记忆到 投屏助手-设置.json） ----------------
-$defaults = @{
+# 用 [ordered] 有序表：保存出来的 JSON 键顺序就按下面的分组排（画面/声音/控制/…），不再是哈希随机序、看着乱。
+$defaults = [ordered]@{
     # 画面
     maxSize = 1496; maxFps = 0; bitRate = 0; videoCodec = ''; crop = ''
     # 声音
@@ -120,7 +121,7 @@ $defaults = @{
     # 记住主窗口位置（-1 = 还没记，居中显示）
     winX = -1; winY = -1
 }
-$settings = @{}
+$settings = [ordered]@{}
 foreach ($k in $defaults.Keys) { $settings[$k] = $defaults[$k] }
 
 function Load-Settings {
@@ -165,6 +166,35 @@ function Load-Settings {
     } catch { }
 }
 
+# 把 JSON 重排成规整的 2 空格缩进（Windows PowerShell 5.1 的 ConvertTo-Json 缩进很丑：值对齐在键后、
+# 嵌套对象缩进错位）。逐字符扫描、识别字符串（含转义），字符串里的 {}[]:," 原样保留、不当结构符处理。
+function Format-Json {
+    param([string]$Json)
+    $sb = New-Object System.Text.StringBuilder
+    $indent = 0; $inStr = $false; $esc = $false
+    foreach ($c in $Json.ToCharArray()) {
+        if ($inStr) {
+            [void]$sb.Append($c)
+            if ($esc) { $esc = $false }
+            elseif ($c -eq '\') { $esc = $true }
+            elseif ($c -eq '"') { $inStr = $false }
+            continue
+        }
+        switch ($c) {
+            '"' { $inStr = $true; [void]$sb.Append($c) }
+            '{' { [void]$sb.Append($c); $indent++; [void]$sb.Append("`r`n" + ('  ' * $indent)) }
+            '[' { [void]$sb.Append($c); $indent++; [void]$sb.Append("`r`n" + ('  ' * $indent)) }
+            '}' { $indent--; [void]$sb.Append("`r`n" + ('  ' * $indent) + $c) }
+            ']' { $indent--; [void]$sb.Append("`r`n" + ('  ' * $indent) + $c) }
+            ',' { [void]$sb.Append($c); [void]$sb.Append("`r`n" + ('  ' * $indent)) }
+            ':' { [void]$sb.Append(': ') }
+            default { if ($c -notmatch '\s') { [void]$sb.Append($c) } }
+        }
+    }
+    $lines = $sb.ToString() -split "`r?`n" | ForEach-Object { $_.TrimEnd() } | Where-Object { $_ -ne '' }
+    return ($lines -join "`r`n")
+}
+
 function Save-Settings {
     try {
         $o = [ordered]@{}
@@ -182,7 +212,7 @@ function Save-Settings {
         $cr = [ordered]@{}
         foreach ($k in $script:camResByDevice.Keys) { $cr[$k] = $script:camResByDevice[$k] }
         $o['camResByDevice'] = $cr
-        ($o | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $cfgPath -Encoding UTF8
+        (Format-Json ($o | ConvertTo-Json -Depth 5)) | Set-Content -LiteralPath $cfgPath -Encoding UTF8
     } catch { }
 }
 
