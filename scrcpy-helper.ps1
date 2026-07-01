@@ -1359,6 +1359,55 @@ function Connect-RememberedAsync {
     $t.Start()
 }
 
+# 掉线后台重连单台无线地址（8s 轮询发现掉线时用）：先 TCP 探测可达再 CreateNoWindow adb connect，
+# 全程在后台 runspace 跑——不阻塞 UI、不闪控制台（与全脚本一致，不再用 Start-Process -WindowStyle Hidden）。
+# in-flight 守卫避免每 8s 轮询叠加多个探测/连接；被「不自动连」排除的地址直接跳过（与启动自动连接口径一致）。
+$script:reconnectInFlight = $false
+function Reconnect-LastAsync {
+    param($addr)
+    if (-not $addr) { return }
+    if ($script:reconnectInFlight) { return }
+    if (Test-AutoConnectExcluded $addr) { return }
+    $script:reconnectInFlight = $true
+    $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+    $rs.SessionStateProxy.SetVariable('adbPath', $adb)
+    $rs.SessionStateProxy.SetVariable('addr', $addr)
+    $rs.SessionStateProxy.SetVariable('probeTimeoutMs', 700)
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript({
+        $parts = $addr -split ':'; $ip = $parts[0]
+        $port = if ($parts.Count -gt 1 -and $parts[1]) { [int]$parts[1] } else { 5555 }
+        $c = New-Object System.Net.Sockets.TcpClient
+        $ok = $false
+        try {
+            $iar = $c.BeginConnect($ip, $port, $null, $null)
+            if ($iar.AsyncWaitHandle.WaitOne($probeTimeoutMs)) { $c.EndConnect($iar); $ok = $c.Connected }
+        } catch { $ok = $false } finally { try { $c.Close() } catch {} }
+        if (-not $ok) { return }   # 死地址：探测即止，不发 adb connect，避免堆 ~21s 卡死的隐藏 adb
+        try {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $adbPath; $psi.Arguments = "connect $addr"
+            $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+            $p = [System.Diagnostics.Process]::Start($psi)
+            [void]$p.StandardOutput.ReadToEnd(); [void]$p.StandardError.ReadToEnd(); $p.WaitForExit()
+        } catch {}
+    })
+    $async = $ps.BeginInvoke()
+    $bag = $script:bgTimers
+    $t = New-Object System.Windows.Forms.Timer; $t.Interval = 400; [void]$bag.Add($t)
+    $t.Add_Tick({
+        if ($async.IsCompleted) {
+            $t.Stop()
+            try { $ps.EndInvoke($async) } catch {}
+            try { $rs.Dispose() } catch {}
+            $ps.Dispose(); $t.Dispose(); [void]$bag.Remove($t)
+            $script:reconnectInFlight = $false
+        }
+    }.GetNewClosure())
+    $t.Start()
+}
+
 # 多设备时让用户挑一台投屏，返回序列号 / 地址，取消返回 $null。
 function Select-Device {
     param($owner, $devs, $title = '选择设备')
@@ -1384,18 +1433,36 @@ function Select-Device {
 # 决定这次投屏用哪台设备。返回 @{ Ok; Serial; Reason }：
 #   Ok=$true 时 Serial 可用；Ok=$false 时 Reason='none'(没设备) 或 'cancel'(多设备时用户取消选择)。
 # 规则：0 台→none；1 台→用它；多台→优先「默认设备」，否则按偏好类型唯一匹配，再否则弹窗让用户选。
-# 快速探测「ip:port」此刻是否可连（TCP 半连接 + 超时）。关键：离线设备若直接 adb connect 会卡满
+# 并行探测一批「ip:port」此刻哪些可连（TCP 半连接 + 超时）。关键：离线设备若直接 adb connect 会卡满
 # 系统 TCP 超时（Windows 上每个死地址约 21 秒），先用它筛掉不可达地址，自动重连就不会一直转圈。
-function Test-TcpOpen {
-    param([string]$addr, [int]$timeoutMs = 700)
-    $parts = $addr -split ':'
-    $ip = $parts[0]; $port = if ($parts.Count -gt 1 -and $parts[1]) { [int]$parts[1] } else { 5555 }
-    $client = New-Object System.Net.Sockets.TcpClient
-    try {
-        $iar = $client.BeginConnect($ip, $port, $null, $null)
-        if (-not $iar.AsyncWaitHandle.WaitOne($timeoutMs)) { return $false }
-        $client.EndConnect($iar); return $true
-    } catch { return $false } finally { try { $client.Close() } catch {} }
+# 一次同时 BeginConnect 全部、轮询等到超时，总耗时≈单台超时而非逐台累加——记住的设备多时不再串行卡界面。
+# 轮询而非 WaitHandle.WaitAll：Windows 上 WaitAll 句柄数上限 64，且这里在 UI 线程只需 ≤timeout 的短阻塞。
+function Get-ReachableAddrs {
+    param([string[]]$addrs, [int]$timeoutMs = 700)
+    if (-not $addrs -or $addrs.Count -eq 0) { return @() }
+    $clients = @(); $iars = @()
+    foreach ($addr in $addrs) {
+        $parts = $addr -split ':'; $ip = $parts[0]
+        $port = if ($parts.Count -gt 1 -and $parts[1]) { [int]$parts[1] } else { 5555 }
+        $c = New-Object System.Net.Sockets.TcpClient
+        try { $iar = $c.BeginConnect($ip, $port, $null, $null) } catch { $iar = $null }
+        $clients += $c; $iars += $iar
+    }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
+        $allDone = $true
+        for ($i = 0; $i -lt $iars.Count; $i++) { if ($iars[$i] -and -not $iars[$i].IsCompleted) { $allDone = $false; break } }
+        if ($allDone) { break }
+        Start-Sleep -Milliseconds 30
+    }
+    $reachable = @()
+    for ($i = 0; $i -lt $addrs.Count; $i++) {
+        $ok = $false
+        try { if ($iars[$i] -and $iars[$i].IsCompleted) { $clients[$i].EndConnect($iars[$i]); $ok = $clients[$i].Connected } } catch { $ok = $false }
+        try { $clients[$i].Close() } catch {}
+        if ($ok) { $reachable += $addrs[$i] }
+    }
+    return $reachable
 }
 
 # 没检测到设备、但有「记住的无线设备」时，先尝试连回来，再返回刷新后的设备列表。
@@ -1406,8 +1473,8 @@ function Ensure-Devices {
     $devs = @(Get-DeviceList)
     if ($devs.Count -gt 0 -or $script:knownDevices.Count -eq 0) { return $devs }
 
-    # 先快速探测哪些记住的设备此刻在线，不可达的直接跳过，避免对死地址 adb connect 卡很久
-    $reachable = @(@($script:knownDevices.Keys) | Where-Object { Test-TcpOpen $_ 700 })
+    # 先并行探测哪些记住的设备此刻在线，不可达的直接跳过，避免对死地址 adb connect 卡很久
+    $reachable = @(Get-ReachableAddrs @($script:knownDevices.Keys) 700)
     if ($reachable.Count -eq 0) { return @(Get-DeviceList) }
 
     # 非阻塞小提示，避免用户只看到光标转圈以为卡死
@@ -1832,9 +1899,10 @@ try {
     # ---------------- 行为 ----------------
     $updateStatus = {
         $devs = @(Get-DeviceList)
-        # 掉线且开了自动重连：后台 adb connect 连回上次的无线地址（不阻塞界面，下次刷新生效）
+        # 掉线且开了自动重连：后台探测+连回上次的无线地址（不阻塞界面，下次刷新生效）。
+        # 交给 Reconnect-LastAsync：先 TCP 探测可达才连、respect「不自动连」名单、CreateNoWindow 不闪控制台、in-flight 防叠加。
         if ($devs.Count -eq 0 -and $settings.autoConnect -and $settings.lastWirelessAddr) {
-            Start-Process -FilePath $adb -ArgumentList @('connect', $settings.lastWirelessAddr) -WindowStyle Hidden -WorkingDirectory $PSScriptRoot
+            Reconnect-LastAsync $settings.lastWirelessAddr
         }
         if ($devs.Count -gt 0) {
             $w = $devs | Where-Object { Test-Wireless $_ } | Select-Object -First 1
@@ -2034,7 +2102,8 @@ try {
         $sfd.Filter = 'MP4 视频|*.mp4|MKV 视频|*.mkv'
         if ($sfd.ShowDialog($form) -eq 'OK') {
             $a = @('-s', $tgt.Serial, '-r', $sfd.FileName) + (Get-VideoArgs) + (Get-AudioArgs)
-            if ($settings.stayAwake) { $a += '-w' }
+            # 保持唤醒要分连接方式：无线用 --keep-active（-w/--stay-awake 只在 USB 插电时生效，无线录制会中途息屏断流）
+            if ($settings.stayAwake) { $a += $(if (Test-Wireless $tgt.Serial) { '--keep-active' } else { '-w' }) }
             if ([int]$settings.recTimeLimit -gt 0) { $a += "--time-limit=$($settings.recTimeLimit)" }
             if ($settings.recBackground) { $a += @('--no-window', '--no-playback') }
             Start-Scrcpy $a -Recording
