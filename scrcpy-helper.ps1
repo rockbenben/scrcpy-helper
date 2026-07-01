@@ -248,6 +248,24 @@ function Get-NewDisplayArgs {
     if ($noDecor) { $a += '--no-vd-system-decorations' }
     return $a
 }
+# 按虚拟屏(WxH)比例算出一个塞进电脑屏幕可用区的「窗口大小」（--window-width/height），
+# 让竖屏窗口不超出屏幕被切。虚拟屏分辨率保持真实（比例、密度都对，App 不拉伸），只缩窗口。
+# 注意：--window-width/height 与 --flex-display 冲突（scrcpy 会报错禁用），故用它时必须不加 --flex-display。
+# 尺寸未知（非 WxH）或放得下时返回 @() —— 交给 scrcpy 默认，不强行定窗口。
+function Get-FitWindowArgs {
+    param([string]$sizeWxH)
+    if ($sizeWxH -notmatch '^(\d+)x(\d+)$') { return @() }
+    $vw = [int]$matches[1]; $vh = [int]$matches[2]
+    if ($vw -le 0 -or $vh -le 0) { return @() }
+    try { $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea } catch { return @() }
+    $maxW = $wa.Width * 0.92; $maxH = $wa.Height * 0.92
+    if ($vw -le $maxW -and $vh -le $maxH) { return @() }   # 本就放得下：不必定窗口
+    $winW = $maxW; $winH = [math]::Round($winW * $vh / $vw)
+    if ($winH -gt $maxH) { $winH = $maxH; $winW = [math]::Round($winH * $vw / $vh) }
+    $winW = [int]$winW; $winH = [int]$winH
+    if ($winW -le 0 -or $winH -le 0) { return @() }
+    return @("--window-width=$winW", "--window-height=$winH")
+}
 # 运行 scrcpy --list-camera-sizes，按朝向解析出本机真正支持的采集分辨率。
 # 不同机型差别很大，写死 1080p 之类会触发 “Camera configuration error”（录像支持 ≠ 投屏采集支持），
 # 所以运行时按设备实拉，让用户只在“一定能开”的尺寸里选。任何失败都返回空表，调用方自行回退到通用档位。
@@ -1027,16 +1045,19 @@ function Show-NewDisplay {
         # 按所选比例/方向算出虚拟屏尺寸与 DPI
         $ndModeSel = [string]$cbMode.Vals[$cbMode.SelectedIndex]
         $ndSz = $settings.ndSize; $ndDpi = $settings.ndDpi
+        $autoFit = $false   # portrait/landscape：虚拟屏用真实/标准尺寸，窗口适配屏幕（非 flex）
         switch ($ndModeSel) {
             'portrait'  {
-                # 手机版面：用设备真实分辨率/密度，确保虚拟屏和手机比例完全一致、不裁切；读不到才兜底通用竖屏值
+                # 手机版面：虚拟屏用设备真实分辨率/密度，比例、密度都跟手机一致（App 不拉伸、走手机版面）；
+                # 窗口再按比例缩进屏幕、避免超出被切。读不到设备尺寸才兜底通用竖屏值。
                 $disp = Get-DeviceDisplay $serial
                 if ($disp) {
                     $w = [Math]::Min($disp.W, $disp.H); $h = [Math]::Max($disp.W, $disp.H)   # 保证竖屏 W<H
-                    $ndSz = "${w}x${h}"; $ndDpi = if ($disp.Dpi -gt 0) { "$($disp.Dpi)" } else { '420' }
-                } else { $ndSz = '1080x2340'; $ndDpi = '420' }
+                    $d = if ($disp.Dpi -gt 0) { $disp.Dpi } else { 420 }
+                } else { $w = 1080; $h = 2340; $d = 420 }
+                $ndSz = "${w}x${h}"; $ndDpi = "$d"; $autoFit = $true
             }
-            'landscape' { $ndSz = '1920x1080'; $ndDpi = '240' }
+            'landscape' { $ndSz = '1920x1080'; $ndDpi = '240'; $autoFit = $true }
             'custom'    {
                 $ndSz  = ([Microsoft.VisualBasic.Interaction]::InputBox("分辨率（宽x高），如 1080x2340。`n留空 = 跟设备一致。", '独立窗口 - 自定义尺寸', $settings.ndSize)).Trim()
                 if ($ndSz -and $ndSz -notmatch '^\d{3,4}x\d{3,4}$') {
@@ -1053,7 +1074,12 @@ function Show-NewDisplay {
         }
         $settings.ndMode = $ndModeSel; $settings.ndFixed = $chkFixed.Checked; Save-Settings
         $pre = if ($serial) { @('-s', $serial) } else { @() }
-        Start-Scrcpy ($pre + (Get-NewDisplayArgs $ndSz $ndDpi $chkFixed.Checked $settings.ndNoDecor) + "--start-app=$target")
+        # 自动模式(手机/平板版面)：窗口适配屏幕；用 --window-* 就必须非 flex（否则 scrcpy 报错），非 flex 也顺带避免最大化画面自转。
+        $fitWin = if ($autoFit) { Get-FitWindowArgs $ndSz } else { @() }
+        $useFixed = if ($fitWin.Count -gt 0) { $true } else { $chkFixed.Checked }
+        # 虚拟屏保留系统装饰（状态栏/导航栏）：去掉 --no-vd-system-decorations 后，像微信这种 App 会把自己的顶栏
+        # 同时画进「状态栏预留区」和正常位置，出现「两条一样的顶栏」；保留系统栏则是正常的「状态栏+单顶栏」手机观感。
+        Start-Scrcpy ($pre + (Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + "--start-app=$target")
     }
 }
 
