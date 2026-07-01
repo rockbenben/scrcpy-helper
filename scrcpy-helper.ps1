@@ -37,6 +37,49 @@ try {
 '@
 } catch {}
 
+# 单实例：已在运行就把已开的窗口拉到最前，然后退出本次启动——双击 .bat 多次不再叠开多个助手。
+# 多开的害处：两套 8s 轮询/自动连接白耗资源；更糟的是两个进程会同时写 投屏助手-设置.json、互相覆盖对方刚存的设备/设置。
+# 用命名 Mutex 判定"是否首个实例"；不是则找到已有主窗口（按标题）拉到前台再退出。任何异常都按"首个实例"放行，绝不因守卫本身挡住启动。
+$script:actEventName = 'rockbenben.scrcpyHelper.activate'   # 命名事件：后启动的实例用它通知已在运行的实例"激活你的窗口"
+try {
+    # FindWindow 必须指定 CharSet=Unicode（走 FindWindowW）：默认 ANSI 编组中文标题在非中文系统码页下匹配不到、返回 0。
+    Add-Type -Namespace Native -Name Win -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)] public static extern System.IntPtr FindWindow(string lpClassName, string lpWindowName);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool IsIconic(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(uint dwProcessId);
+'@
+} catch {}
+$script:isFirstInstance = $true
+try { $script:appMutex = New-Object System.Threading.Mutex($true, 'rockbenben.scrcpyHelper.singleton', [ref]$script:isFirstInstance) } catch { $script:isFirstInstance = $true }
+if (-not $script:isFirstInstance) {
+    # 已有实例：核心思路——让"已在运行的那个实例激活它自己的窗口"（进程激活自己的窗口远比外部进程抢前台可靠）。
+    # 本次(后启动的)实例先 AllowSetForegroundWindow(ASFW_ANY) 把抢前台权限授权出去，再 Set 命名事件通知对方，然后退出。
+    try { [void][Native.Win]::AllowSetForegroundWindow([uint32]::MaxValue) } catch {}   # ASFW_ANY = -1：允许任意进程设置前台（授权给第一实例）
+    $signaled = $false
+    try {
+        $evt = [System.Threading.EventWaitHandle]::OpenExisting($script:actEventName)
+        [void]$evt.Set(); $evt.Dispose(); $signaled = $true
+    } catch {}
+    if (-not $signaled) {
+        # 事件还没建好（第一实例刚启动中）→ 退回自己找窗口：先试抢前台，不成再用"最小化+还原"兜底（还原自最小化是被允许的前台切换，必成）。
+        try {
+            $h = [Native.Win]::FindWindow($null, 'scrcpy 投屏助手')
+            if ($h -ne [System.IntPtr]::Zero) {
+                if ([Native.Win]::IsIconic($h)) { [void][Native.Win]::ShowWindow($h, 9) }   # SW_RESTORE
+                [void][Native.Win]::SetForegroundWindow($h)
+                Start-Sleep -Milliseconds 60
+                if ([Native.Win]::GetForegroundWindow() -ne $h) { [void][Native.Win]::ShowWindow($h, 6); [void][Native.Win]::ShowWindow($h, 9) }   # 6=SW_MINIMIZE→9=SW_RESTORE
+            }
+        } catch {}
+    }
+    return   # 已有实例，本次启动到此为止（$script:appMutex 未持有，进程退出即释放，不影响已在运行的那个）
+}
+# 首个实例：立刻建好命名事件，供后续实例来激活本窗口（等待线程在窗口显示后启动，见 Start-ActivationWaiter）。
+try { $script:actEvent = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, $script:actEventName) } catch { $script:actEvent = $null }
+
 # 配色（墨 + 素纸 + 朱砂印：素纸灰打底护眼，墨黑主操作，红仅作印章点缀）
 $cPaper   = [System.Drawing.Color]::FromArgb(236, 232, 225)   # 素纸灰（暖而不黄，比白柔和）
 $cInk     = [System.Drawing.Color]::FromArgb(43, 41, 38)      # 墨黑·主操作按钮/标题
@@ -1815,6 +1858,34 @@ function Show-DeviceManager {
     [void]$dlg.ShowDialog($owner)
 }
 
+# 首个实例的「激活等待线程」：后台 runspace 阻塞等命名事件；被后启动的实例 Set 时，把本进程自己的窗口拉到最前。
+# 关键：这是本进程激活自己的窗口（比外部进程抢前台可靠得多），加上后启动实例已 AllowSetForegroundWindow 授权，
+# SetForegroundWindow 基本必成；万一仍被前台锁挡住，就用「最小化→还原」兜底——还原自最小化是系统允许的前台切换，必定把窗口带到最前并聚焦。
+# 直接用 Win32 对 HWND 操作（跨线程安全、作用于窗口所属线程），不碰 WinForms 对象，避免跨 runspace 的线程亲和/死锁问题。
+function Start-ActivationWaiter {
+    param($hwnd, $evt)
+    if (-not $evt -or $hwnd -eq [System.IntPtr]::Zero) { return }
+    $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+    $rs.SessionStateProxy.SetVariable('evt', $evt)
+    $rs.SessionStateProxy.SetVariable('hwnd', $hwnd)
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript({
+        while ($true) {
+            $sig = $false
+            try { $sig = $evt.WaitOne() } catch { break }   # 事件被销毁/异常 → 退出等待
+            if (-not $sig) { continue }
+            try {
+                if ([Native.Win]::IsIconic($hwnd)) { [void][Native.Win]::ShowWindow($hwnd, 9) }   # SW_RESTORE：最小化先还原
+                [void][Native.Win]::SetForegroundWindow($hwnd)
+                Start-Sleep -Milliseconds 60
+                if ([Native.Win]::GetForegroundWindow() -ne $hwnd) { [void][Native.Win]::ShowWindow($hwnd, 6); [void][Native.Win]::ShowWindow($hwnd, 9) }   # 6=SW_MINIMIZE→9=SW_RESTORE 兜底，必成
+            } catch {}
+        }
+    })
+    [void]$ps.BeginInvoke()
+    $script:actWaiter = @{ Rs = $rs; Ps = $ps }   # 钉住防 GC；进程退出时后台线程随之结束
+}
+
 try {
     # ---------------- 主窗口 ----------------
     $form = New-Object System.Windows.Forms.Form
@@ -2158,8 +2229,13 @@ try {
             if ([int]$settings.recTimeLimit -gt 0) { $a += "--time-limit=$($settings.recTimeLimit)" }
             if ($settings.recBackground) { $a += @('--no-window', '--no-playback') }
             Start-Scrcpy $a -Recording
-            $tip = if ($settings.recBackground) { '已在后台开始录制（无画面）。' } else { '已开始录制。' }
-            [System.Windows.Forms.MessageBox]::Show($tip + '关掉投屏窗口或在原命令窗口按 Ctrl+C 即停止保存。', '录制屏幕') | Out-Null
+            # 非模态提示（不弹窗打断）：把底部提示行临时换成录制提示，几秒后自动恢复。文字保持短，避免压到右侧「设备/快捷键/设置」链接。
+            $recTip = if ($settings.recBackground) { '● 后台录制中 · 「设备」里停止投屏即保存' } else { '● 录制中 · 关掉投屏窗口即停止并保存' }
+            $prevHintText = $lblHint.Text; $prevHintColor = $lblHint.ForeColor
+            $lblHint.Text = $recTip; $lblHint.ForeColor = $cGreen
+            $rt = New-Object System.Windows.Forms.Timer; $rt.Interval = 6000; [void]$script:bgTimers.Add($rt)
+            $rt.Add_Tick({ $rt.Stop(); $lblHint.Text = $prevHintText; $lblHint.ForeColor = $prevHintColor; $rt.Dispose(); [void]$script:bgTimers.Remove($rt) }.GetNewClosure())
+            $rt.Start()
         }
     })
 
@@ -2177,6 +2253,7 @@ try {
         & $updateStatus
         if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() }
         Connect-RememberedAsync ({ param($connected) & $updateStatus }.GetNewClosure())
+        Start-ActivationWaiter $form.Handle $script:actEvent   # 开始监听"再次启动时激活本窗口"的信号
     })
     $form.Add_Activated({ & $updateStatus; if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() } else { $timer.Stop() } })
     $form.Add_Deactivate({ $timer.Stop() })
