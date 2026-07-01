@@ -1494,7 +1494,9 @@ function Ensure-Devices {
             $busy.Location = New-Object System.Drawing.Point(($ob.Left + [int](($ob.Width - 260) / 2)), ($ob.Top + [int](($ob.Height - 64) / 2)))
             $busy.Show($owner)
         } else { $busy.StartPosition = 'CenterScreen'; $busy.Show() }
-        $busy.Refresh(); [System.Windows.Forms.Application]::DoEvents()
+        # 同步重绘忙提示（父窗 + 子标签各自 Update）。不用 Application::DoEvents——它会把整个输入队列也泵掉：
+        # 断连+有可达记住设备时，用户快速双击「有线/无线投屏」，第二次点击会在这里被重入派发，最终开出两个 scrcpy 窗口。
+        $busy.Refresh(); $bl.Refresh()
     } catch { $busy = $null }
 
     foreach ($addr in $reachable) {
@@ -1753,6 +1755,8 @@ function Show-DeviceManager {
         if ($script:knownDevices.Contains($addr)) { $script:knownDevices.Remove($addr) }
         if ($script:deviceNames.Contains($addr)) { $script:deviceNames.Remove($addr) }   # 忘记设备时一并清掉它的自定义名
         if ($settings.defaultDevice -eq $addr) { $settings.defaultDevice = '' }
+        # 若忘记的正是"上次无线地址"，一并清掉——否则主界面 8s 轮询会用它 Reconnect-LastAsync 连回来、再 Add-KnownDevice 把它重新记住，忘记等于白忘
+        if ($settings.lastWirelessAddr -eq $addr) { $settings.lastWirelessAddr = '' }
         Save-Settings; & $refresh
     })
     $btnAuto.Add_Click({
