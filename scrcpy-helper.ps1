@@ -135,10 +135,8 @@ $scrcpyProcs = New-Object System.Collections.ArrayList   # 记录本助手启动
 $script:autoConnectStarted = $false                      # 启动自动连接每次只跑一次
 $script:bgTimers = New-Object System.Collections.ArrayList  # 钉住后台计时器防 GC（运行中的 Forms.Timer 仅靠自引用会被回收）
 
-if (-not (Test-Path -LiteralPath $exe)) {
-    [System.Windows.Forms.MessageBox]::Show('没找到 scrcpy.exe，请把本程序和 scrcpy.exe 放在同一个文件夹里。', 'scrcpy 投屏助手') | Out-Null
-    return
-}
+# 注：$exe/$adb 的最终解析与「没找到 scrcpy.exe」守卫都挪到了 Load-Settings 之后（见下方 Resolve-Tools + 守卫），
+# 这样「设置 > 通用」里自定义的 adb/scrcpy 路径（存在 JSON 里）才能在守卫判断前生效；否则守卫用的是写死的自带路径。
 
 # 同步执行 adb/scrcpy 并取回输出（用于 devices/getprop/connect/--list-* 等一次性查询）。
 # 不用 `& $adb ...` 调用操作符：宿主虽是 -WindowStyle Hidden 的 powershell，但它的控制台仍然存在（只是被隐藏），
@@ -150,7 +148,7 @@ function Invoke-Hidden {
     $psi.FileName = $FilePath
     # 不用 ProcessStartInfo.ArgumentList：本助手宿主是 Windows PowerShell 5.1（投屏助手-双击运行.bat 里调用的
     # powershell.exe），实测该属性取出来是 $null、Add 直接报错（“cannot call a method on a null-valued expression”）。
-    # 改拼 Arguments 命令行串，和 Start-Scrcpy（上面 234 行）给含空格参数补引号的写法保持一致。
+    # 改拼 Arguments 命令行串，和 Start-Scrcpy 给含空格参数补引号的写法保持一致。
     $psi.Arguments = (@($ArgumentList | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
@@ -207,6 +205,8 @@ $defaults = [ordered]@{
     recFormat = 'mp4'; recTimeLimit = 0; recBackground = $false
     # 通用
     liveStatus = $true; autoConnect = $true; disconnectOnClose = $false; extraArgs = ''; lastWirelessAddr = ''; defaultDevice = ''
+    # 自定义 adb / scrcpy 可执行文件路径（留空=用本助手同目录自带的）；在「设置 > 通用」里改，随设置存进 JSON
+    scrcpyPath = ''; adbPath = ''
     # 记住主窗口位置（-1 = 还没记，居中显示）
     winX = -1; winY = -1
 }
@@ -320,7 +320,43 @@ function Set-AutoConnectExcluded {
     elseif ((-not $Excluded) -and $has) { [void]$script:autoConnectExclude.Remove([string]$addr); Save-Settings }
 }
 
+# 解析 adb / scrcpy 可执行文件的最终路径：优先用「设置 > 通用」里自定义、且文件确实存在的路径，否则回退到本助手同目录自带的。
+# 保存设置时也会再调一次（$script:exe/$adb 即时更新，无需重启）。scrcpy 自身会去找 adb，这里顺带把环境变量 ADB 指到同一个 adb，
+# 让 scrcpy 和本助手用的是同一个 adb（仅在该 adb 确实存在时才设，避免指向不存在路径反而让 scrcpy 找不到 adb）。
+function Resolve-Tools {
+    $script:exe = if ($settings.scrcpyPath -and (Test-Path -LiteralPath $settings.scrcpyPath)) { $settings.scrcpyPath } else { Join-Path $PSScriptRoot 'scrcpy.exe' }
+    # adb 解析优先级：① 自定义 adbPath 且存在 → 用它；② 否则用「解析出的 scrcpy.exe 同目录里的 adb.exe」
+    #（scrcpy 发行包本就把 adb.exe 放在 scrcpy.exe 旁边——这样只设 scrcpy、adb 留空时，也会自动配对到那个 scrcpy 对应的 adb，
+    #  而不是回退到本助手自带的、可能与自定义 scrcpy 版本不一致的 adb，避免二者 adb 版本打架）；③ 都没有 → 回退本助手同目录自带的。
+    if ($settings.adbPath -and (Test-Path -LiteralPath $settings.adbPath)) {
+        $script:adb = $settings.adbPath
+    } else {
+        $sibling = Join-Path (Split-Path -Parent $script:exe) 'adb.exe'
+        $script:adb = if (Test-Path -LiteralPath $sibling) { $sibling } else { Join-Path $PSScriptRoot 'adb.exe' }
+    }
+    if (Test-Path -LiteralPath $script:adb) { $env:ADB = $script:adb }
+}
+
 Load-Settings
+Resolve-Tools
+
+# 找不到 scrcpy.exe 时不直接退出——否则若有人删了自带的、又从没设过自定义路径，就永远够不到「设置」去指定它。
+# 改为当场让用户选一次 scrcpy.exe 的位置：选了有效的就存进设置、重解析后继续进入助手；没选/取消才退出。
+if (-not (Test-Path -LiteralPath $exe)) {
+    $msg = "没找到 scrcpy.exe。`n`n正常情况下它应和本程序放在同一个文件夹里。`n如果你想用电脑里别处的 scrcpy，可点「是」现在选择它的位置。`n（选好后会记住，下次直接用；也可随时在「设置 > 通用」里改。）"
+    if ([System.Windows.Forms.MessageBox]::Show($msg, 'scrcpy 投屏助手', 'YesNo', 'Warning') -eq 'Yes') {
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.Filter = 'scrcpy.exe|scrcpy.exe|可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*'
+        $ofd.Title = '选择 scrcpy.exe'
+        if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $settings.scrcpyPath = $ofd.FileName; Save-Settings; Resolve-Tools
+        }
+    }
+    if (-not (Test-Path -LiteralPath $exe)) {   # 仍然没有（没选/取消）→ 才退出
+        [System.Windows.Forms.MessageBox]::Show("仍未找到 scrcpy.exe，助手退出。`n可把 scrcpy.exe 放到本程序同一文件夹，或重开后按提示选择它的位置。", 'scrcpy 投屏助手') | Out-Null
+        return
+    }
+}
 
 # ---------------- 参数拼接 ----------------
 function Get-VideoArgs {
@@ -578,7 +614,6 @@ function Get-DevInfo {
     $script:devInfo[$serial] = $info
     return $info
 }
-# 版本门控改为「按实际目标设备」检查，见下方 Resolve-TargetForFeature（要先有 Resolve-Target）。
 
 # 小工具：建标签
 function New-Lbl {
@@ -1018,9 +1053,38 @@ function Show-Settings {
     $lblExHint = New-Lbl '例如：--angle=90   --display-id=1   --time-limit=300' 14 108; $lblExHint.ForeColor = $cMuted
     $tt.SetToolTip($chkLive, '它只决定窗口顶部「已连接/未连接」多久自动更新一次，不影响投屏。开着时仅在窗口处于前台才每几秒刷一次；关掉后改为手动点「刷新」，更省资源。')
     $tt.SetToolTip($txtExtra, '高级用法（看不懂就留空，不影响正常使用）：在这里追加 scrcpy 命令行参数，会拼到启动命令末尾，多个用空格分隔。例如 --crop=1080:1920:0:0（裁剪画面）、--angle=90（旋转）、--display-id=1（指定屏幕）。')
+
+    # 自定义 adb / scrcpy 路径（留空=用本助手同目录自带的）
+    $lblPathHdr = New-Lbl '自定义 adb / scrcpy 路径（留空＝用自带的）：' 14 150; $lblPathHdr.ForeColor = $cMuted
+    $lblAdbCap = New-Lbl 'adb' 14 181
+    $txtAdbPath = New-Object System.Windows.Forms.TextBox
+    $txtAdbPath.Location = New-Object System.Drawing.Point(66, 177); $txtAdbPath.Size = New-Object System.Drawing.Size(248, 24)
+    $txtAdbPath.Text = $settings.adbPath
+    $btnAdbBrowse = New-SecondaryBtn '浏览…' 322 176 72 26
+    $lblScrcpyCap = New-Lbl 'scrcpy' 14 223
+    $txtScrcpyPath = New-Object System.Windows.Forms.TextBox
+    $txtScrcpyPath.Location = New-Object System.Drawing.Point(66, 219); $txtScrcpyPath.Size = New-Object System.Drawing.Size(248, 24)
+    $txtScrcpyPath.Text = $settings.scrcpyPath
+    $btnScrcpyBrowse = New-SecondaryBtn '浏览…' 322 218 72 26
+    $btnAdbBrowse.Add_Click({
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.Filter = '可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*'; $ofd.Title = '选择 adb.exe'
+        if ($txtAdbPath.Text -and (Test-Path -LiteralPath $txtAdbPath.Text)) { try { $ofd.InitialDirectory = Split-Path -Parent $txtAdbPath.Text } catch {} }
+        if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txtAdbPath.Text = $ofd.FileName }
+    }.GetNewClosure())
+    $btnScrcpyBrowse.Add_Click({
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.Filter = '可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*'; $ofd.Title = '选择 scrcpy.exe'
+        if ($txtScrcpyPath.Text -and (Test-Path -LiteralPath $txtScrcpyPath.Text)) { try { $ofd.InitialDirectory = Split-Path -Parent $txtScrcpyPath.Text } catch {} }
+        if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txtScrcpyPath.Text = $ofd.FileName }
+    }.GetNewClosure())
+    $tt.SetToolTip($txtAdbPath, 'adb.exe 路径。留空＝优先用所选 scrcpy 旁边的 adb、没有再用自带的；填了也让 scrcpy 用同一个 adb。保存即时生效。')
+    $tt.SetToolTip($txtScrcpyPath, 'scrcpy.exe 路径。留空＝用自带的；想用电脑里别处 / 更新版的 scrcpy 时填。保存即时生效。')
+
     $tabGen.Controls.AddRange(@(
         $chkLive,
-        (New-Lbl '高级·其它命令行参数（看不懂就留空，多个用空格隔开）：' 14 52), $txtExtra, $lblExHint))
+        (New-Lbl '高级·其它命令行参数（看不懂就留空，多个用空格隔开）：' 14 52), $txtExtra, $lblExHint,
+        $lblPathHdr, $lblAdbCap, $txtAdbPath, $btnAdbBrowse, $lblScrcpyCap, $txtScrcpyPath, $btnScrcpyBrowse))
 
     # 把 8 个面板叠放到右侧内容区，只显示选中的那个；导轨切换驱动显示
     $panels = @($tabCommon, $tabVideo, $tabAudio, $tabCtrl, $tabWin, $tabNd, $tabRec, $tabGen)
@@ -1080,7 +1144,17 @@ function Show-Settings {
         $settings.autoConnect = $chkReconnect.Checked
         $settings.disconnectOnClose = $chkDisconnect.Checked
         $settings.extraArgs  = $txtExtra.Text.Trim()
+        $settings.adbPath    = $txtAdbPath.Text.Trim()
+        $settings.scrcpyPath = $txtScrcpyPath.Text.Trim()
         Save-Settings
+        Resolve-Tools   # 立刻按新路径重算 $exe/$adb（含环境变量 ADB），之后的连接/投屏即时生效、无需重启
+        # 填了路径但文件不存在时提醒一句（仍然保存，运行时会回退到自带的那个）
+        if ($settings.scrcpyPath -and -not (Test-Path -LiteralPath $settings.scrcpyPath)) {
+            [System.Windows.Forms.MessageBox]::Show("填写的 scrcpy 路径不存在，已暂时回退到自带的：`n$($settings.scrcpyPath)", '设置') | Out-Null
+        }
+        if ($settings.adbPath -and -not (Test-Path -LiteralPath $settings.adbPath)) {
+            [System.Windows.Forms.MessageBox]::Show("填写的 adb 路径不存在，已暂时回退到自带的：`n$($settings.adbPath)", '设置') | Out-Null
+        }
         $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $dlg.Close()
     })
@@ -1090,6 +1164,7 @@ function Show-Settings {
         if ([System.Windows.Forms.MessageBox]::Show('确定把所有设置恢复为默认值吗？', '恢复默认', 'YesNo', 'Warning') -eq 'Yes') {
             foreach ($k in @($defaults.Keys)) { $settings[$k] = $defaults[$k] }
             Save-Settings
+            Resolve-Tools   # 默认里 adb/scrcpy 路径为空 → 重解析回退到自带的
             $dlg.Close()
             [System.Windows.Forms.MessageBox]::Show('已恢复默认设置。', '设置') | Out-Null
         }
@@ -2325,10 +2400,13 @@ try {
             Start-Scrcpy $a -Recording
             # 非模态提示（不弹窗打断）：把底部提示行临时换成录制提示，几秒后自动恢复。文字保持短，避免压到右侧「设备/快捷键/设置」链接。
             $recTip = if ($settings.recBackground) { '● 后台录制中 · 「设备」里停止投屏即保存' } else { '● 录制中 · 关掉投屏窗口即停止并保存' }
-            $prevHintText = $lblHint.Text; $prevHintColor = $lblHint.ForeColor
+            # 只在「当前不是录制提示态」时记住原始提示——否则 6s 内连续两次录制会让第二次把 recTip 当成「原文」记下，
+            # 两个恢复定时器先后触发后底部会永久卡在 recTip（明明没在录）。恢复统一用这份记住的原始文案。
+            if (-not $script:recTipActive) { $script:recHintText = $lblHint.Text; $script:recHintColor = $lblHint.ForeColor }
+            $script:recTipActive = $true
             $lblHint.Text = $recTip; $lblHint.ForeColor = $cGreen
             $rt = New-Object System.Windows.Forms.Timer; $rt.Interval = 6000; [void]$script:bgTimers.Add($rt)
-            $rt.Add_Tick({ $rt.Stop(); $lblHint.Text = $prevHintText; $lblHint.ForeColor = $prevHintColor; $rt.Dispose(); [void]$script:bgTimers.Remove($rt) }.GetNewClosure())
+            $rt.Add_Tick({ $rt.Stop(); $lblHint.Text = $script:recHintText; $lblHint.ForeColor = $script:recHintColor; $script:recTipActive = $false; $rt.Dispose(); [void]$script:bgTimers.Remove($rt) }.GetNewClosure())
             $rt.Start()
         }
     })
