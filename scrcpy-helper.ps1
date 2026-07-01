@@ -63,7 +63,7 @@ if (-not (Test-Path -LiteralPath $exe)) {
 # `&` 启动 adb.exe/scrcpy.exe 这类控制台子程序时仍可能瞬间闪出一个新控制台窗口。改用 ProcessStartInfo 显式
 # CreateNoWindow=true，从源头不创建窗口，而不是创建后再隐藏。顺带用 UTF8 直读输出，不再依赖宿主控制台编码。
 function Invoke-Hidden {
-    param([string]$FilePath, [string[]]$ArgumentList = @(), [switch]$DiscardStderr)
+    param([string]$FilePath, [string[]]$ArgumentList = @(), [switch]$DiscardStderr, [int]$TimeoutMs = 15000)
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $FilePath
     # 不用 ProcessStartInfo.ArgumentList：本助手宿主是 Windows PowerShell 5.1（投屏助手-双击运行.bat 里调用的
@@ -78,12 +78,17 @@ function Invoke-Hidden {
     try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { return @() }
     # 并发读 stdout/stderr 再 WaitForExit：先 ReadToEnd 一路再读另一路，输出量大时（如 --list-apps 装机多）
     # 会把另一路的管道缓冲区写满，子进程卡在 write 上不退出，PowerShell 卡在 ReadToEnd 上——互相等死。
-    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $outTask = $proc.StandardOutput.ReadToEndAsync()   # 先起并发读，下面 WaitForExit 不会被管道缓冲区顶死
     $errTask = $proc.StandardError.ReadToEndAsync()
-    [System.Threading.Tasks.Task]::WaitAll(@($outTask, $errTask))
-    $proc.WaitForExit()
-    $stdout = $outTask.Result
-    $stderr = if ($DiscardStderr) { '' } else { $errTask.Result }
+    # 带超时：adb 有时会在半死的无线设备上卡死（如 `adb -s <addr> shell getprop` 连接半开、永不返回）。
+    # 本函数在 UI 线程被 8 秒轮询/按钮调用，若不设上限，一次卡死就把整个界面永久冻住。超时则杀掉子进程兜底。
+    if (-not $proc.WaitForExit($TimeoutMs)) {
+        try { $proc.Kill() } catch {}
+        try { [void]$proc.WaitForExit(2000) } catch {}
+    }
+    try { [void][System.Threading.Tasks.Task]::WaitAll(@($outTask, $errTask), 3000) } catch {}
+    $stdout = if ($outTask.IsCompleted -and -not $outTask.IsFaulted) { $outTask.Result } else { '' }
+    $stderr = if ($DiscardStderr -or -not $errTask.IsCompleted -or $errTask.IsFaulted) { '' } else { $errTask.Result }
     $combined = if ($stderr) { "$stdout`n$stderr" } else { $stdout }
     if (-not $combined) { return @() }
     return @($combined -split "`r?`n")
@@ -212,7 +217,12 @@ function Save-Settings {
         $cr = [ordered]@{}
         foreach ($k in $script:camResByDevice.Keys) { $cr[$k] = $script:camResByDevice[$k] }
         $o['camResByDevice'] = $cr
-        (Format-Json ($o | ConvertTo-Json -Depth 5)) | Set-Content -LiteralPath $cfgPath -Encoding UTF8
+        # 原子写：先写临时文件再替换，避免写到一半崩溃/断电把设置文件截断——那会让 Load-Settings 解析失败、
+        # 静默回退默认值，用户记住的设备/常用 App/备注名全丢。崩在临时文件上则原文件完好，下次照常读。
+        $tmp = "$cfgPath.tmp"
+        (Format-Json ($o | ConvertTo-Json -Depth 5)) | Set-Content -LiteralPath $tmp -Encoding UTF8
+        if (Test-Path -LiteralPath $cfgPath) { [System.IO.File]::Replace($tmp, $cfgPath, [NullString]::Value) }   # 原子替换（第三参给 $null 会被当空路径报错，须用 [NullString]::Value）
+        else { Move-Item -LiteralPath $tmp -Destination $cfgPath -Force }
     } catch { }
 }
 
@@ -1703,7 +1713,8 @@ try {
     # 记住上次的位置：存过且仍落在可见屏幕范围内就沿用，否则居中（换了显示器/分辨率也不会跑到屏幕外）
     $savedX = [int]$settings.winX; $savedY = [int]$settings.winY
     $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
-    if (($savedX -ge 0 -or $savedY -ge 0) -and $savedX -ge $vs.Left -and $savedX -le ($vs.Right - 120) -and $savedY -ge $vs.Top -and $savedY -le ($vs.Bottom - 60)) {
+    # 只把「精确的 -1,-1」当作「还没记录过」的哨兵；其余交给下面的虚拟屏边界校验（副屏在主屏左/上方时坐标本就是负的）。
+    if (-not ($savedX -eq -1 -and $savedY -eq -1) -and $savedX -ge $vs.Left -and $savedX -le ($vs.Right - 120) -and $savedY -ge $vs.Top -and $savedY -le ($vs.Bottom - 60)) {
         $form.StartPosition = 'Manual'
         $form.Location = New-Object System.Drawing.Point($savedX, $savedY)
     } else {
