@@ -115,6 +115,8 @@ $defaults = [ordered]@{
     screenOff = $false; stayAwake = $true; showTouches = $false; powerOffOnClose = $false
     # 摄像头（存“最大边长档位”如 1920/1280/0，或实测精确尺寸如 1920x1080；统一按字符串存，避免重载时类型转换报错）
     camResMax = '1920'
+    # 摄像头面板上次的选择（全局偏好）：前后置 back/front、方向 land/port、补光灯、麦克风。分辨率另按设备+前后记在 camResByDevice。
+    camFacing = 'back'; camOrientation = 'land'; camTorch = $false; camMic = $false
     # 窗口
     fullscreen = $false; onTop = $false; borderless = $false
     # 独立窗口
@@ -2016,14 +2018,14 @@ try {
 
         $gb1 = New-Object System.Windows.Forms.GroupBox
         $gb1.Text = '摄像头'; $gb1.Location = '16,12'; $gb1.Size = '232,52'
-        $rbBack = New-Object System.Windows.Forms.RadioButton; $rbBack.Text = '后置'; $rbBack.Location = '16,20'; $rbBack.AutoSize = $true; $rbBack.Checked = $true
-        $rbFront = New-Object System.Windows.Forms.RadioButton; $rbFront.Text = '前置'; $rbFront.Location = '124,20'; $rbFront.AutoSize = $true
+        $rbBack = New-Object System.Windows.Forms.RadioButton; $rbBack.Text = '后置'; $rbBack.Location = '16,20'; $rbBack.AutoSize = $true; $rbBack.Checked = ($settings.camFacing -ne 'front')
+        $rbFront = New-Object System.Windows.Forms.RadioButton; $rbFront.Text = '前置'; $rbFront.Location = '124,20'; $rbFront.AutoSize = $true; $rbFront.Checked = ($settings.camFacing -eq 'front')
         $gb1.Controls.AddRange(@($rbBack, $rbFront))
 
         $gb2 = New-Object System.Windows.Forms.GroupBox
         $gb2.Text = '画面方向'; $gb2.Location = '16,74'; $gb2.Size = '232,52'
-        $rbLand = New-Object System.Windows.Forms.RadioButton; $rbLand.Text = '横屏'; $rbLand.Location = '16,20'; $rbLand.AutoSize = $true; $rbLand.Checked = $true
-        $rbPort = New-Object System.Windows.Forms.RadioButton; $rbPort.Text = '竖屏'; $rbPort.Location = '124,20'; $rbPort.AutoSize = $true
+        $rbLand = New-Object System.Windows.Forms.RadioButton; $rbLand.Text = '横屏'; $rbLand.Location = '16,20'; $rbLand.AutoSize = $true; $rbLand.Checked = ($settings.camOrientation -ne 'port')
+        $rbPort = New-Object System.Windows.Forms.RadioButton; $rbPort.Text = '竖屏'; $rbPort.Location = '124,20'; $rbPort.AutoSize = $true; $rbPort.Checked = ($settings.camOrientation -eq 'port')
         $gb2.Controls.AddRange(@($rbLand, $rbPort))
 
         # 分辨率：优先用实测支持尺寸（精确 --camera-size，一定能开）；读不到时回退到「最大边长」通用档位。
@@ -2061,12 +2063,12 @@ try {
             $cbRes.SelectedIndex = $idx
         }
         $capRes.Text = if ($camDetected) { '✓ 已读取本机支持的尺寸，随便选都能开' } else { '没读到支持列表，用通用档位（打不开就选低一档）' }
-        & $fillRes 'back'
+        & $fillRes $(if ($settings.camFacing -eq 'front') { 'front' } else { 'back' })   # 按上次记住的前后置初始填充
         $rbBack.Add_CheckedChanged({ if ($rbBack.Checked) { & $fillRes 'back' } })
         $rbFront.Add_CheckedChanged({ if ($rbFront.Checked) { & $fillRes 'front' } })
 
-        $chkTorch = New-Chk '打开补光灯' $false 18 196
-        $chkMic = New-Chk '同时采集麦克风声音' $false 18 222
+        $chkTorch = New-Chk '打开补光灯' $settings.camTorch 18 196
+        $chkMic = New-Chk '同时采集麦克风声音' $settings.camMic 18 222
 
         $btnGo = New-PrimaryBtn '开始' 16 262 232 32 11
         $btnGo.Add_Click({ $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close() })
@@ -2076,7 +2078,13 @@ try {
         if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
             $selVal = [string]$cbRes.Vals[$cbRes.SelectedIndex]
             $facing = if ($rbFront.Checked) { 'front' } else { 'back' }
-            Set-CamRemembered $serial $facing $selVal; Save-Settings   # 按设备+前后记住这次选择
+            Set-CamRemembered $serial $facing $selVal                  # 分辨率按设备+前后记
+            # 面板其余选择记成全局偏好，下次打开沿用：前后置 / 横竖屏 / 补光灯 / 麦克风
+            $settings.camFacing = $facing
+            $settings.camOrientation = if ($rbPort.Checked) { 'port' } else { 'land' }
+            $settings.camTorch = $chkTorch.Checked
+            $settings.camMic = $chkMic.Checked
+            Save-Settings
             $a = @('-s', $serial, '--video-source=camera', "--camera-facing=$facing")
             if ($selVal -match '^\d+x\d+$') {
                 # 设备实测支持的精确采集尺寸：直接用 --camera-size，不再加 --camera-ar 以免比例冲突
@@ -2086,7 +2094,9 @@ try {
                 $a += '--camera-ar=16:9'
                 if ([int]$selVal -gt 0) { $a += @('-m', "$selVal") }
             }
-            if ($rbPort.Checked) { $a += '--capture-orientation=90' }
+            # 竖屏旋转要分前后置：多数机型后置传感器方向 90°、前置 270°（差 180°），--capture-orientation 只叠加旋转、
+            # 不自动补偿这个差异——前置若也用 90 会上下颠倒，需 270 才是正的。
+            if ($rbPort.Checked) { $a += $(if ($rbFront.Checked) { '--capture-orientation=270' } else { '--capture-orientation=90' }) }
             if ($chkTorch.Checked) { $a += '--camera-torch' }
             if ($chkMic.Checked) { $a += '--audio-source=mic' } else { $a += '--no-audio' }
             Start-Scrcpy $a
