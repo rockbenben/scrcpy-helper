@@ -10,6 +10,34 @@ Set-Location -LiteralPath $PSScriptRoot
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName Microsoft.VisualBasic
+
+# 高 DPI 清晰化：必须在创建任何窗口之前声明进程 DPI 感知，否则 Windows 会把 96DPI 画面整体位图放大 → 文字发虚。
+# 只声明感知还不够——本脚本布局全是写死像素坐标，声明后窗体会按原始像素在高分屏上显示（清晰但偏小），
+# 需配合各窗体的 Set-DpiScale（见 New-Dialog / 忙窗 / 主窗）在 Load 时按真实 DPI 等比放大。
+#
+# 特意选「系统级 DPI 感知（System-Aware）」而非 Per-Monitor：本脚本跑在 powershell 宿主、无 app.config，
+# WinForms 不会处理跨屏的 WM_DPICHANGED 重新布局。若用 Per-Monitor，把窗口从 150% 主屏拖到 125% 副屏时，
+# 系统会按 125% 缩小窗框、但控件仍是 150% 的布局 → 界面被截断。改用 System-Aware：窗口一生只按主屏 DPI 布局一次，
+# 拖到别的 DPI 屏时由系统整幅位图缩放（副屏略微发软但绝不截断），是本场景最稳的取舍。
+# 逐级兜底：System-Aware 上下文（Win10 1607+）→ 旧的系统级感知（Win8.1+）→ 最旧的 SetProcessDPIAware（Vista+）。任何异常都吞掉、不阻断启动。
+try {
+    Add-Type -Namespace Native -Name Dpi -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(System.IntPtr value);
+[System.Runtime.InteropServices.DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern int GetDpiForWindow(System.IntPtr hwnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetDC(System.IntPtr hwnd);
+[System.Runtime.InteropServices.DllImport("gdi32.dll")] public static extern int GetDeviceCaps(System.IntPtr hdc, int index);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern int ReleaseDC(System.IntPtr hwnd, System.IntPtr hdc);
+'@
+    $ok = $false
+    # DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = -2
+    try { $ok = [Native.Dpi]::SetProcessDpiAwarenessContext([System.IntPtr](-2)) } catch {}
+    # PROCESS_SYSTEM_DPI_AWARE = 1
+    if (-not $ok) { try { [void][Native.Dpi]::SetProcessDpiAwareness(1); $ok = $true } catch {} }
+    if (-not $ok) { try { [void][Native.Dpi]::SetProcessDPIAware() } catch {} }
+} catch {}
+
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # scrcpy 4.0 的命令行输出是 UTF-8；Windows PowerShell 默认按系统 OEM 码页解码，会把中文
@@ -637,14 +665,29 @@ function New-LinkBtn {
 # 把控件裁成圆角（用于连接状态药丸）
 function Set-Rounded {
     param($ctl, $radius)
-    $d = $radius * 2
-    $p = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $p.AddArc(0, 0, $d, $d, 180, 90)
-    $p.AddArc($ctl.Width - $d - 1, 0, $d, $d, 270, 90)
-    $p.AddArc($ctl.Width - $d - 1, $ctl.Height - $d - 1, $d, $d, 0, 90)
-    $p.AddArc(0, $ctl.Height - $d - 1, $d, $d, 90, 90)
-    $p.CloseAllFigures()
-    $ctl.Region = New-Object System.Drawing.Region($p)
+    $applyRegion = {
+        param($c, $r)
+        $d = [Math]::Max(2, [int]$r * 2)
+        if ($d -ge $c.Width) { $d = $c.Width - 1 }
+        if ($d -ge $c.Height) { $d = $c.Height - 1 }
+        if ($d -lt 2 -or $c.Width -lt 2 -or $c.Height -lt 2) { return }
+        $p = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $p.AddArc(0, 0, $d, $d, 180, 90)
+        $p.AddArc($c.Width - $d - 1, 0, $d, $d, 270, 90)
+        $p.AddArc($c.Width - $d - 1, $c.Height - $d - 1, $d, $d, 0, 90)
+        $p.AddArc(0, $c.Height - $d - 1, $d, $d, 90, 90)
+        $p.CloseAllFigures()
+        $c.Region = New-Object System.Drawing.Region($p)
+    }
+    $origH = if ($ctl.Height -gt 0) { $ctl.Height } else { $radius * 2 }
+    & $applyRegion $ctl $radius
+    # 高 DPI：Control.Scale 会放大控件尺寸但不会重算 Region（圆角裁剪区），会导致药丸只显示原始小尺寸的一块。
+    # 改为随尺寸变化（含 Scale 之后）重算 Region，并按高度比例放大圆角半径，保持药丸形状。
+    $ctl.Add_SizeChanged({
+        $c = $args[0]
+        $r = [int][Math]::Round($radius * $c.Height / $origH)
+        & $applyRegion $c $r
+    }.GetNewClosure())
 }
 
 # ---------------- 设置窗口（分页） ----------------
@@ -755,10 +798,51 @@ n2iY7/3GHwJguedCF5jWQfs97xYhP4hnGVJt8+j0Cx/f0eccwG/B8ll+H6UMT9MAAAAABJRU5ErkJggg
     return $script:AppIcon
 }
 
+# 高 DPI 清晰化：让窗体在高分屏上按真实缩放比等比放大，既清晰又不发小。
+# 为何手动做而不用 AutoScaleMode=Dpi：.NET Framework 的 WinForms 自动 DPI 缩放被 app.config
+# （EnableWindowsFormsHighDpiAutoResizing / DpiAwareness）门控，而本脚本跑在 powershell 宿主里、无法提供 app.config，
+# 于是 AutoScaleMode 取不到真实 DPI（Control.DeviceDpi 恒为 96），窗体不会放大 → 在 150% 屏上清晰但偏小。
+# 改为：进程已声明 DPI 感知（见开头），窗体 Load 时用 Win32 GetDpiForWindow 读到真实 DPI（如 144），
+# 按 DPI/96 用 Control.Scale 一次性等比放大所有控件的坐标与尺寸。字体是磅值、在高 DPI 下由 GDI 自动放大，
+# 而 Scale 不改磅值 → 坐标与字体同比放大、不会二次放大。任何异常都吞掉、绝不阻断窗口显示。
+# Control.Scale 会放大 ListView 控件本身、但不缩放它的「列宽」（WinForms 已知短板）——
+# 高 DPI 下列宽保持 96DPI 的像素值 → 字大了却挤在窄列里被截断、右侧留空。递归找出所有 ListView 按同一比例补缩列宽。
+function Update-ListViewColumnWidths {
+    param($ctrl, $factor)
+    foreach ($child in $ctrl.Controls) {
+        if ($child -is [System.Windows.Forms.ListView]) {
+            foreach ($col in $child.Columns) { $col.Width = [int][Math]::Round($col.Width * $factor) }
+        }
+        if ($child.Controls.Count -gt 0) { Update-ListViewColumnWidths $child $factor }
+    }
+}
+
+function Set-DpiScale {
+    param($form)
+    $form.AutoScaleMode = 'None'   # 关掉 WinForms 自带缩放（此处拿不到真实 DPI，且会与手动 Scale 冲突）
+    $form.Add_Load({
+        try {
+            $f = $args[0]
+            $dpi = 0
+            try { $dpi = [Native.Dpi]::GetDpiForWindow($f.Handle) } catch {}          # Win10 1607+
+            if ($dpi -le 0) {                                                          # 兜底：取桌面 DC 的系统 DPI
+                try { $dc = [Native.Dpi]::GetDC([System.IntPtr]::Zero); $dpi = [Native.Dpi]::GetDeviceCaps($dc, 88); [void][Native.Dpi]::ReleaseDC([System.IntPtr]::Zero, $dc) } catch {}
+            }
+            if ($dpi -le 0) { $dpi = 96 }
+            $fac = $dpi / 96.0
+            if ($fac -gt 1.01) {
+                $f.Scale([System.Drawing.SizeF]::new($fac, $fac))
+                Update-ListViewColumnWidths $f $fac   # Scale 不管列宽，这里按同一比例补上
+            }
+        } catch {}
+    })
+}
+
 # 统一风格的弹窗：标题/尺寸/居中父窗/固定边框/字体/底色一处定义，各弹窗共用
 function New-Dialog {
     param($title, $w, $h, $owner)
     $d = New-Object System.Windows.Forms.Form
+    Set-DpiScale $d   # 高 DPI 清晰化：Load 时按真实 DPI 等比放大
     $d.Text = $title; $d.ClientSize = New-Object System.Drawing.Size($w, $h)
     $d.Icon = Get-AppIcon
     $d.FormBorderStyle = 'FixedDialog'
@@ -1563,6 +1647,7 @@ function Ensure-Devices {
     $busy = $null
     try {
         $busy = New-Object System.Windows.Forms.Form
+        Set-DpiScale $busy   # 高 DPI 清晰化：Load 时按真实 DPI 等比放大
         $busy.FormBorderStyle = 'None'; $busy.BackColor = $cPaper; $busy.ShowInTaskbar = $false
         $busy.Size = New-Object System.Drawing.Size(260, 64)
         $bl = New-Object System.Windows.Forms.Label
@@ -1897,6 +1982,7 @@ function Stop-ActivationWaiter {
 try {
     # ---------------- 主窗口 ----------------
     $form = New-Object System.Windows.Forms.Form
+    Set-DpiScale $form   # 高 DPI 清晰化：Load 时按真实 DPI 等比放大
     $form.Text = 'scrcpy 投屏助手'
     $form.ClientSize = New-Object System.Drawing.Size(512, 384)
     # 记住上次的位置：存过且仍落在可见屏幕范围内就沿用，否则居中（换了显示器/分辨率也不会跑到屏幕外）
