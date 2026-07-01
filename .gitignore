@@ -15,6 +15,9 @@ scrcpy.png
 # 打包产物
 *.zip
 
+# superpowers 技能生成的计划/设计稿 —— 本地产物，不入库
+docs/superpowers/
+
 # 系统杂项
 Thumbs.db
 .DS_Store
