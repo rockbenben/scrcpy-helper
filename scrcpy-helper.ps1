@@ -42,7 +42,10 @@ $cfgPath = Join-Path $PSScriptRoot '投屏助手-设置.json'
 $script:customApps = [ordered]@{}   # 用户自定义的常用 App（名称 => 包名），随设置一起存进 投屏助手-设置.json
 $script:knownDevices = [ordered]@{} # 记住的无线设备（地址 ip:port => 备注名），连接成功自动记下，供「设备管理」切换/重连
 $script:deviceNames  = [ordered]@{} # 用户自定义的设备显示名（序列号/地址 => 名称），优先于型号显示，可在「设备管理」里重命名
+$script:autoConnectExclude = New-Object System.Collections.Generic.List[string]  # 不自动连接的无线地址（设备管理里可切换）
 $scrcpyProcs = New-Object System.Collections.ArrayList   # 记录本助手启动的所有 scrcpy 进程，关助手时一并停止
+$script:autoConnectStarted = $false                      # 启动自动连接每次只跑一次
+$script:bgTimers = New-Object System.Collections.ArrayList  # 钉住后台计时器防 GC（运行中的 Forms.Timer 仅靠自引用会被回收）
 
 if (-not (Test-Path -LiteralPath $exe)) {
     [System.Windows.Forms.MessageBox]::Show('没找到 scrcpy.exe，请把本程序和 scrcpy.exe 放在同一个文件夹里。', 'scrcpy 投屏助手') | Out-Null
@@ -107,7 +110,7 @@ $defaults = @{
     # 录制
     recFormat = 'mp4'; recTimeLimit = 0; recBackground = $false
     # 通用
-    liveStatus = $true; autoReconnect = $false; disconnectOnClose = $false; extraArgs = ''; lastWirelessAddr = ''; defaultDevice = ''
+    liveStatus = $true; autoConnect = $true; disconnectOnClose = $false; extraArgs = ''; lastWirelessAddr = ''; defaultDevice = ''
     # 记住主窗口位置（-1 = 还没记，居中显示）
     winX = -1; winY = -1
 }
@@ -143,6 +146,10 @@ function Load-Settings {
                 if ($p.Name -and $p.Value) { $script:deviceNames[[string]$p.Name] = [string]$p.Value }
             }
         }
+        # 不自动连接名单：autoConnectExclude 是地址数组
+        if ($j.autoConnectExclude) {
+            foreach ($a in @($j.autoConnectExclude)) { if ($a) { [void]$script:autoConnectExclude.Add([string]$a) } }
+        }
     } catch { }
 }
 
@@ -159,8 +166,19 @@ function Save-Settings {
         $dn = [ordered]@{}
         foreach ($k in $script:deviceNames.Keys) { $dn[$k] = $script:deviceNames[$k] }
         $o['deviceNames'] = $dn
+        $o['autoConnectExclude'] = @($script:autoConnectExclude)
         ($o | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $cfgPath -Encoding UTF8
     } catch { }
+}
+
+# 「不自动连接」名单的查询/切换：仅对无线地址有意义；改动即时存盘。
+function Test-AutoConnectExcluded { param($addr) return ([bool]($addr -and ($script:autoConnectExclude -contains $addr))) }
+function Set-AutoConnectExcluded {
+    param($addr, [bool]$Excluded)
+    if (-not $addr) { return }
+    $has = $script:autoConnectExclude -contains $addr
+    if ($Excluded -and -not $has) { [void]$script:autoConnectExclude.Add([string]$addr); Save-Settings }
+    elseif ((-not $Excluded) -and $has) { [void]$script:autoConnectExclude.Remove([string]$addr); Save-Settings }
 }
 
 Load-Settings
@@ -615,7 +633,7 @@ function Show-Settings {
     $chkAudio = New-Chk '把手机声音也传到电脑' $settings.audioOn 14 46
     $chkStay = New-Chk '保持手机唤醒（避免锁屏 / 无线中途断开）' $settings.stayAwake 14 74
     $chkScreenOff = New-Chk '投屏时关闭手机屏幕（省电、防偷看）' $settings.screenOff 14 102
-    $chkReconnect = New-Chk '无线掉线后自动重连（断了自动连回来）' $settings.autoReconnect 14 130
+    $chkReconnect = New-Chk '自动连接记住的无线设备（启动连接附近设备 · 掉线自动重连）' $settings.autoConnect 14 130
     $chkDisconnect = New-Chk '关闭助手时断开无线连接（默认保持，重开即用）' $settings.disconnectOnClose 14 158
     $tt.SetToolTip($nudSize, '画面最大边长(像素)。数值越大越清晰、越小越流畅；0=原画不限制。')
     $tt.SetToolTip($chkAudio, '取消勾选则完全不传声音（等同 --no-audio）。')
@@ -781,7 +799,7 @@ function Show-Settings {
         $settings.recTimeLimit = [int]$nudTime.Value
         $settings.recBackground = $chkRecBg.Checked
         $settings.liveStatus = $chkLive.Checked
-        $settings.autoReconnect = $chkReconnect.Checked
+        $settings.autoConnect = $chkReconnect.Checked
         $settings.disconnectOnClose = $chkDisconnect.Checked
         $settings.extraArgs  = $txtExtra.Text.Trim()
         Save-Settings
@@ -1117,6 +1135,103 @@ function Add-KnownDevice {
     Save-Settings
 }
 
+# 把设备移到「最近连接」最前（knownDevices 有序表，最近在前）。只在离散连接成功事件调用，不在每 8s 轮询调，
+# 否则会每 8s 写盘、多台同连时反复顶来顶去。Add-KnownDevice 仍只管「第一次记住新设备」。
+function Touch-KnownDevice {
+    param($addr, $name)
+    if (-not $addr) { return }
+    if (-not $name) { $name = if ($script:knownDevices.Contains($addr)) { $script:knownDevices[$addr] } else { Get-FriendlyName $addr } }
+    $keys = @($script:knownDevices.Keys)
+    if ($keys.Count -gt 0 -and $keys[0] -eq $addr -and $script:knownDevices[$addr] -eq $name) { return }
+    if ($script:knownDevices.Contains($addr)) { $script:knownDevices.Remove($addr) }
+    $script:knownDevices.Insert(0, $addr, $name)
+    Save-Settings
+}
+
+# 启动自动连接的候选：记住的无线设备(最近在前) 去掉排除名单, 封顶 Max; 默认/上次设备保证纳入并靠前。
+function Get-AutoConnectCandidates {
+    param([int]$Max = 16)
+    $all = @($script:knownDevices.Keys | Where-Object { (Test-Wireless $_) -and (-not (Test-AutoConnectExcluded $_)) })
+    if ($all.Count -eq 0) { return @() }
+    $priority = @()
+    foreach ($p in @($settings.defaultDevice, $settings.lastWirelessAddr)) {
+        if ($p -and ($all -contains $p) -and ($priority -notcontains $p)) { $priority += $p }
+    }
+    $rest = @($all | Where-Object { $priority -notcontains $_ })
+    $ordered = @($priority + $rest)
+    if ($ordered.Count -gt $Max) { $ordered = @($ordered[0..($Max-1)]) }
+    return $ordered
+}
+
+# 启动时后台连接所有可达的记住设备：runspace 里并行 TCP 探测(轮询、不用 WaitAll) + 对可达者 CreateNoWindow 跑 adb connect。
+# UI 线程零阻塞；完成后一次性 Timer 在 UI 线程回收 runspace、Touch 连上的设备、回调刷新状态。
+function Connect-RememberedAsync {
+    param($OnDone)
+    if ($script:autoConnectStarted) { return }
+    if (-not $settings.autoConnect) { return }
+    $cands = @(Get-AutoConnectCandidates 16)
+    if ($cands.Count -eq 0) { return }
+    $script:autoConnectStarted = $true
+
+    $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+    $rs.SessionStateProxy.SetVariable('adbPath', $adb)
+    $rs.SessionStateProxy.SetVariable('cands', $cands)
+    $rs.SessionStateProxy.SetVariable('probeTimeoutMs', 600)
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript({
+        $clients=@(); $iars=@()
+        foreach ($addr in $cands) {
+            $parts = $addr -split ':'; $ip=$parts[0]
+            $port = if ($parts.Count -gt 1 -and $parts[1]) { [int]$parts[1] } else { 5555 }
+            $c = New-Object System.Net.Sockets.TcpClient
+            try { $iar = $c.BeginConnect($ip,$port,$null,$null) } catch { $iar=$null }
+            $clients += $c; $iars += $iar
+        }
+        $sw=[System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.ElapsedMilliseconds -lt $probeTimeoutMs) {
+            $allDone=$true
+            for ($i=0;$i -lt $iars.Count;$i++){ if ($iars[$i] -and -not $iars[$i].IsCompleted){ $allDone=$false; break } }
+            if ($allDone){ break }
+            Start-Sleep -Milliseconds 30
+        }
+        $reachable=@()
+        for ($i=0;$i -lt $cands.Count;$i++){
+            $ok=$false
+            try { if ($iars[$i] -and $iars[$i].IsCompleted){ $clients[$i].EndConnect($iars[$i]); $ok=$clients[$i].Connected } } catch { $ok=$false }
+            try { $clients[$i].Close() } catch {}
+            if ($ok){ $reachable += $cands[$i] }
+        }
+        $connected=@()
+        foreach ($addr in $reachable) {
+            try {
+                $psi = [System.Diagnostics.ProcessStartInfo]::new()
+                $psi.FileName=$adbPath; $psi.Arguments="connect $addr"
+                $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
+                $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true
+                $p=[System.Diagnostics.Process]::Start($psi)
+                $out=$p.StandardOutput.ReadToEnd(); [void]$p.StandardError.ReadToEnd(); $p.WaitForExit()
+                if ($out -match 'connected to' -or $out -match 'already connected') { $connected += $addr }
+            } catch {}
+        }
+        return ,$connected
+    })
+    $async = $ps.BeginInvoke()
+    $bag = $script:bgTimers
+    $t = New-Object System.Windows.Forms.Timer; $t.Interval = 400; [void]$bag.Add($t)
+    $t.Add_Tick({
+        if ($async.IsCompleted) {
+            $t.Stop()
+            $connected=@()
+            try { $connected = @($ps.EndInvoke($async)) } catch {}
+            try { $rs.Dispose() } catch {}
+            $ps.Dispose(); $t.Dispose(); [void]$bag.Remove($t)
+            foreach ($a in $connected) { if ($a) { Touch-KnownDevice $a } }
+            if ($OnDone) { & $OnDone $connected }
+        }
+    }.GetNewClosure())
+    $t.Start()
+}
+
 # 多设备时让用户挑一台投屏，返回序列号 / 地址，取消返回 $null。
 function Select-Device {
     param($owner, $devs, $title = '选择设备')
@@ -1254,7 +1369,7 @@ function Connect-ByIp {
     $dlg.Controls.AddRange(@($l1, $l2, $l3, $txtIp, $l4, $txtPort, $btnGo))
     $dlg.AcceptButton = $btnGo
     [void]$dlg.ShowDialog($owner)
-    if ($result.addr) { Add-KnownDevice $result.addr }
+    if ($result.addr) { Touch-KnownDevice $result.addr }
     return $result.addr
 }
 
@@ -1293,6 +1408,7 @@ function Show-DeviceManager {
     $btnDisc    = New-SecondaryBtn '断开'    156 290 72 34
     $btnRename  = New-SecondaryBtn '重命名'   234 290 82 34
     $btnForget  = New-SecondaryBtn '忘记'    322 290 72 34
+    $btnAuto    = New-SecondaryBtn '不自动连' 400 290 104 34   # 切换：把选中无线设备移入/移出「不自动连接」名单
     # 第三组「全局」
     $btnIp      = New-SecondaryBtn '输入 IP 连接…' 16 346 150 34
     $btnRefresh2= New-SecondaryBtn '刷新'    326 346 80  34
@@ -1320,6 +1436,10 @@ function Show-DeviceManager {
         $btnDisc.Enabled    = [bool]($one -and $one.Connected -and $one.Wireless)
         $btnRename.Enabled  = [bool]$one
         $btnForget.Enabled  = [bool]($one -and -not $one.Connected)
+        if ($one -and $one.Wireless) {
+            $btnAuto.Enabled = $true
+            $btnAuto.Text = if (Test-AutoConnectExcluded $one.Serial) { '恢复自动连' } else { '不自动连' }
+        } else { $btnAuto.Enabled = $false; $btnAuto.Text = '不自动连' }
     }
     $refresh = {
         $active = Get-ActiveSerials; $state.Active = $active
@@ -1335,6 +1455,7 @@ function Show-DeviceManager {
             $sys = if ($info.Ver -gt 0) { "Android $($info.Ver)" } else { '' }
             $typ = $(if ($wl) { '无线' } else { 'USB' }) + $(if ($sys) { " · $sys" } else { '' })
             if ($active -contains $s) { $typ += '  ▶ 投屏中' }   # 正在投屏的标注出来（与整行同为绿色）
+            if (Test-AutoConnectExcluded $s) { $typ += '  ⊘ 不自动连' }
             [void]$it.SubItems.Add($typ)
             $it.Tag = @{ Serial = $s; Connected = $true; Wireless = $wl }
             [void]$lv.Items.Add($it)
@@ -1344,7 +1465,8 @@ function Show-DeviceManager {
             $it = New-Object System.Windows.Forms.ListViewItem(('○  ' + (Get-FriendlyName $addr)))
             $it.Group = $grpKnown; $it.ForeColor = $cMuted
             [void]$it.SubItems.Add($addr)
-            [void]$it.SubItems.Add('无线 · 未连接')
+            $typ2 = '无线 · 未连接'; if (Test-AutoConnectExcluded $addr) { $typ2 += '  ⊘ 不自动连' }
+            [void]$it.SubItems.Add($typ2)
             $it.Tag = @{ Serial = $addr; Connected = $false; Wireless = $true }
             [void]$lv.Items.Add($it)
         }
@@ -1365,7 +1487,7 @@ function Show-DeviceManager {
         foreach ($it in $items) {
             $addr = $it.Tag.Serial
             try { $out = (Invoke-Hidden -FilePath $adb -ArgumentList @('connect', $addr)) -join "`n" } catch { $out = $_.Exception.Message }
-            if ($out -match 'connected to') { Add-KnownDevice $addr } else { $fail += "$addr：$out" }
+            if ($out -match 'connected to') { Touch-KnownDevice $addr } else { $fail += "$addr：$out" }
         }
         $owner.Cursor = [System.Windows.Forms.Cursors]::Default
         if ($fail) { [System.Windows.Forms.MessageBox]::Show("有设备没连上（可能不在线或网络 adb 已关）：`n`n" + ($fail -join "`n"), '设备管理') | Out-Null }
@@ -1437,12 +1559,19 @@ function Show-DeviceManager {
         if ($settings.defaultDevice -eq $addr) { $settings.defaultDevice = '' }
         Save-Settings; & $refresh
     })
+    $btnAuto.Add_Click({
+        $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
+        $addr = $items[0].Tag.Serial
+        if (-not (Test-Wireless $addr)) { return }
+        Set-AutoConnectExcluded $addr (-not (Test-AutoConnectExcluded $addr))
+        & $refresh
+    })
     $btnIp.Add_Click({ if (Connect-ByIp $dlg) { & $refresh } })
     $btnRefresh2.Add_Click($refresh)
     $btnDone.Add_Click({ $dlg.Close() })
 
     $dlg.Controls.AddRange(@($lv, $line1, $line2, $capCast, $capManage,
-        $btnConnect, $btnCast, $btnStop, $btnAll, $btnDefault, $btnDisc, $btnRename, $btnForget,
+        $btnConnect, $btnCast, $btnStop, $btnAll, $btnDefault, $btnDisc, $btnRename, $btnForget, $btnAuto,
         $btnIp, $btnRefresh2, $btnDone))
     $dlg.AcceptButton = $btnDone
     & $refresh
@@ -1576,7 +1705,7 @@ try {
     $updateStatus = {
         $devs = @(Get-DeviceList)
         # 掉线且开了自动重连：后台 adb connect 连回上次的无线地址（不阻塞界面，下次刷新生效）
-        if ($devs.Count -eq 0 -and $settings.autoReconnect -and $settings.lastWirelessAddr) {
+        if ($devs.Count -eq 0 -and $settings.autoConnect -and $settings.lastWirelessAddr) {
             Start-Process -FilePath $adb -ArgumentList @('connect', $settings.lastWirelessAddr) -WindowStyle Hidden -WorkingDirectory $PSScriptRoot
         }
         if ($devs.Count -gt 0) {
@@ -1665,7 +1794,7 @@ try {
                 $addr = Show-WirelessPair $form
                 if ($addr) {
                     if ($settings.lastWirelessAddr -ne $addr) { $settings.lastWirelessAddr = $addr; Save-Settings }
-                    Add-KnownDevice $addr
+                    Touch-KnownDevice $addr
                     Start-Scrcpy (@('-s', $addr) + (Get-MirrorArgs -Wireless:$true))
                 }
             }
@@ -1795,8 +1924,12 @@ try {
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 8000
     $timer.Add_Tick($updateStatus)
-    $form.Add_Shown({ & $updateStatus; if ($settings.liveStatus -or $settings.autoReconnect) { $timer.Start() } })
-    $form.Add_Activated({ & $updateStatus; if ($settings.liveStatus -or $settings.autoReconnect) { $timer.Start() } else { $timer.Stop() } })
+    $form.Add_Shown({
+        & $updateStatus
+        if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() }
+        Connect-RememberedAsync ({ param($connected) & $updateStatus }.GetNewClosure())
+    })
+    $form.Add_Activated({ & $updateStatus; if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() } else { $timer.Stop() } })
     $form.Add_Deactivate({ $timer.Stop() })
     # 关闭助手 = 停止它开过的所有投屏；正在录屏时先确认，避免误关丢录像
     $form.Add_FormClosing({
