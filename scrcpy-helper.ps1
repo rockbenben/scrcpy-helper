@@ -132,6 +132,7 @@ $script:autoConnectExclude = New-Object System.Collections.Generic.List[string] 
 $script:camResByDevice = [ordered]@{}   # 摄像头采集尺寸记忆，按「序列号|前后」分记（serial|back / serial|front => WxH 或档位）
 $script:camSizesCache  = @{}            # --list-camera-sizes 结果按设备会话缓存，同一台只读一次
 $scrcpyProcs = New-Object System.Collections.ArrayList   # 记录本助手启动的所有 scrcpy 进程，关助手时一并停止
+$script:camSessions = New-Object System.Collections.ArrayList   # 摄像头会话（看门狗自动重连/降档，见主窗 $script:camWatch）；Stop-* 先打 Stopped 标记免得被看门狗拉起来
 $script:autoConnectStarted = $false                      # 启动自动连接每次只跑一次
 $script:bgTimers = New-Object System.Collections.ArrayList  # 钉住后台计时器防 GC（运行中的 Forms.Timer 仅靠自引用会被回收）
 
@@ -518,6 +519,16 @@ function Start-Scrcpy {
     if ($p) { [void]$scrcpyProcs.Add([pscustomobject]@{ Proc = $p; Rec = [bool]$Recording; Serial = $serial }) }
 }
 
+# 启动一个 scrcpy 并把 Process 对象拿回来（摄像头看门狗要盯它的退出码）；启动失败返回 $null。
+# Start-Scrcpy 本身不返回进程（返回值会顺着事件处理器输出流漏出去），这里用「启动前后 $scrcpyProcs 数量」判断拿最后一个。
+function Start-CamProc {
+    param([string[]]$argv)
+    $before = $scrcpyProcs.Count
+    Start-Scrcpy $argv
+    if ($scrcpyProcs.Count -gt $before) { return $scrcpyProcs[$scrcpyProcs.Count - 1].Proc }
+    return $null
+}
+
 # 是否有正在进行的录屏（关助手时据此决定要不要提醒）
 function Test-Recording {
     foreach ($it in @($scrcpyProcs)) {
@@ -547,6 +558,7 @@ function Stop-ScrcpyGraceful {
 }
 # 停止本助手启动的所有投屏：录制中的先发 Ctrl+C 优雅收尾（保住文件），再对其余优雅关窗，最后关不掉的强杀兜底
 function Stop-AllScrcpy {
+    foreach ($cs in @($script:camSessions)) { $cs.Stopped = $true }   # 主动停止：摄像头看门狗别再自动重连（Kill 的退出码≠0，不标记会被误判成异常断开）
     foreach ($it in @($scrcpyProcs)) {   # 录制进程优先优雅停：后台录制无窗口，只能靠 Ctrl+C 收尾，否则强杀会损坏视频
         if ($it.Rec -and $it.Proc -and -not $it.Proc.HasExited) { [void](Stop-ScrcpyGraceful $it.Proc) }
     }
@@ -571,6 +583,7 @@ function Get-ActiveSerials {
 function Stop-DeviceScrcpy {
     param($serial)
     if (-not $serial) { return }
+    foreach ($cs in @($script:camSessions)) { if ($cs.Serial -eq $serial) { $cs.Stopped = $true } }   # 主动停止这台：摄像头看门狗别再自动重连
     foreach ($it in @($scrcpyProcs)) {   # 这台的录制进程先发 Ctrl+C 优雅收尾（后台录制无窗口，强杀会损坏视频）
         if ($it.Serial -eq $serial -and $it.Rec -and $it.Proc -and -not $it.Proc.HasExited) { [void](Stop-ScrcpyGraceful $it.Proc) }
     }
@@ -1277,7 +1290,7 @@ function Show-ManageApps {
 # ---------------- 独立窗口：选 App ----------------
 function Show-NewDisplay {
     param($owner, $serial)
-    $dlg = New-Dialog '独立窗口' 320 308 $owner
+    $dlg = New-Dialog '独立窗口' 320 336 $owner
 
     $l1 = New-Lbl '在电脑上单开一块屏，运行下面这个 App：' 18 18
     $l2 = New-Lbl '（手机本身照常用，互不影响；需 Android 11+）' 18 42; $l2.ForeColor = $cMuted
@@ -1294,9 +1307,11 @@ function Show-NewDisplay {
     $lblMode = New-Lbl '窗口比例' 18 120
     $cbMode = New-Combo @('竖屏·手机版面（推荐微信/QQ）', '横屏·平板版面', '跟随“设置”里的尺寸', '自定义…') @('portrait', 'landscape', 'settings', 'custom') $settings.ndMode 86 117 216
     $chkFixed = New-Chk '固定方向（最大化时画面不乱转）' $settings.ndFixed 18 152
+    # 限宽自动换行：两行说明都比固定宽度的窗宽，不限宽会被右边缘裁掉、看不全
     $capMode = New-Caption "竖屏适合聊天/刷信息；横屏适合看视频。乱转就勾上「固定方向」。`n应用双开/分身在独立窗口常黑屏、点不到，建议改用普通投屏在手机上开分身。" 18 176
+    $capMode.MaximumSize = New-Object System.Drawing.Size(284, 0)
 
-    $btnGo = New-PrimaryBtn '打开' 18 228 284 38 11
+    $btnGo = New-PrimaryBtn '打开' 18 254 284 38 11
     $btnGo.Add_Click({ $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close() })
     $dlg.Controls.AddRange(@($l1, $l2, $cb, $lblMode, $cbMode, $chkFixed, $capMode, $btnGo))
     $dlg.AcceptButton = $btnGo
@@ -2150,6 +2165,18 @@ try {
     # 底部：提示（左） + 设备/快捷键/设置/刷新 链接 + GitHub 图标（右，归入「工具/关于」这组安静的次要入口）
     $lblHint = New-Caption '首次连接点「允许 USB 调试」' 28 338
     $form.Controls.Add($lblHint)
+    # 底部非模态临时提示（录制提示 / 摄像头自动重连提示共用）：换文案几秒后自动恢复原提示。
+    # 只在「当前不是提示态」时记住原始文案——否则短时间内连续两次提示会把上一条提示当成「原文」记下，
+    # 两个恢复定时器先后触发后底部会永久卡在临时文案上。恢复统一用这份记住的原始文案。
+    $script:showTempHint = {
+        param($text, $color, $ms = 6000)
+        if (-not $script:recTipActive) { $script:recHintText = $lblHint.Text; $script:recHintColor = $lblHint.ForeColor }
+        $script:recTipActive = $true
+        $lblHint.Text = $text; $lblHint.ForeColor = $color
+        $ht = New-Object System.Windows.Forms.Timer; $ht.Interval = $ms; [void]$script:bgTimers.Add($ht)
+        $ht.Add_Tick({ $ht.Stop(); $lblHint.Text = $script:recHintText; $lblHint.ForeColor = $script:recHintColor; $script:recTipActive = $false; $ht.Dispose(); [void]$script:bgTimers.Remove($ht) }.GetNewClosure())
+        $ht.Start()
+    }
     # 不再放「刷新」：状态会在窗口重新获得焦点时自动重测，「设备」管理打开也会重新扫描
     $btnDevices = New-LinkBtn '设备' 288 334 52
     $btnShortcuts = New-LinkBtn '快捷键' 344 334 62
@@ -2313,7 +2340,9 @@ try {
         # 下拉内容随「后置/前置」切换重填——两个摄像头支持的尺寸常常不一样。
         $lblRes = New-Lbl '分辨率' 18 140
         $cbRes = New-Combo @('自动') @('auto') 'auto' 78 137 170
-        $capRes = New-Caption '' 78 166
+        # 说明文字顶格放、限宽自动换行：原先跟在下拉下方 x=78 起步，固定宽度的窗横向摆不下、尾巴被裁掉看不全
+        $capRes = New-Caption '' 18 166
+        $capRes.MaximumSize = New-Object System.Drawing.Size(230, 0)
         $fillRes = {
             param($facing)
             $list = @($camSizes[$facing])
@@ -2343,15 +2372,15 @@ try {
             }
             $cbRes.SelectedIndex = $idx
         }
-        $capRes.Text = if ($camDetected) { '✓ 已读取本机支持的尺寸，随便选都能开' } else { '没读到支持列表，用通用档位（打不开就选低一档）' }
+        $capRes.Text = if ($camDetected) { '✓ 已读取本机支持的尺寸；个别高档位编码器可能带不动，打不开会自动降一档重试' } else { '没读到支持列表，用通用档位；打不开会自动重试' }
         & $fillRes $(if ($settings.camFacing -eq 'front') { 'front' } else { 'back' })   # 按上次记住的前后置初始填充
         $rbBack.Add_CheckedChanged({ if ($rbBack.Checked) { & $fillRes 'back' } })
         $rbFront.Add_CheckedChanged({ if ($rbFront.Checked) { & $fillRes 'front' } })
 
-        $chkTorch = New-Chk '打开补光灯' $settings.camTorch 18 196
-        $chkMic = New-Chk '同时采集麦克风声音' $settings.camMic 18 222
+        $chkTorch = New-Chk '打开补光灯' $settings.camTorch 18 214
+        $chkMic = New-Chk '同时采集麦克风声音' $settings.camMic 18 240
 
-        $btnGo = New-PrimaryBtn '开始' 16 262 232 32 11
+        $btnGo = New-PrimaryBtn '开始' 16 280 232 32 11
         $btnGo.Add_Click({ $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close() })
 
         $dlg.Controls.AddRange(@($gb1, $gb2, $lblRes, $cbRes, $capRes, $chkTorch, $chkMic, $btnGo))
@@ -2370,6 +2399,9 @@ try {
             if ($selVal -match '^\d+x\d+$') {
                 # 设备实测支持的精确采集尺寸：直接用 --camera-size，不再加 --camera-ar 以免比例冲突
                 $a += "--camera-size=$selVal"
+                # 关掉 scrcpy 内部的「编码失败自动减半清晰度」：它会一路砍到 800 级别、画面糊成一片还不吱声。
+                # 失败改由看门狗接手——换成尺寸列表里「下一个真实支持的档位」重试，清晰度只降一小步（见 $script:camWatch）。
+                $a += '--no-downsize-on-error'
             } else {
                 # 回退档位：宽高比 + 最大边长，让 scrcpy 自己在支持范围里挑
                 $a += '--camera-ar=16:9'
@@ -2380,7 +2412,17 @@ try {
             if ($rbPort.Checked) { $a += $(if ($rbFront.Checked) { '--capture-orientation=270' } else { '--capture-orientation=90' }) }
             if ($chkTorch.Checked) { $a += '--camera-torch' }
             if ($chkMic.Checked) { $a += '--audio-source=mic' } else { $a += '--no-audio' }
-            Start-Scrcpy $a
+            # 交给看门狗盯着（$script:camWatch）：亮屏被抢自动重连；分辨率带不动自动降一档（只在有实测尺寸列表时能降）
+            $p = Start-CamProc $a
+            if ($p) {
+                [void]$script:camSessions.Add([pscustomobject]@{
+                    Serial = $serial; Facing = $facing; Args = [string[]]$a
+                    Sizes = [string[]]$(if ($selVal -match '^\d+x\d+$') { @($camSizes[$facing]) } else { @() })
+                    CurSize = [string]$selVal; Proc = $p; StartedAt = (Get-Date)
+                    Fails = 0; Proven = $false; Downgraded = $false; Stopped = $false; NextTryAt = [datetime]::MinValue
+                })
+                $script:camWatch.Start()
+            }
         }
     })
 
@@ -2400,14 +2442,7 @@ try {
             Start-Scrcpy $a -Recording
             # 非模态提示（不弹窗打断）：把底部提示行临时换成录制提示，几秒后自动恢复。文字保持短，避免压到右侧「设备/快捷键/设置」链接。
             $recTip = if ($settings.recBackground) { '● 后台录制中 · 「设备」里停止投屏即保存' } else { '● 录制中 · 关掉投屏窗口即停止并保存' }
-            # 只在「当前不是录制提示态」时记住原始提示——否则 6s 内连续两次录制会让第二次把 recTip 当成「原文」记下，
-            # 两个恢复定时器先后触发后底部会永久卡在 recTip（明明没在录）。恢复统一用这份记住的原始文案。
-            if (-not $script:recTipActive) { $script:recHintText = $lblHint.Text; $script:recHintColor = $lblHint.ForeColor }
-            $script:recTipActive = $true
-            $lblHint.Text = $recTip; $lblHint.ForeColor = $cGreen
-            $rt = New-Object System.Windows.Forms.Timer; $rt.Interval = 6000; [void]$script:bgTimers.Add($rt)
-            $rt.Add_Tick({ $rt.Stop(); $lblHint.Text = $script:recHintText; $lblHint.ForeColor = $script:recHintColor; $script:recTipActive = $false; $rt.Dispose(); [void]$script:bgTimers.Remove($rt) }.GetNewClosure())
-            $rt.Start()
+            & $script:showTempHint $recTip $cGreen
         }
     })
 
@@ -2421,6 +2456,70 @@ try {
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 8000
     $timer.Add_Tick($updateStatus)
+
+    # 摄像头看门狗：手机亮屏/人脸解锁时，Android 相机服务会把摄像头从 scrcpy（shell 优先级低）手里抢走——
+    # 这是系统级仲裁，scrcpy 挡不住，表现为「一亮屏就 Camera disconnected、窗口退出」。只能事后自救：
+    # ① 跑起来过又异常退出（退出码≠0）→ 视为被系统中断，原参数自动重连（退避递增，连续 12 次失败才罢手）；
+    # ② 一启动就挂 → 多半是该分辨率编码器带不动（scrcpy 官方文档：--list-camera-sizes 是“声明式”的，列出来≠真能开）
+    #    → 自动换下一档真实尺寸重试，稳定跑满 15 秒就把这档记为该设备该朝向的默认，下次直接用；
+    # ③ 用户自己关窗（退出码 0）/ 助手主动停止（Stopped 标记）→ 不重连。
+    $script:camWatch = New-Object System.Windows.Forms.Timer
+    $script:camWatch.Interval = 1500
+    $script:camWatch.Add_Tick({
+        if ($script:camSessions.Count -eq 0) { $script:camWatch.Stop(); return }
+        $now = Get-Date
+        foreach ($cs in @($script:camSessions)) {
+            if ($cs.Stopped -or -not $cs.Proc) { [void]$script:camSessions.Remove($cs); continue }
+            if (-not $cs.Proc.HasExited) {
+                # 稳定运行 15 秒 = 这档分辨率确实能开：清失败计数；若是降档换来的尺寸，记住它（下次面板直接默认）
+                if ((($now - $cs.StartedAt).TotalSeconds -ge 15) -and (-not $cs.Proven -or $cs.Fails -gt 0)) {
+                    # 每次稳定运行都清零 Fails（不只首次）：12 次上限管的是「连续」失败，
+                    # 否则长时间用下来亮屏中断的次数累计够 12 次后就再也不重连了
+                    if (-not $cs.Proven -and $cs.Downgraded) { Set-CamRemembered $cs.Serial $cs.Facing $cs.CurSize; Save-Settings }
+                    $cs.Proven = $true; $cs.Fails = 0
+                }
+                continue
+            }
+            $code = 1; try { $code = $cs.Proc.ExitCode } catch {}
+            if ($code -eq 0) { [void]$script:camSessions.Remove($cs); continue }   # 用户自己关的窗，不重连
+            if ($now -lt $cs.NextTryAt) { continue }                               # 还在退避期，等下个周期
+            $ranSec = 0; try { $ranSec = ($cs.Proc.ExitTime - $cs.StartedAt).TotalSeconds } catch {}
+            $cs.Fails++
+            if ($cs.Proven -or $ranSec -ge 12) {
+                # 跑起来过：典型是亮屏/解锁被抢走摄像头 → 重连。锁屏人脸解锁期间相机可能仍被占着，退避 2/4/6…10s 再试
+                if ($cs.Fails -gt 12) {
+                    [void]$script:camSessions.Remove($cs)
+                    & $script:showTempHint '摄像头多次重连失败，已停止自动重连' $cRed 12000
+                    continue
+                }
+                if ((Get-DeviceList) -notcontains $cs.Serial) {
+                    # 设备整个不在了（拔线/无线掉线）：重启 scrcpy 只会白闪一串失败窗口，直接收手并告知
+                    [void]$script:camSessions.Remove($cs)
+                    & $script:showTempHint '设备已断开，摄像头未自动重连' $cRed 12000
+                    continue
+                }
+                $cs.NextTryAt = $now.AddSeconds([Math]::Min(2 * $cs.Fails, 10))
+                $cs.Proc = Start-CamProc $cs.Args
+                $cs.StartedAt = Get-Date
+                if ($cs.Proc) { & $script:showTempHint '摄像头被手机中断（亮屏/解锁），已自动重连' $cGreen }
+            } else {
+                # 一启动就挂：这档分辨率带不动 → 自动降一档（列表按面积降序，取下一个真实支持的尺寸）
+                $idx = if ($cs.Sizes.Count -gt 0) { [array]::IndexOf([array]$cs.Sizes, [string]$cs.CurSize) } else { -1 }
+                if ($cs.Fails -le 6 -and $idx -ge 0 -and ($idx + 1) -lt $cs.Sizes.Count) {
+                    $next = [string]$cs.Sizes[$idx + 1]
+                    $cs.Args = [string[]]@($cs.Args | ForEach-Object { if ($_ -like '--camera-size=*') { "--camera-size=$next" } else { $_ } })
+                    & $script:showTempHint "$($cs.CurSize) 打不开，已自动换 $next 重试" $cMuted
+                    $cs.CurSize = $next; $cs.Downgraded = $true
+                    $cs.NextTryAt = $now.AddSeconds(1)
+                    $cs.Proc = Start-CamProc $cs.Args
+                    $cs.StartedAt = Get-Date
+                } else {
+                    [void]$script:camSessions.Remove($cs)
+                    & $script:showTempHint '摄像头没能打开，请在面板里选更低的分辨率' $cRed 12000
+                }
+            }
+        }
+    })
     $form.Add_Shown({
         & $updateStatus
         if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() }
@@ -2451,7 +2550,7 @@ try {
         # 用本助手目录里的 adb 自己 kill-server（只停默认端口的 server，下次用到会自动重启）。
         try { Invoke-Hidden -FilePath $adb -ArgumentList @('kill-server') -DiscardStderr | Out-Null } catch {}
     })
-    $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose(); Stop-ActivationWaiter })   # 让激活等待线程退出，否则它阻塞 WaitOne 会钉住进程不退出
+    $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose(); $script:camWatch.Stop(); $script:camWatch.Dispose(); Stop-ActivationWaiter })   # 让激活等待线程退出，否则它阻塞 WaitOne 会钉住进程不退出
 
     [void]$form.ShowDialog()
 }
