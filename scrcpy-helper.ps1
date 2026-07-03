@@ -40,6 +40,17 @@ try {
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# UI 线程事件处理器里的漏网异常：默认会弹 .NET Framework 的「未经处理的异常」模态窗（还带「退出」按钮，
+# 一点就把助手整个杀掉、收尾代码全跳过）。改为记到脚本旁的错误日志里、程序照常继续，用户不被打断还留下线索。
+[System.Windows.Forms.Application]::add_ThreadException([System.Threading.ThreadExceptionEventHandler]{
+    param($s, $e)
+    try {
+        $logPath = Join-Path $PSScriptRoot '投屏助手-错误日志.txt'
+        if ((Test-Path -LiteralPath $logPath) -and ((Get-Item -LiteralPath $logPath).Length -gt 262144)) { Remove-Item -LiteralPath $logPath -Force }   # 日志封顶 256KB，超了重头记
+        Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $($e.Exception)`r`n" -Encoding UTF8
+    } catch {}
+})
+
 # scrcpy 4.0 的命令行输出是 UTF-8；Windows PowerShell 默认按系统 OEM 码页解码，会把中文
 # （如「更多应用」里 --list-apps 列出的 App 中文名）读成乱码。统一按 UTF-8 解码原生命令输出。
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
@@ -498,9 +509,20 @@ function Get-DeviceDisplay {
     return $res
 }
 
+# 一个常驻的空文件，专给摄像头 scrcpy 当 stdin（-RedirectStandardInput 需要真实存在的文件路径；空文件=立刻 EOF，
+# 让 scrcpy 退出时的「Press Enter to continue…」读到 EOF 直接返回、不卡）。只在第一次用到时建，之后复用。
+$script:nulStdinPath = $null
+function Get-NulStdin {
+    if ($script:nulStdinPath -and (Test-Path -LiteralPath $script:nulStdinPath)) { return $script:nulStdinPath }
+    $pth = Join-Path $env:TEMP 'scrcpy-helper-nul-stdin.txt'
+    try { if (-not (Test-Path -LiteralPath $pth)) { Set-Content -LiteralPath $pth -Value '' -NoNewline -Encoding ascii } } catch {}
+    $script:nulStdinPath = $pth
+    return $pth
+}
+
 # 启动 scrcpy（不阻塞界面；自动过滤空参数）
 function Start-Scrcpy {
-    param([string[]]$Options, [switch]$Recording)
+    param([string[]]$Options, [switch]$Recording, [string]$StderrFile)
     $extra = @(); if ($settings.extraArgs) { $extra = @($settings.extraArgs -split '\s+' | Where-Object { $_ }) }
     $clean = @(($Options + $extra) | Where-Object { $_ -ne '' -and $null -ne $_ })
     # 解析目标设备序列号（来自 -s），用于「投屏中」标记 / 「停止这台」，并据此给窗口起友好标题
@@ -514,19 +536,31 @@ function Start-Scrcpy {
     # Start-Process 数组传参不会给「含空格的参数」加引号——会把录屏路径 C:\My Videos\x.mp4 拆成多段、
     # 让 scrcpy 收到的 -r 路径残缺、录屏失败。这里自己给含空格/引号的参数补引号，整体作为命令行串传。
     $cmd = (@($clean | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
-    $p = if ($cmd) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru }
+    # StderrFile：摄像头看门狗要靠 stderr 里的报错分类「被抢 / 带不动 / 不明原因」，只对摄像头会话把 stderr 落到文件。
+    # scrcpy 是控制台程序：一旦 -RedirectStandardError（=UseShellExecute 关）就会继承本助手的控制台，退出时触发它
+    # Windows 版自带的「Press Enter to continue…」暂停——进程卡着不退、还冒出黑窗，看门狗误判成异常又反复重开。
+    # 两道一起下才干净：① -RedirectStandardInput 指到一个空文件 → scrcpy 那次 getchar 立刻读到 EOF，不等回车；
+    # ② -WindowStyle Hidden → 不弹控制台窗。stderr 落文件由 OS 直接写（不占管道缓冲，避免 scrcpy 刷不动 stderr 卡死）。
+    $p = if ($cmd -and $StderrFile) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru -RedirectStandardError $StderrFile -RedirectStandardInput (Get-NulStdin) -WindowStyle Hidden }
+    elseif ($cmd) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru }
     else { Start-Process -FilePath $exe -WorkingDirectory $PSScriptRoot -PassThru }
     if ($p) { [void]$scrcpyProcs.Add([pscustomobject]@{ Proc = $p; Rec = [bool]$Recording; Serial = $serial }) }
 }
 
-# 启动一个 scrcpy 并把 Process 对象拿回来（摄像头看门狗要盯它的退出码）；启动失败返回 $null。
+# 启动一个 scrcpy 并把 Process 对象拿回来（摄像头看门狗要盯它的退出码和 stderr）；启动失败返回 $null。
 # Start-Scrcpy 本身不返回进程（返回值会顺着事件处理器输出流漏出去），这里用「启动前后 $scrcpyProcs 数量」判断拿最后一个。
 function Start-CamProc {
-    param([string[]]$argv)
+    param([string[]]$argv, [string]$errFile)
     $before = $scrcpyProcs.Count
-    Start-Scrcpy $argv
+    Start-Scrcpy $argv -StderrFile $errFile
     if ($scrcpyProcs.Count -gt $before) { return $scrcpyProcs[$scrcpyProcs.Count - 1].Proc }
     return $null
+}
+# 摘掉一个摄像头看门狗会话并清掉它的 stderr 临时文件
+function Remove-CamSession {
+    param($cs)
+    [void]$script:camSessions.Remove($cs)
+    if ($cs.ErrFile) { try { Remove-Item -LiteralPath $cs.ErrFile -Force } catch {} }
 }
 
 # 是否有正在进行的录屏（关助手时据此决定要不要提醒）
@@ -1618,13 +1652,15 @@ function Connect-RememberedAsync {
 # 掉线后台重连单台无线地址（8s 轮询发现掉线时用）：先 TCP 探测可达再 CreateNoWindow adb connect，
 # 全程在后台 runspace 跑——不阻塞 UI、不闪控制台（与全脚本一致，不再用 Start-Process -WindowStyle Hidden）。
 # in-flight 守卫避免每 8s 轮询叠加多个探测/连接；被「不自动连」排除的地址直接跳过（与启动自动连接口径一致）。
-$script:reconnectInFlight = $false
+# 守卫放在哈希表里而不是布尔标量：完成回调是 GetNewClosure 闭包，里面写 $script:xxx 只会写进闭包模块的副本、
+# 真标志永远卡在 $true，掉线自动重连从第一次之后就全被这里 return 掉——只能靠「捕获引用 + 写属性」穿透闭包。
+$script:reconnectState = @{ InFlight = $false }
 function Reconnect-LastAsync {
     param($addr)
     if (-not $addr) { return }
-    if ($script:reconnectInFlight) { return }
+    if ($script:reconnectState.InFlight) { return }
     if (Test-AutoConnectExcluded $addr) { return }
-    $script:reconnectInFlight = $true
+    $script:reconnectState.InFlight = $true
     $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
     $rs.SessionStateProxy.SetVariable('adbPath', $adb)
     $rs.SessionStateProxy.SetVariable('addr', $addr)
@@ -1651,6 +1687,7 @@ function Reconnect-LastAsync {
     })
     $async = $ps.BeginInvoke()
     $bag = $script:bgTimers
+    $flag = $script:reconnectState   # 捕获引用：闭包里写 $flag.InFlight 才真正改到脚本级状态（写 $script: 无效，见上）
     $t = New-Object System.Windows.Forms.Timer; $t.Interval = 400; [void]$bag.Add($t)
     $t.Add_Tick({
         if ($async.IsCompleted) {
@@ -1658,7 +1695,7 @@ function Reconnect-LastAsync {
             try { $ps.EndInvoke($async) } catch {}
             try { $rs.Dispose() } catch {}
             $ps.Dispose(); $t.Dispose(); [void]$bag.Remove($t)
-            $script:reconnectInFlight = $false
+            $flag.InFlight = $false
         }
     }.GetNewClosure())
     $t.Start()
@@ -2166,16 +2203,22 @@ try {
     $lblHint = New-Caption '首次连接点「允许 USB 调试」' 28 338
     $form.Controls.Add($lblHint)
     # 底部非模态临时提示（录制提示 / 摄像头自动重连提示共用）：换文案几秒后自动恢复原提示。
-    # 只在「当前不是提示态」时记住原始文案——否则短时间内连续两次提示会把上一条提示当成「原文」记下，
-    # 两个恢复定时器先后触发后底部会永久卡在临时文案上。恢复统一用这份记住的原始文案。
+    # 只在「当前不是提示态」时记住原始文案——否则短时间内连续两次提示会把上一条提示当成「原文」记下。
+    # 恢复用一只常驻定时器（新提示只是重置它的间隔），且回调不可用 GetNewClosure：
+    # 闭包会绑到新的动态模块，里面 $script: 前缀解析到该模块自己的空 script 作用域全是 $null——
+    # 恢复时 ForeColor 被赋 $null 直接抛「无法转换为 System.Drawing.Color」的未处理异常弹窗。
+    $script:hintRestore = New-Object System.Windows.Forms.Timer
+    $script:hintRestore.Add_Tick({
+        $script:hintRestore.Stop()
+        $lblHint.Text = $script:recHintText; $lblHint.ForeColor = $script:recHintColor
+        $script:recTipActive = $false
+    })
     $script:showTempHint = {
         param($text, $color, $ms = 6000)
         if (-not $script:recTipActive) { $script:recHintText = $lblHint.Text; $script:recHintColor = $lblHint.ForeColor }
         $script:recTipActive = $true
         $lblHint.Text = $text; $lblHint.ForeColor = $color
-        $ht = New-Object System.Windows.Forms.Timer; $ht.Interval = $ms; [void]$script:bgTimers.Add($ht)
-        $ht.Add_Tick({ $ht.Stop(); $lblHint.Text = $script:recHintText; $lblHint.ForeColor = $script:recHintColor; $script:recTipActive = $false; $ht.Dispose(); [void]$script:bgTimers.Remove($ht) }.GetNewClosure())
-        $ht.Start()
+        $script:hintRestore.Stop(); $script:hintRestore.Interval = $ms; $script:hintRestore.Start()
     }
     # 不再放「刷新」：状态会在窗口重新获得焦点时自动重测，「设备」管理打开也会重新扫描
     $btnDevices = New-LinkBtn '设备' 288 334 52
@@ -2413,12 +2456,15 @@ try {
             if ($chkTorch.Checked) { $a += '--camera-torch' }
             if ($chkMic.Checked) { $a += '--audio-source=mic' } else { $a += '--no-audio' }
             # 交给看门狗盯着（$script:camWatch）：亮屏被抢自动重连；分辨率带不动自动降一档（只在有实测尺寸列表时能降）
-            $p = Start-CamProc $a
+            # 同一台的旧会话先标停：用户重新从面板开摄像头 = 放弃旧会话，否则两个会话的看门狗会抢着拉进程
+            foreach ($old in @($script:camSessions)) { if ($old.Serial -eq $serial) { $old.Stopped = $true } }
+            $errFile = Join-Path $env:TEMP ("scrcpy-helper-cam-{0}.log" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+            $p = Start-CamProc $a $errFile
             if ($p) {
                 [void]$script:camSessions.Add([pscustomobject]@{
                     Serial = $serial; Facing = $facing; Args = [string[]]$a
                     Sizes = [string[]]$(if ($selVal -match '^\d+x\d+$') { @($camSizes[$facing]) } else { @() })
-                    CurSize = [string]$selVal; Proc = $p; StartedAt = (Get-Date)
+                    CurSize = [string]$selVal; Proc = $p; StartedAt = (Get-Date); ErrFile = $errFile
                     Fails = 0; Proven = $false; Downgraded = $false; Stopped = $false; NextTryAt = [datetime]::MinValue
                 })
                 $script:camWatch.Start()
@@ -2458,18 +2504,25 @@ try {
     $timer.Add_Tick($updateStatus)
 
     # 摄像头看门狗：手机亮屏/人脸解锁时，Android 相机服务会把摄像头从 scrcpy（shell 优先级低）手里抢走——
-    # 这是系统级仲裁，scrcpy 挡不住，表现为「一亮屏就 Camera disconnected、窗口退出」。只能事后自救：
-    # ① 跑起来过又异常退出（退出码≠0）→ 视为被系统中断，原参数自动重连（退避递增，连续 12 次失败才罢手）；
-    # ② 一启动就挂 → 多半是该分辨率编码器带不动（scrcpy 官方文档：--list-camera-sizes 是“声明式”的，列出来≠真能开）
-    #    → 自动换下一档真实尺寸重试，稳定跑满 15 秒就把这档记为该设备该朝向的默认，下次直接用；
-    # ③ 用户自己关窗（退出码 0）/ 助手主动停止（Stopped 标记）→ 不重连。
+    # 这是系统级仲裁，scrcpy 挡不住。只能事后自救。退出后按「退出码 + stderr 报错」分类（实测 scrcpy 4.0）：
+    # ① 退出码 0 = 用户自己关窗 / Stopped 标记 = 助手主动停止 → 不重连；
+    # ② stderr 有被抢病因（CAMERA_IN_USE / Camera disconnected 等）= 被抢 → 原参数重连（退避递增，连 12 次失败才罢手）；
+    # ③ stderr 有配置/编码器病因（Camera configuration error / MediaCodec 栈等）= 该分辨率带不动
+    #    （--list-camera-sizes 是“声明式”的，列出来≠真能开）→ 自动换下一档真实尺寸重试，
+    #    稳定跑满 15 秒就把这档记为该设备该朝向的默认，下次直接用；
+    # ④ stderr 只剩通用断流尾声（Device disconnected）= 真断流 → 同②重连（设备不在线则收手）；
+    # ⑤ 其它一概不明原因 → 收手不折腾。以前只按「退出码≠0 + 跑了多久」猜，开头 15 秒内被抢会被误判成
+    #    带不动而连环降档换分辨率重开，用户想退都退不掉。
+    # 匹配次序②③④不可换：scrcpy 客户端在 server 任何猝死时结尾都补一句 "WARN: Device disconnected"
+    # （实测被抢的 CAMERA_IN_USE 日志和带不动的场景都带这尾声），先查它会把「带不动」也吞成「被抢」、永远不降档。
     $script:camWatch = New-Object System.Windows.Forms.Timer
     $script:camWatch.Interval = 1500
     $script:camWatch.Add_Tick({
         if ($script:camSessions.Count -eq 0) { $script:camWatch.Stop(); return }
         $now = Get-Date
         foreach ($cs in @($script:camSessions)) {
-            if ($cs.Stopped -or -not $cs.Proc) { [void]$script:camSessions.Remove($cs); continue }
+          try {
+            if ($cs.Stopped -or -not $cs.Proc) { Remove-CamSession $cs; continue }
             if (-not $cs.Proc.HasExited) {
                 # 稳定运行 15 秒 = 这档分辨率确实能开：清失败计数；若是降档换来的尺寸，记住它（下次面板直接默认）
                 if ((($now - $cs.StartedAt).TotalSeconds -ge 15) -and (-not $cs.Proven -or $cs.Fails -gt 0)) {
@@ -2481,43 +2534,59 @@ try {
                 continue
             }
             $code = 1; try { $code = $cs.Proc.ExitCode } catch {}
-            if ($code -eq 0) { [void]$script:camSessions.Remove($cs); continue }   # 用户自己关的窗，不重连
-            if ($now -lt $cs.NextTryAt) { continue }                               # 还在退避期，等下个周期
-            $ranSec = 0; try { $ranSec = ($cs.Proc.ExitTime - $cs.StartedAt).TotalSeconds } catch {}
+            if ($code -eq 0) { Remove-CamSession $cs; continue }   # 用户自己关的窗，不重连
+            if ($now -lt $cs.NextTryAt) { continue }               # 还在退避期，等下个周期
+            $errTxt = ''; try { if ($cs.ErrFile) { $errTxt = [System.IO.File]::ReadAllText($cs.ErrFile) } } catch {}
             $cs.Fails++
-            if ($cs.Proven -or $ranSec -ge 12) {
-                # 跑起来过：典型是亮屏/解锁被抢走摄像头 → 重连。锁屏人脸解锁期间相机可能仍被占着，退避 2/4/6…10s 再试
+            # 病因分类（字符串核对自 scrcpy 4.0 客户端与 scrcpy-server 二进制 + 实测 stderr 日志），具体病因优先、通用尾声兜底
+            $kind = if ($errTxt -match 'CAMERA_IN_USE|Higher-priority client|Camera disconnected') { 'grab' }
+                elseif ($errTxt -match 'Camera configuration error|MediaCodec|CodecException|IllegalArgumentException|Could not select camera size|Could not create video encoder|stream configuration error') { 'cfg' }
+                elseif ($errTxt -match 'Device disconnected|stream disabled due to connection error') { 'grab' }
+                else { 'unknown' }
+            if ($kind -eq 'grab') {
+                # 被抢 / 断流：典型是亮屏/解锁把摄像头抢走 → 重连。人脸解锁期间相机可能仍被占着，退避 2/4/6…10s 再试
                 if ($cs.Fails -gt 12) {
-                    [void]$script:camSessions.Remove($cs)
+                    Remove-CamSession $cs
                     & $script:showTempHint '摄像头多次重连失败，已停止自动重连' $cRed 12000
                     continue
                 }
                 if ((Get-DeviceList) -notcontains $cs.Serial) {
                     # 设备整个不在了（拔线/无线掉线）：重启 scrcpy 只会白闪一串失败窗口，直接收手并告知
-                    [void]$script:camSessions.Remove($cs)
+                    Remove-CamSession $cs
                     & $script:showTempHint '设备已断开，摄像头未自动重连' $cRed 12000
                     continue
                 }
                 $cs.NextTryAt = $now.AddSeconds([Math]::Min(2 * $cs.Fails, 10))
-                $cs.Proc = Start-CamProc $cs.Args
+                $cs.Proc = Start-CamProc $cs.Args $cs.ErrFile
                 $cs.StartedAt = Get-Date
-                if ($cs.Proc) { & $script:showTempHint '摄像头被手机中断（亮屏/解锁），已自动重连' $cGreen }
-            } else {
-                # 一启动就挂：这档分辨率带不动 → 自动降一档（列表按面积降序，取下一个真实支持的尺寸）
+                if ($cs.Proc) { & $script:showTempHint '摄像头被手机中断（亮屏/解锁），已自动重连；不想用了关窗即停' $cGreen }
+            } elseif ($kind -eq 'cfg') {
+                # 这档分辨率带不动 → 自动降一档（列表按面积降序，取下一个真实支持的尺寸）。
+                # 只认「配置/编码器」类病因：相机配不出（Camera configuration error）或编码器扛不住（MediaCodec/IllegalArgumentException 栈）。
+                # 不含泛泛的 "Video encoding error"：它是任何采集失败的通用外壳，被抢（CAMERA_IN_USE）的日志里也有这句。
+                # 不含 "Could not open camera"：那更像相机被系统占用（解锁争用），降分辨率也没用，交给下面「不明原因→停」，
+                # 免得把一次占用误判成带不动、连环降档换分辨率——正是最初那个「想退退不掉」的坑。
+                # -not $cs.Proven：只在「这档从没成功跑起来过」时才降。已稳定跑过的分辨率偶发一次配置错误多半是transient，
+                # 降一个已知能用的档位反而把清晰度平白降没了——那种情况落到下面「不明原因→停」，不动它。
                 $idx = if ($cs.Sizes.Count -gt 0) { [array]::IndexOf([array]$cs.Sizes, [string]$cs.CurSize) } else { -1 }
-                if ($cs.Fails -le 6 -and $idx -ge 0 -and ($idx + 1) -lt $cs.Sizes.Count) {
+                if (-not $cs.Proven -and $cs.Fails -le 6 -and $idx -ge 0 -and ($idx + 1) -lt $cs.Sizes.Count) {
                     $next = [string]$cs.Sizes[$idx + 1]
                     $cs.Args = [string[]]@($cs.Args | ForEach-Object { if ($_ -like '--camera-size=*') { "--camera-size=$next" } else { $_ } })
-                    & $script:showTempHint "$($cs.CurSize) 打不开，已自动换 $next 重试" $cMuted
                     $cs.CurSize = $next; $cs.Downgraded = $true
                     $cs.NextTryAt = $now.AddSeconds(1)
-                    $cs.Proc = Start-CamProc $cs.Args
+                    $cs.Proc = Start-CamProc $cs.Args $cs.ErrFile
                     $cs.StartedAt = Get-Date
+                    & $script:showTempHint "分辨率带不动，已自动换 $next 重试" $cMuted
                 } else {
-                    [void]$script:camSessions.Remove($cs)
+                    Remove-CamSession $cs
                     & $script:showTempHint '摄像头没能打开，请在面板里选更低的分辨率' $cRed 12000
                 }
+            } else {
+                # 不明原因退出（stderr 没有认识的报错）：宁可不折腾也别跟用户抢——自动重开才是更大的骚扰
+                Remove-CamSession $cs
+                & $script:showTempHint '摄像头已退出，未自动重连' $cMuted 8000
             }
+          } catch { try { Remove-CamSession $cs } catch {} }   # 看门狗内部任何意外都只放弃这个会话，绝不让异常冒成弹窗
         }
     })
     $form.Add_Shown({
@@ -2550,7 +2619,7 @@ try {
         # 用本助手目录里的 adb 自己 kill-server（只停默认端口的 server，下次用到会自动重启）。
         try { Invoke-Hidden -FilePath $adb -ArgumentList @('kill-server') -DiscardStderr | Out-Null } catch {}
     })
-    $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose(); $script:camWatch.Stop(); $script:camWatch.Dispose(); Stop-ActivationWaiter })   # 让激活等待线程退出，否则它阻塞 WaitOne 会钉住进程不退出
+    $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose(); $script:camWatch.Stop(); $script:camWatch.Dispose(); $script:hintRestore.Stop(); $script:hintRestore.Dispose(); Stop-ActivationWaiter })   # 让激活等待线程退出，否则它阻塞 WaitOne 会钉住进程不退出
 
     [void]$form.ShowDialog()
 }
