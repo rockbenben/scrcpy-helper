@@ -2547,7 +2547,7 @@ try {
                 # 被抢 / 断流：典型是亮屏/解锁把摄像头抢走 → 重连。人脸解锁期间相机可能仍被占着，退避 2/4/6…10s 再试
                 if ($cs.Fails -gt 12) {
                     Remove-CamSession $cs
-                    & $script:showTempHint '摄像头多次重连失败，已停止自动重连' $cRed 12000
+                    & $script:showTempHint '多次重连失败，摄像头已停止' $cRed 12000
                     continue
                 }
                 if ((Get-DeviceList) -notcontains $cs.Serial) {
@@ -2559,7 +2559,7 @@ try {
                 $cs.NextTryAt = $now.AddSeconds([Math]::Min(2 * $cs.Fails, 10))
                 $cs.Proc = Start-CamProc $cs.Args $cs.ErrFile
                 $cs.StartedAt = Get-Date
-                if ($cs.Proc) { & $script:showTempHint '摄像头被手机中断（亮屏/解锁），已自动重连；不想用了关窗即停' $cGreen }
+                if ($cs.Proc) { & $script:showTempHint '摄像头被亮屏打断，已自动重连；关窗即停' $cGreen }
             } elseif ($kind -eq 'cfg') {
                 # 这档分辨率带不动 → 自动降一档（列表按面积降序，取下一个真实支持的尺寸）。
                 # 只认「配置/编码器」类病因：相机配不出（Camera configuration error）或编码器扛不住（MediaCodec/IllegalArgumentException 栈）。
@@ -2576,10 +2576,10 @@ try {
                     $cs.NextTryAt = $now.AddSeconds(1)
                     $cs.Proc = Start-CamProc $cs.Args $cs.ErrFile
                     $cs.StartedAt = Get-Date
-                    & $script:showTempHint "分辨率带不动，已自动换 $next 重试" $cMuted
+                    & $script:showTempHint "分辨率带不动，已换 $next 重试" $cMuted
                 } else {
                     Remove-CamSession $cs
-                    & $script:showTempHint '摄像头没能打开，请在面板里选更低的分辨率' $cRed 12000
+                    & $script:showTempHint '摄像头没能打开，请选更低的分辨率' $cRed 12000
                 }
             } else {
                 # 不明原因退出（stderr 没有认识的报错）：宁可不折腾也别跟用户抢——自动重开才是更大的骚扰
