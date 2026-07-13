@@ -2462,11 +2462,11 @@ try {
             Save-Settings
             $a = @('-s', $serial, '--video-source=camera', "--camera-facing=$facing")
             if ($selVal -match '^\d+x\d+$') {
-                # 设备实测支持的精确采集尺寸：直接用 --camera-size，不再加 --camera-ar 以免比例冲突
+                # 设备实测支持的精确采集尺寸：直接用 --camera-size，不再加 --camera-ar 以免比例冲突。
+                # 不再加 --no-downsize-on-error：scrcpy 4.1 若这档编码器带不动，会用分级阶梯 {2560..800} 单步降档、进程不退继续跑
+                #（不再是 4.0 一步砍到 800 糊成一片），残余失败交给 4.1 原生处理。看门狗只保留「亮屏被抢自动重连」。
+                # 若真机上原生降档不理想，回退＝在此加回 '--no-downsize-on-error' 并恢复看门狗 cfg 手动降档分支。
                 $a += "--camera-size=$selVal"
-                # 关掉 scrcpy 内部的「编码失败自动减半清晰度」：它会一路砍到 800 级别、画面糊成一片还不吱声。
-                # 失败改由看门狗接手——换成尺寸列表里「下一个真实支持的档位」重试，清晰度只降一小步（见 $script:camWatch）。
-                $a += '--no-downsize-on-error'
             } else {
                 # 回退档位：宽高比 + 最大边长，让 scrcpy 自己在支持范围里挑
                 $a += '--camera-ar=16:9'
@@ -2477,7 +2477,7 @@ try {
             if ($rbPort.Checked) { $a += $(if ($rbFront.Checked) { '--capture-orientation=270' } else { '--capture-orientation=90' }) }
             if ($chkTorch.Checked) { $a += '--camera-torch' }
             if ($chkMic.Checked) { $a += '--audio-source=mic' } else { $a += '--no-audio' }
-            # 交给看门狗盯着（$script:camWatch）：亮屏被抢自动重连；分辨率带不动自动降一档（只在有实测尺寸列表时能降）
+            # 交给看门狗盯着（$script:camWatch）：只管「亮屏被抢自动重连」；分辨率带不动已交给 scrcpy 4.1 原生降档，看门狗不再手动换档
             # 同一台的旧会话先标停：用户重新从面板开摄像头 = 放弃旧会话，否则两个会话的看门狗会抢着拉进程
             foreach ($old in @($script:camSessions)) { if ($old.Serial -eq $serial) { $old.Stopped = $true } }
             $errFile = Join-Path $env:TEMP ("scrcpy-helper-cam-{0}.log" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
@@ -2485,9 +2485,8 @@ try {
             if ($p) {
                 [void]$script:camSessions.Add([pscustomobject]@{
                     Serial = $serial; Facing = $facing; Args = [string[]]$a
-                    Sizes = [string[]]$(if ($selVal -match '^\d+x\d+$') { @($camSizes[$facing]) } else { @() })
-                    CurSize = [string]$selVal; Proc = $p; StartedAt = (Get-Date); ErrFile = $errFile
-                    Fails = 0; Proven = $false; Downgraded = $false; Stopped = $false; NextTryAt = [datetime]::MinValue
+                    Proc = $p; StartedAt = (Get-Date); ErrFile = $errFile
+                    Fails = 0; Proven = $false; Stopped = $false; NextTryAt = [datetime]::MinValue
                 })
                 $script:camWatch.Start()
             }
@@ -2534,17 +2533,16 @@ try {
     $timer.Add_Tick($updateStatus)
 
     # 摄像头看门狗：手机亮屏/人脸解锁时，Android 相机服务会把摄像头从 scrcpy（shell 优先级低）手里抢走——
-    # 这是系统级仲裁，scrcpy 挡不住。只能事后自救。退出后按「退出码 + stderr 报错」分类（实测 scrcpy 4.0）：
+    # 这是系统级仲裁，scrcpy 挡不住。只能事后自救。退出后按「退出码 + stderr 报错」分类（病因串核对自 scrcpy 4.x）：
     # ① 退出码 0 = 用户自己关窗 / Stopped 标记 = 助手主动停止 → 不重连；
     # ② stderr 有被抢病因（CAMERA_IN_USE / Camera disconnected 等）= 被抢 → 原参数重连（退避递增，连 12 次失败才罢手）；
-    # ③ stderr 有配置/编码器病因（Camera configuration error / MediaCodec 栈等）= 该分辨率带不动
-    #    （--list-camera-sizes 是“声明式”的，列出来≠真能开）→ 自动换下一档真实尺寸重试，
-    #    稳定跑满 15 秒就把这档记为该设备该朝向的默认，下次直接用；
+    # ③ stderr 有配置/编码器病因（Camera configuration error / MediaCodec 栈等）= 分辨率带不动。
+    #    已去掉 --no-downsize-on-error，scrcpy 4.1 能降档时会内部单步降档、进程不退；真走到这里 = 它把分级阶梯也试完了仍开不出
+    #    → 直接停并提示选更低分辨率（不再手动换档，那套已交给 4.1 原生）；
     # ④ stderr 只剩通用断流尾声（Device disconnected）= 真断流 → 同②重连（设备不在线则收手）；
-    # ⑤ 其它一概不明原因 → 收手不折腾。以前只按「退出码≠0 + 跑了多久」猜，开头 15 秒内被抢会被误判成
-    #    带不动而连环降档换分辨率重开，用户想退都退不掉。
+    # ⑤ 其它一概不明原因 → 收手不折腾。以前只按「退出码≠0 + 跑了多久」猜，开头 15 秒内被抢会被误判成带不动、连环重开退不掉。
     # 匹配次序②③④不可换：scrcpy 客户端在 server 任何猝死时结尾都补一句 "WARN: Device disconnected"
-    # （实测被抢的 CAMERA_IN_USE 日志和带不动的场景都带这尾声），先查它会把「带不动」也吞成「被抢」、永远不降档。
+    # （实测被抢的 CAMERA_IN_USE 日志和带不动的场景都带这尾声），先查它会把「带不动」也吞成「被抢」、分类错。
     $script:camWatch = New-Object System.Windows.Forms.Timer
     $script:camWatch.Interval = 1500
     $script:camWatch.Add_Tick({
@@ -2554,11 +2552,10 @@ try {
           try {
             if ($cs.Stopped -or -not $cs.Proc) { Remove-CamSession $cs; continue }
             if (-not $cs.Proc.HasExited) {
-                # 稳定运行 15 秒 = 这档分辨率确实能开：清失败计数；若是降档换来的尺寸，记住它（下次面板直接默认）
+                # 稳定运行 15 秒 = 这次会话确实起来了：清失败计数（供被抢重连的 12 次上限用）
                 if ((($now - $cs.StartedAt).TotalSeconds -ge 15) -and (-not $cs.Proven -or $cs.Fails -gt 0)) {
                     # 每次稳定运行都清零 Fails（不只首次）：12 次上限管的是「连续」失败，
                     # 否则长时间用下来亮屏中断的次数累计够 12 次后就再也不重连了
-                    if (-not $cs.Proven -and $cs.Downgraded) { Set-CamRemembered $cs.Serial $cs.Facing $cs.CurSize; Save-Settings }
                     $cs.Proven = $true; $cs.Fails = 0
                 }
                 continue
@@ -2591,26 +2588,10 @@ try {
                 $cs.StartedAt = Get-Date
                 if ($cs.Proc) { & $script:showTempHint '摄像头被亮屏打断，已自动重连；关窗即停' $cGreen }
             } elseif ($kind -eq 'cfg') {
-                # 这档分辨率带不动 → 自动降一档（列表按面积降序，取下一个真实支持的尺寸）。
-                # 只认「配置/编码器」类病因：相机配不出（Camera configuration error）或编码器扛不住（MediaCodec/IllegalArgumentException 栈）。
-                # 不含泛泛的 "Video encoding error"：它是任何采集失败的通用外壳，被抢（CAMERA_IN_USE）的日志里也有这句。
-                # 不含 "Could not open camera"：那更像相机被系统占用（解锁争用），降分辨率也没用，交给下面「不明原因→停」，
-                # 免得把一次占用误判成带不动、连环降档换分辨率——正是最初那个「想退退不掉」的坑。
-                # -not $cs.Proven：只在「这档从没成功跑起来过」时才降。已稳定跑过的分辨率偶发一次配置错误多半是transient，
-                # 降一个已知能用的档位反而把清晰度平白降没了——那种情况落到下面「不明原因→停」，不动它。
-                $idx = if ($cs.Sizes.Count -gt 0) { [array]::IndexOf([array]$cs.Sizes, [string]$cs.CurSize) } else { -1 }
-                if (-not $cs.Proven -and $cs.Fails -le 6 -and $idx -ge 0 -and ($idx + 1) -lt $cs.Sizes.Count) {
-                    $next = [string]$cs.Sizes[$idx + 1]
-                    $cs.Args = [string[]]@($cs.Args | ForEach-Object { if ($_ -like '--camera-size=*') { "--camera-size=$next" } else { $_ } })
-                    $cs.CurSize = $next; $cs.Downgraded = $true
-                    $cs.NextTryAt = $now.AddSeconds(1)
-                    $cs.Proc = Start-CamProc $cs.Args $cs.ErrFile
-                    $cs.StartedAt = Get-Date
-                    & $script:showTempHint "分辨率带不动，已换 $next 重试" $cMuted
-                } else {
-                    Remove-CamSession $cs
-                    & $script:showTempHint '摄像头没能打开，请选更低的分辨率' $cRed 12000
-                }
+                # 编码器/配置类失败退出。已去掉 --no-downsize-on-error：scrcpy 4.1 能降档时会内部单步降档、进程不退；
+                # 走到这里 = 它把分级阶梯 {2560..800} 也试完了仍开不出 → 手动再降没意义，直接停并提示选更低分辨率。
+                Remove-CamSession $cs
+                & $script:showTempHint '摄像头没能打开，请选更低的分辨率' $cRed 12000
             } else {
                 # 不明原因退出（stderr 没有认识的报错）：宁可不折腾也别跟用户抢——自动重开才是更大的骚扰
                 Remove-CamSession $cs
