@@ -3,7 +3,11 @@
 给 [scrcpy](https://github.com/Genymobile/scrcpy) 套一层 **免安装、双击即用、全中文** 的 Windows 图形界面。
 A zero-install, double-click, Chinese-first GUI wrapper for **scrcpy** on Windows.
 
-> 365 开源计划 #019 · 给 scrcpy 套一层免安装、双击即用、全中文的 Windows 投屏图形界面
+> 给 scrcpy 套一层免安装、双击即用、全中文的 Windows 投屏图形界面
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE) [![365 开源计划 #019](https://img.shields.io/badge/365%20%E5%BC%80%E6%BA%90%E8%AE%A1%E5%88%92-%23019-1f6feb)](https://github.com/rockbenben/365opensource)
+
+**[⬇ 下载最新版](https://github.com/rockbenben/scrcpy-helper/releases/latest)** —— 已内置 scrcpy，解压双击即用，免安装
 
 ![scrcpy 投屏助手界面](./assets/scrcpy-helper-ui.png)
 
@@ -34,13 +38,14 @@ scrcpy 是优秀的安卓投屏工具，但它是命令行程序，对普通用�
 
 ### 已知限制 · Known limitations
 
+- **以「管理员身份」运行助手时，拖文件进投屏窗口会显示禁止图标、传不进去**：Windows 不允许从普通权限的文件资源管理器向管理员权限的窗口拖放（UIPI 隔离）。助手本就无需管理员——正常双击 `.bat` 即可；若曾设过「以管理员身份运行」（或快捷方式里勾了），取消后普通打开即恢复拖拽传文件。
 - **电脑输入法的中文打不进投屏窗口**（只能粘贴）：scrcpy + Windows 输入法的固有限制，输入法「组词」阶段的字捕获不到。临时用 `Ctrl+V` 粘贴；彻底解决可给手机装 [ADBKeyboard](https://github.com/senzhk/ADBKeyBoard) 设为输入法，或键盘模式选「游戏模式」用手机自带输入法打拼音。
 - **应用双开 / 分身在独立窗口里黑屏**：分身运行在另一个安卓用户身份下、且部分应用拒绝在虚拟屏渲染，scrcpy 无法定向到分身；建议改用普通投屏在手机上开分身。
 
 ## 界面 · Screenshots
 
-| 设备管理：多设备切换 / 同时多投 | 设置：左侧分类，改完自动记忆 |
-| :---: | :---: |
+|         设备管理：多设备切换 / 同时多投         |         设置：左侧分类，改完自动记忆         |
+| :---------------------------------------------: | :------------------------------------------: |
 | ![设备管理](./assets/scrcpy-helper-devices.png) | ![设置](./assets/scrcpy-helper-settings.png) |
 
 ## 怎么用（普通用户）· Usage
@@ -61,6 +66,8 @@ scrcpy 是优秀的安卓投屏工具，但它是命令行程序，对普通用�
 
 仓库不含 scrcpy 二进制。打包很简单：把 `scrcpy-helper.ps1`、`投屏助手-双击运行.bat`、`使用说明.txt` 三个文件复制进 [scrcpy](https://github.com/Genymobile/scrcpy/releases) 的解压目录，整个文件夹压成 zip 即可。用户解压后双击 `.bat` 就能用。
 
+打包时**还要把本仓库的 `LICENSE` 一并复制进去，改名为 `LICENSE-scrcpy-helper.txt`**。scrcpy 发行包里那个 `LICENSE.txt` 是它自己的 Apache-2.0，不覆盖本助手的三个文件；两份都放，解压的人才分得清哪个文件按哪个许可。scrcpy 的 `LICENSE.txt` 不要删——原样保留它是 Apache-2.0 的要求。
+
 > **请用 scrcpy 4.1 及以上版本打包**。助手用到了 `--flex-display`（独立窗口）、`--keep-active`（无线投屏保持唤醒，4.0 起），以及 VP8/VP9 视频编码、`--ignore-video-encoder-constraints`（编码器约束兜底，4.1 起）；用旧版打包会导致相关功能因「未知参数」失败。升到 4.1 还白得：拖拽传文件后相册/文件管理器即时可见（媒体扫描）、色彩空间转换修复、若干稳定性修复（FFmpeg 8.1.2 / SDL 3.4.12）。
 
 ## 致谢 · Credits
@@ -70,14 +77,14 @@ scrcpy 是优秀的安卓投屏工具，但它是命令行程序，对普通用�
 
 ## 许可证 · License
 
-封装脚本以 [MIT](./LICENSE) 开源；scrcpy 本体遵循其 Apache-2.0 许可。
+本仓库的三个文件（`scrcpy-helper.ps1`、`投屏助手-双击运行.bat`、`使用说明.txt`）以 [MIT](./LICENSE) 开源。
+
+发行包里除此之外的一切都来自 scrcpy 官方 win64 发行包，**原样转发、未作修改**，遵循其 Apache-2.0 许可，随包附带的 `LICENSE.txt` 即该许可全文。逐项清单见 [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md)。
 
 ## 贡献 · Contributing
 
 欢迎 issue / PR。**多语言（i18n）** 尤其欢迎：当前界面文案内嵌在脚本里，后续可抽成字符串表以支持英文等语言。
 
-## 关于 365 开源计划 · About
+## 关于 365 开源计划
 
-本项目是 [365 开源计划](https://github.com/rockbenben/365opensource) 的第 19 个项目。
-
-一个人 + AI，一年 300+ 个开源项目。[提交你的需求 →](https://my.feishu.cn/share/base/form/shrcnI6y7rrmlSjbzkYXh6sjmzb)
+[365 开源计划](https://github.com/rockbenben/365opensource) 的第 **#019** 个项目——一个人 + AI，一年 300+ 个开源项目。[提交你的需求 →](https://365.aishort.top/) · [Discord](https://discord.gg/PZTQfJ4GjX) · [Telegram](https://t.me/aishort_top)

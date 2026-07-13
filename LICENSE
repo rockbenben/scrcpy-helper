@@ -22,7 +22,13 @@ SOFTWARE.
 
 ---
 
-This wrapper bundles/uses scrcpy (https://github.com/Genymobile/scrcpy),
-which is licensed under the Apache License 2.0. scrcpy is a trademark of
-Genymobile. This project is an independent GUI wrapper and is not affiliated
-with or endorsed by the scrcpy authors.
+The MIT terms above cover only this project's own files: scrcpy-helper.ps1,
+投屏助手-双击运行.bat and 使用说明.txt.
+
+Everything else in the release archive is redistributed verbatim and unmodified
+from the official scrcpy win64 release (https://github.com/Genymobile/scrcpy)
+and stays under the Apache License 2.0; the LICENSE.txt shipped alongside is
+that license in full. Per-file list: THIRD-PARTY-NOTICES.md.
+
+scrcpy is a trademark of Genymobile. This project is an independent GUI
+wrapper, not affiliated with or endorsed by the scrcpy authors.
