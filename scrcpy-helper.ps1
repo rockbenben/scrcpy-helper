@@ -417,7 +417,11 @@ function Get-WindowArgs {
 }
 function Get-MirrorArgs {
     param([bool]$Wireless)
-    return (Get-VideoArgs) + (Get-AudioArgs) + (Get-ControlArgs -Wireless:$Wireless) + (Get-WindowArgs)
+    # 每段都必须 @() 包一层：PowerShell 的 return 会把「只剩一个元素的数组」拆成字符串，
+    # 而「字符串 + 数组」是字符串拼接（数组按空格连成一串接在后面），不是数组相加。
+    # 于是清晰度/帧率/画质都关掉、视频段只剩一个参数时，会拼出
+    # 「--video-codec=av1--gamepad=uhid --turn-screen-off --keep-active」这种粘连的单个参数，scrcpy 报「不支持的编码」。
+    return @(Get-VideoArgs) + @(Get-AudioArgs) + @(Get-ControlArgs -Wireless:$Wireless) + @(Get-WindowArgs)
 }
 function Get-NewDisplayArgs {
     param($sz = $settings.ndSize, $dpi = $settings.ndDpi, [bool]$fixed = $settings.ndFixed, [bool]$noDecor = $settings.ndNoDecor)
@@ -1438,7 +1442,8 @@ function Show-NewDisplay {
         $useFixed = if ($fitWin.Count -gt 0) { $true } else { $chkFixed.Checked }
         # 虚拟屏保留系统装饰（状态栏/导航栏）：去掉 --no-vd-system-decorations 后，像微信这种 App 会把自己的顶栏
         # 同时画进「状态栏预留区」和正常位置，出现「两条一样的顶栏」；保留系统栏则是正常的「状态栏+单顶栏」手机观感。
-        Start-Scrcpy ($pre + (Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + "--start-app=$target")
+        # @() 防单元素退化粘连（同 Get-MirrorArgs 处的坑）：$pre 为空时 $null+单元素串 会变字符串拼接
+        Start-Scrcpy ($pre + @(Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + "--start-app=$target")
     }
 }
 
