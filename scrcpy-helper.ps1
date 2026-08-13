@@ -123,11 +123,11 @@ try { $script:actEvent = New-Object System.Threading.EventWaitHandle($false, [Sy
 $cPaper   = [System.Drawing.Color]::FromArgb(236, 232, 225)   # 素纸灰（暖而不黄，比白柔和）
 $cInk     = [System.Drawing.Color]::FromArgb(43, 41, 38)      # 墨黑·主操作按钮/标题
 $cInkDark = [System.Drawing.Color]::FromArgb(70, 66, 61)      # 主按钮悬停
-$cMuted   = [System.Drawing.Color]::FromArgb(140, 136, 127)   # 次要文字
+$cMuted   = [System.Drawing.Color]::FromArgb(108, 104, 96)    # 次要文字（已压深到过 WCAG AA，勿再调浅）
 $cRed     = [System.Drawing.Color]::FromArgb(167, 43, 42)     # 朱砂印（仅标题竖条）
 $cRedDark = [System.Drawing.Color]::FromArgb(138, 33, 33)
 $cLine    = [System.Drawing.Color]::FromArgb(217, 212, 203)   # 发丝线 / 描边
-$cGreen   = [System.Drawing.Color]::FromArgb(47, 129, 88)     # 已连接
+$cGreen   = [System.Drawing.Color]::FromArgb(38, 110, 74)     # 已连接（已压深到在绿药丸上过 WCAG AA，勿再调浅）
 $cGreenBg = [System.Drawing.Color]::FromArgb(220, 231, 223)
 $cTagBg   = [System.Drawing.Color]::FromArgb(226, 221, 212)   # 未连接药丸
 $cWhite   = [System.Drawing.Color]::FromArgb(252, 251, 249)   # 卡片软白（次要按钮 / 输入）
@@ -697,6 +697,8 @@ function New-Caption {
     return $l
 }
 # 小工具：建下拉（DropDownList），按当前值预选
+# 别给它加 FlatStyle='Flat'：会把系统那个 ∨ 箭头换成生硬的小三角，比默认边框更出戏。
+# 下拉框保持系统外观是有意为之，不必跟 New-Txt / New-Nud 的扁平描边看齐。
 function New-Combo {
     param($labels, $values, $current, $x, $y, $w)
     $c = New-Object System.Windows.Forms.ComboBox
@@ -716,7 +718,17 @@ function New-Nud {
     $v = [int]$val; if ($v -lt $min) { $v = $min }; if ($v -gt $max) { $v = $max }
     $n.Value = [decimal]$v
     $n.Location = New-Object System.Drawing.Point($x, $y); $n.Size = New-Object System.Drawing.Size(90, 26)
+    $n.BorderStyle = 'FixedSingle'; $n.BackColor = $cWhite   # 扁平描边，同 New-Txt
     return $n
+}
+# 输入框：默认 Fixed3D 凹陷边框 + 系统白，跟本助手的扁平卡片风格打架，统一在这里刷平。
+# 多行框传 $h（先 Size 后 Multiline 也不会被钳高——控件此时还没句柄）；.Text/.MaxLength 等按需在调用处补。
+function New-Txt {
+    param($x, $y, $w, $h = 24)
+    $t = New-Object System.Windows.Forms.TextBox
+    $t.Location = New-Object System.Drawing.Point($x, $y); $t.Size = New-Object System.Drawing.Size($w, $h)
+    $t.BorderStyle = 'FixedSingle'; $t.BackColor = $cWhite
+    return $t
 }
 function New-Chk {
     param($text, $checked, $x, $y)
@@ -1028,8 +1040,7 @@ function Show-Settings {
     $nudFps  = New-Nud $settings.maxFps  0 240 5  250 16
     $nudBit  = New-Nud $settings.bitRate 0 50  1  250 52
     $cbVCodec = New-Combo @('默认（H.264，兼容最好）', 'H.265（更清晰）', 'AV1（更省流量）', 'VP8（兜底）', 'VP9（兜底）') @('', 'h265', 'av1', 'vp8', 'vp9') $settings.videoCodec 110 88 230
-    $txtCrop = New-Object System.Windows.Forms.TextBox
-    $txtCrop.Location = New-Object System.Drawing.Point(110, 120); $txtCrop.Size = New-Object System.Drawing.Size(230, 24)
+    $txtCrop = New-Txt 110 120 230
     $txtCrop.Text = $settings.crop
     $chkIgnoreEnc = New-Chk '忽略编码器分辨率约束（分辨率/独立窗口选不对时再勾）' $settings.ignoreEncoderConstraints 14 178
     $tt.SetToolTip($chkIgnoreEnc, '高级兜底：某些机型上报的编码器限制值不准，导致分辨率或独立窗口画面不对。勾上让 scrcpy 完全忽略这些限制（含对齐要求）。一般不用勾。需 scrcpy 4.1+。')
@@ -1050,7 +1061,7 @@ function Show-Settings {
     $cbASrc = New-Combo @('手机外放声音', '麦克风') @('', 'mic') $settings.audioSource 110 50 230
     $cbACodec = New-Combo @('默认（Opus）', 'AAC（兼容）', 'FLAC（无损）', '原始 PCM') @('', 'aac', 'flac', 'raw') $settings.audioCodec 110 88 230
     $lblAudioTip = New-Lbl '是否传声音，请到「常用」页开关。下面是进阶项：' 14 18; $lblAudioTip.ForeColor = $cMuted
-    $tt.SetToolTip($cbASrc, '“手机外放声音”把手机正在播放的声音传到电脑；“麦克风”采集手机话筒，适合当摄像头/直播。')
+    $tt.SetToolTip($cbASrc, '「手机外放声音」把手机正在播放的声音传到电脑；「麦克风」采集手机话筒，适合当摄像头/直播。')
     $tt.SetToolTip($cbACodec, '一般保持默认即可；个别播放器不出声时可改 AAC。')
     $tabAudio.Controls.AddRange(@(
         $lblAudioTip,
@@ -1063,7 +1074,7 @@ function Show-Settings {
     $cbMouse = New-Combo @('默认（推荐）', '游戏模式（更跟手）', 'USB 直连（特殊情况）') @('', 'uhid', 'aoa') $settings.mouse 110 49 300
     # 顺序按使用度：键鼠模式在前，常用的「只投屏」「关窗息屏」次之，niche 的触摸点 / 手柄沉底
     $chkNoCtrl = New-Chk '只投屏，不允许控制手机' $settings.noControl 14 86
-    $chkPowerOff = New-Chk '关闭投屏时顺手熄灭手机屏幕' $settings.powerOffOnClose 14 114
+    $chkPowerOff = New-Chk '结束投屏后熄灭手机屏幕' $settings.powerOffOnClose 14 114
     $chkTouches = New-Chk '显示触摸点' $settings.showTouches 14 142
     $chkGamepad = New-Chk '启用手柄（把电脑手柄映射到手机）' $settings.gamepad 14 170
     $tt.SetToolTip($cbKb, '绝大多数人选「默认」即可，能正常用中文输入法。「游戏模式」让电脑键盘像真键盘一样直接控制游戏，但用不了中文输入法。')
@@ -1094,7 +1105,7 @@ function Show-Settings {
     $cbNdDpi = New-Combo @('自动', '小', '中', '大') @('', '160', '240', '320') $settings.ndDpi 110 79 110
     $chkNoDecor = New-Chk '隐藏虚拟屏的系统状态栏' $settings.ndNoDecor 14 116
     $tt.SetToolTip($cbNdSize, '独立窗口（虚拟显示器）的分辨率。可直接输入自定义值，如 2560x1440。')
-    $tt.SetToolTip($cbNdDpi, '虚拟屏里界面元素的大小。手机 App 显示太大就选“小”。')
+    $tt.SetToolTip($cbNdDpi, '虚拟屏里界面元素的大小。手机 App 显示太大就选「小」。')
     $tabNd.Controls.AddRange(@(
         (New-Lbl '分辨率（可直接输入，如 2560x1440）：' 14 17), $cbNdSize,
         (New-Lbl '界面缩放：' 14 82), $cbNdDpi,
@@ -1114,24 +1125,21 @@ function Show-Settings {
 
     # ===== 通用 =====
     $tabGen = New-Object System.Windows.Forms.Panel
-    $chkLive = New-Chk '自动刷新连接状态显示（只更新上方那行文字）' $settings.liveStatus 14 18
-    $txtExtra = New-Object System.Windows.Forms.TextBox
-    $txtExtra.Location = New-Object System.Drawing.Point(14, 78); $txtExtra.Size = New-Object System.Drawing.Size(392, 24)
+    $chkLive = New-Chk '自动刷新主界面的连接状态（不影响投屏）' $settings.liveStatus 14 18
+    $txtExtra = New-Txt 14 78 392
     $txtExtra.Text = $settings.extraArgs
     $lblExHint = New-Lbl '例如：--angle=90   --display-id=1   --time-limit=300' 14 108; $lblExHint.ForeColor = $cMuted
     $tt.SetToolTip($chkLive, '它只决定窗口顶部「已连接/未连接」多久自动更新一次，不影响投屏。开着时仅在窗口处于前台才每几秒刷一次；关掉后改为手动点「刷新」，更省资源。')
     $tt.SetToolTip($txtExtra, '高级用法（看不懂就留空，不影响正常使用）：在这里追加 scrcpy 命令行参数，会拼到启动命令末尾，多个用空格分隔。例如 --crop=1080:1920:0:0（裁剪画面）、--angle=90（旋转）、--display-id=1（指定屏幕）。')
 
     # 自定义 adb / scrcpy 路径（留空=用本助手同目录自带的）
-    $lblPathHdr = New-Lbl '自定义 adb / scrcpy 路径（留空＝用自带的）：' 14 150; $lblPathHdr.ForeColor = $cMuted
+    $lblPathHdr = New-Lbl '自定义 adb / scrcpy 路径（留空=用自带的）：' 14 150; $lblPathHdr.ForeColor = $cMuted
     $lblAdbCap = New-Lbl 'adb' 14 181
-    $txtAdbPath = New-Object System.Windows.Forms.TextBox
-    $txtAdbPath.Location = New-Object System.Drawing.Point(66, 177); $txtAdbPath.Size = New-Object System.Drawing.Size(248, 24)
+    $txtAdbPath = New-Txt 66 177 248
     $txtAdbPath.Text = $settings.adbPath
     $btnAdbBrowse = New-SecondaryBtn '浏览…' 322 176 72 26
     $lblScrcpyCap = New-Lbl 'scrcpy' 14 223
-    $txtScrcpyPath = New-Object System.Windows.Forms.TextBox
-    $txtScrcpyPath.Location = New-Object System.Drawing.Point(66, 219); $txtScrcpyPath.Size = New-Object System.Drawing.Size(248, 24)
+    $txtScrcpyPath = New-Txt 66 219 248
     $txtScrcpyPath.Text = $settings.scrcpyPath
     $btnScrcpyBrowse = New-SecondaryBtn '浏览…' 322 218 72 26
     $btnAdbBrowse.Add_Click({
@@ -1146,8 +1154,8 @@ function Show-Settings {
         if ($txtScrcpyPath.Text -and (Test-Path -LiteralPath $txtScrcpyPath.Text)) { try { $ofd.InitialDirectory = Split-Path -Parent $txtScrcpyPath.Text } catch {} }
         if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txtScrcpyPath.Text = $ofd.FileName }
     }.GetNewClosure())
-    $tt.SetToolTip($txtAdbPath, 'adb.exe 路径。留空＝优先用所选 scrcpy 旁边的 adb、没有再用自带的；填了也让 scrcpy 用同一个 adb。保存即时生效。')
-    $tt.SetToolTip($txtScrcpyPath, 'scrcpy.exe 路径。留空＝用自带的；想用电脑里别处 / 更新版的 scrcpy 时填。保存即时生效。')
+    $tt.SetToolTip($txtAdbPath, 'adb.exe 路径。留空=优先用所选 scrcpy 旁边的 adb、没有再用自带的；填了也让 scrcpy 用同一个 adb。保存即时生效。')
+    $tt.SetToolTip($txtScrcpyPath, 'scrcpy.exe 路径。留空=用自带的；想用电脑里别处 / 更新版的 scrcpy 时填。保存即时生效。')
 
     $tabGen.Controls.AddRange(@(
         $chkLive,
@@ -1268,8 +1276,7 @@ function Show-AppPicker {
     $dlg = New-Dialog '选择 App' 340 388 $owner
 
     $lbl = New-Lbl '搜索 / 选择要在独立窗口里打开的 App：' 16 14
-    $txt = New-Object System.Windows.Forms.TextBox
-    $txt.Location = '16,40'; $txt.Size = '308,24'
+    $txt = New-Txt 16 40 308
     $lb = New-Object System.Windows.Forms.ListBox
     $lb.Location = '16,74'; $lb.Size = '308,256'
     $lb.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
@@ -1349,7 +1356,7 @@ function Show-NewDisplay {
     $dlg = New-Dialog '独立窗口' 320 336 $owner
 
     $l1 = New-Lbl '在电脑上单开一块屏，运行下面这个 App：' 18 18
-    $l2 = New-Lbl '（手机本身照常用，互不影响；需 Android 11+）' 18 42; $l2.ForeColor = $cMuted
+    $l2 = New-Lbl '（手机照常用，互不影响；需 Android 11+）' 18 42; $l2.ForeColor = $cMuted
     $cb = New-Object System.Windows.Forms.ComboBox
     $cb.DropDownStyle = 'DropDownList'; $cb.Location = New-Object System.Drawing.Point(18, 76); $cb.Size = New-Object System.Drawing.Size(284, 28)
     foreach ($name in $apps.Keys) { [void]$cb.Items.Add($name) }
@@ -1361,7 +1368,7 @@ function Show-NewDisplay {
 
     # 窗口比例/方向：微信、QQ 等手机应用在“横屏平板”虚拟屏上会用平板版面、显示不全，选「竖屏·手机」即用手机版面
     $lblMode = New-Lbl '窗口比例' 18 120
-    $cbMode = New-Combo @('竖屏·手机版面（推荐微信/QQ）', '横屏·平板版面', '跟随“设置”里的尺寸', '自定义…') @('portrait', 'landscape', 'settings', 'custom') $settings.ndMode 86 117 216
+    $cbMode = New-Combo @('竖屏·手机版面（推荐微信/QQ）', '横屏·平板版面', '跟随「设置」里的尺寸', '自定义…') @('portrait', 'landscape', 'settings', 'custom') $settings.ndMode 86 117 216
     $chkFixed = New-Chk '固定方向（最大化时画面不乱转）' $settings.ndFixed 18 152
     # 限宽自动换行：两行说明都比固定宽度的窗宽，不限宽会被右边缘裁掉、看不全
     $capMode = New-Caption "竖屏适合聊天/刷信息；横屏适合看视频。乱转就勾上「固定方向」。`n应用双开/分身在独立窗口常黑屏、点不到，建议改用普通投屏在手机上开分身。" 18 176
@@ -1447,14 +1454,12 @@ function Show-WirelessPair {
     $l2 = New-Lbl '手机：开发者选项 → 无线调试 → 使用配对码配对设备' 18 38
 
     $l3 = New-Lbl '配对地址（那个弹窗里的「IP 地址和端口」）' 18 72
-    $txtPair = New-Object System.Windows.Forms.TextBox
-    $txtPair.Location = '18,94'; $txtPair.Size = '324,24'
+    $txtPair = New-Txt 18 94 324
 
     $l4 = New-Lbl '配对码（同一弹窗里的 6 位数字）' 18 124
-    $txtCode = New-Object System.Windows.Forms.TextBox
-    $txtCode.Location = '18,146'; $txtCode.Size = '324,24'; $txtCode.MaxLength = 6
+    $txtCode = New-Txt 18 146 324; $txtCode.MaxLength = 6
 
-    $lblNote = New-Lbl '两项都在同一个弹窗里照抄即可，连接端口会自动识别。' 18 178; $lblNote.ForeColor = $cMuted
+    $lblNote = New-Lbl '两项都在同一个弹窗里照抄，端口会自动识别。' 18 178; $lblNote.ForeColor = $cMuted
 
     $btnGo = New-PrimaryBtn '配对并连接' 18 208 324 38 11
     $result = @{ addr = $null }
@@ -1505,10 +1510,8 @@ function Show-WirelessPair {
 function Show-Shortcuts {
     param($owner)
     $dlg = New-Dialog '快捷键速查' 380 432 $owner
-    $txt = New-Object System.Windows.Forms.TextBox
+    $txt = New-Txt 16 14 348 358
     $txt.Multiline = $true; $txt.ReadOnly = $true; $txt.ScrollBars = 'Vertical'
-    $txt.Location = New-Object System.Drawing.Point(16, 14); $txt.Size = New-Object System.Drawing.Size(348, 358)
-    $txt.BackColor = $cWhite; $txt.BorderStyle = 'FixedSingle'
     $txt.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
     $txt.Text = (@'
 MOD 键 = 左 Alt 或 左 Super 键
@@ -1860,9 +1863,9 @@ function Connect-ByIp {
     $l1 = New-Lbl '用 IP 直接连接手机，不需要配对码。' 18 14; $l1.ForeColor = $cMuted
     $l2 = New-Lbl '保底连法：任何已开网络 adb 的设备都适用，重连也方便。' 18 36; $l2.ForeColor = $cMuted
     $l3 = New-Lbl 'IP 地址' 18 68
-    $txtIp = New-Object System.Windows.Forms.TextBox; $txtIp.Location = '18,90'; $txtIp.Size = '208,24'
+    $txtIp = New-Txt 18 90 208
     $l4 = New-Lbl '端口' 242 68
-    $txtPort = New-Object System.Windows.Forms.TextBox; $txtPort.Location = '242,90'; $txtPort.Size = '100,24'; $txtPort.Text = '5555'
+    $txtPort = New-Txt 242 90 100; $txtPort.Text = '5555'
     $btnGo = New-PrimaryBtn '连接' 18 130 324 38 11
     $result = @{ addr = $null }
     $btnGo.Add_Click({
