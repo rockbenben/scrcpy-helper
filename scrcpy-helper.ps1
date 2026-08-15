@@ -227,6 +227,8 @@ $defaults = [ordered]@{
     scrcpyPath = ''; adbPath = ''
     # 记住主窗口位置（-1 = 还没记，居中显示）
     winX = -1; winY = -1
+    # 控制台
+    showConsole = $false
 }
 $settings = [ordered]@{}
 foreach ($k in $defaults.Keys) { $settings[$k] = $defaults[$k] }
@@ -558,9 +560,10 @@ function Start-Scrcpy {
     # 万一仍被拦下并取消，给句人话提示而不是让异常冒成崩溃窗/静默无反应。摄像头带 -RedirectStandardError 那支是 UseShellExecute=$false，不触发。
     $p = $null
     try {
-        $p = if ($cmd -and $StderrFile) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru -RedirectStandardError $StderrFile -RedirectStandardInput (Get-NulStdin) -WindowStyle Hidden }
-        elseif ($cmd) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru }
-        else { Start-Process -FilePath $exe -WorkingDirectory $PSScriptRoot -PassThru }
+        $winStyle = if ($settings.showConsole) { 'Normal' } else { 'Hidden' }
+        $p = if ($cmd -and $StderrFile) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru -RedirectStandardError $StderrFile -RedirectStandardInput (Get-NulStdin) -WindowStyle $winStyle }
+        elseif ($cmd) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru -WindowStyle $winStyle}
+        else { Start-Process -FilePath $exe -WorkingDirectory $PSScriptRoot -PassThru -WindowStyle $winStyle }
     } catch {
         if ($script:showTempHint) { & $script:showTempHint '投屏被安全提示拦下：请点「更多信息>仍要运行」，或右键 scrcpy.exe 属性勾「解除锁定」' $cRed 12000 }
         try { $lp = Join-Path $PSScriptRoot '投屏助手-错误日志.txt'; Add-Content -LiteralPath $lp -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Start-Scrcpy 启动失败: $($_.Exception.Message)`r`n" -Encoding UTF8 } catch {}
@@ -1029,15 +1032,17 @@ function Show-Settings {
     $chkScreenOff = New-Chk '投屏时关闭手机屏幕（省电、防偷看）' $settings.screenOff 14 102
     $chkReconnect = New-Chk '自动连接记住的无线设备（启动连接附近设备 · 掉线自动重连）' $settings.autoConnect 14 130
     $chkDisconnect = New-Chk '关闭助手时断开无线连接（默认保持，重开即用）' $settings.disconnectOnClose 14 158
+    $chkShowConsole = New-Chk '显示 scrcpy 控制台窗口（调试用，会弹黑窗）' $settings.showConsole 14 186
     $tt.SetToolTip($nudSize, '画面最大边长(像素)。数值越大越清晰、越小越流畅；0=原画不限制。')
     $tt.SetToolTip($chkAudio, '取消勾选则完全不传声音（等同 --no-audio）。')
     $tt.SetToolTip($chkStay, '保持手机不锁屏，避免无线投屏中途断开。想更省电可关掉，让手机自然休眠。')
     $tt.SetToolTip($chkScreenOff, '投屏时关掉手机屏幕，明显省电、还能防偷看（投屏照常进行）。无线投屏想省电首选它。')
     $tt.SetToolTip($chkReconnect, '记住最近一次的无线 IP，发现掉线就自动连回去，适合无线投屏中途断开。会略增耗电，按需开启。')
     $tt.SetToolTip($chkDisconnect, '不勾（默认）：关掉助手后仍保持手机连接，重开即用、几乎不耗电。勾上：关助手时一并断开无线连接，重开需重新连（可能要再插一次线）。')
+    $tt.SetToolTip($chkShowConsole, '勾上后投屏时会弹出一个黑色控制台窗口，里面显示 scrcpy 的运行日志。默认关闭，不影响正常使用。')
     $tabCommon.Controls.AddRange(@(
         (New-Lbl '清晰度（越大越清晰，0=原画）' 14 16), $nudSize,
-        $chkAudio, $chkStay, $chkScreenOff, $chkReconnect, $chkDisconnect))
+        $chkAudio, $chkStay, $chkScreenOff, $chkReconnect, $chkDisconnect, $chkShowConsole))
 
     # ===== 画面 =====
     $tabVideo = New-Object System.Windows.Forms.Panel
@@ -1227,6 +1232,7 @@ function Show-Settings {
         $settings.extraArgs  = $txtExtra.Text.Trim()
         $settings.adbPath    = $txtAdbPath.Text.Trim()
         $settings.scrcpyPath = $txtScrcpyPath.Text.Trim()
+        $settings.showConsole = $chkShowConsole.Checked
         Save-Settings
         Resolve-Tools   # 立刻按新路径重算 $exe/$adb（含环境变量 ADB），之后的连接/投屏即时生效、无需重启
         # 填了路径但文件不存在时提醒一句（仍然保存，运行时会回退到自带的那个）
