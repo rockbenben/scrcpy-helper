@@ -28,7 +28,7 @@ Release 里的 zip 除上述三个文件外，**其余全部来自 [scrcpy](http
 
 1. **不要删 `LICENSE.txt`**。Apache-2.0 第 4(a) 条要求向接收者提供许可副本，那个文件就是。
 2. **不要修改任何 scrcpy 文件**。一旦修改，Apache-2.0 第 4(b) 条要求在被改动的文件上显著标注改动。目前无一被改。
-3. **把本仓库的 `LICENSE` 复制进去，改名 `LICENSE-scrcpy-helper.txt`**。否则解压的人只看得到 Apache-2.0，会误以为助手脚本也是 Apache-2.0。
+3. 发行包里**不放**本助手自己的 MIT 全文。`LICENSE.txt` 只是 scrcpy 的 Apache-2.0，不覆盖助手那三个文件；助手的 MIT 许可以仓库根目录的 `LICENSE` 为准，包内「使用说明.txt」末尾有仓库地址。MIT 那部分的版权人即本项目作者，随包附全文不是义务。
 
 scrcpy 上游没有 `NOTICE` 文件，因此 Apache-2.0 第 4(d) 条不适用。
 
