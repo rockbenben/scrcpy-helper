@@ -213,6 +213,8 @@ $defaults = [ordered]@{
     screenOff = $false; stayAwake = $true; showTouches = $false; powerOffOnClose = $false
     # 摄像头（存“最大边长档位”如 1920/1280/0，或实测精确尺寸如 1920x1080；统一按字符串存，避免重载时类型转换报错）
     camResMax = '1920'
+    # 摄像头初始倍率的全局兜底（换设备、没记录时用）；具体倍率同样按设备+前后记在 camResByDevice（键带 |zoom 后缀）
+    camZoom = '1'
     # 摄像头面板上次的选择（全局偏好）：前后置 back/front、方向 land/port、补光灯、麦克风。分辨率另按设备+前后记在 camResByDevice。
     camFacing = 'back'; camOrientation = 'land'; camTorch = $false; camMic = $false
     # 窗口
@@ -467,11 +469,25 @@ function Set-CamRemembered {
     if ($serial) { $script:camResByDevice["$serial|$facing"] = [string]$val }   # 按设备+前后分记
     $settings.camResMax = [string]$val                                          # 同时更新全局默认（换设备时的回退值）
 }
+# 初始倍率记忆：跟采集尺寸共用 camResByDevice，键多个 |zoom 后缀区分，省一套加载/保存代码（两处都按整表遍历读写）。
+# 倍率一律按不变文化格式化成字符串（1.5 而非德语区的 1,5），否则拼进命令行 scrcpy 解析不了。
+function Format-Zoom { param($v) return ([double]$v).ToString('0.##', [cultureinfo]::InvariantCulture) }
+function Get-CamZoom {
+    param($serial, $facing)
+    $k = "$serial|$facing|zoom"
+    if ($script:camResByDevice.Contains($k)) { return [double]$script:camResByDevice[$k] }
+    return [double]$settings.camZoom
+}
+function Set-CamZoom {
+    param($serial, $facing, $zs)
+    if ($serial) { $script:camResByDevice["$serial|$facing|zoom"] = [string]$zs }
+    $settings.camZoom = [string]$zs
+}
 
 function Get-CameraSizes {
     param([string]$serial)
     if ($serial -and $script:camSizesCache.ContainsKey($serial)) { return $script:camSizesCache[$serial] }   # 同一台设备本会话缓存
-    $result = @{ back = @(); front = @() }
+    $result = @{ back = @(); front = @(); zoom = @{ back = $null; front = $null } }
     try {
         $argv = @(); if ($serial) { $argv += @('-s', $serial) }; $argv += '--list-camera-sizes'
         $out = (Invoke-Hidden -FilePath $exe -ArgumentList $argv) -join "`n"
@@ -485,6 +501,13 @@ function Get-CameraSizes {
             elseif ($line -match '\bback\b')     { $facing = 'back' }
             elseif ($line -match '\bexternal\b') { $facing = 'back' }
             else   { $facing = $null }
+            # 顺手读走变焦范围 zoom-range=[0.6, 10]。只认该朝向第一颗镜头——--camera-facing=back 选中的就是第一颗 back，
+            # 同朝向别的镜头范围往往不同（本机 id=0 是 0.6~10、id=3 是 1~10），取并集会把这颗不支持的倍率放进面板，
+            # 投屏时被 Android 挡下（IllegalArgumentException），还会被看门狗误判成「分辨率带不动」。
+            # 另外只有端点可读——「几倍会切到长焦」是各家 HAL 的私有逻辑，Android 没有 API 暴露，所以面板只提供范围内自由填，不做镜头档位。
+            if ($facing -and $null -eq $result.zoom[$facing] -and $line -match 'zoom-range=\[\s*([\d.]+)\s*,\s*([\d.]+)\s*\]') {
+                $result.zoom[$facing] = @([double]$Matches[1], [double]$Matches[2])
+            }
             continue
         }
         if ($facing -and $line -match '(\d{3,5})x(\d{3,5})') {
@@ -536,7 +559,7 @@ function Get-NulStdin {
 
 # 启动 scrcpy（不阻塞界面；自动过滤空参数）
 function Start-Scrcpy {
-    param([string[]]$Options, [switch]$Recording, [string]$StderrFile)
+    param([string[]]$Options, [switch]$Recording, [string]$StderrFile, [string]$StdoutFile)
     $extra = @(); if ($settings.extraArgs) { $extra = @($settings.extraArgs -split '\s+' | Where-Object { $_ }) }
     $clean = @(($Options + $extra) | Where-Object { $_ -ne '' -and $null -ne $_ })
     # 解析目标设备序列号（来自 -s），用于「投屏中」标记 / 「停止这台」，并据此给窗口起友好标题
@@ -561,7 +584,10 @@ function Start-Scrcpy {
     $p = $null
     try {
         $winStyle = if ($settings.showConsole) { 'Normal' } else { 'Hidden' }
-        $p = if ($cmd -and $StderrFile) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru -RedirectStandardError $StderrFile -RedirectStandardInput (Get-NulStdin) -WindowStyle $winStyle }
+        # StdoutFile 只有摄像头会话传：scrcpy 的 INFO 级日志（含每次变焦的 "Set camera zoom: 3.16"）走的是 stdout，
+        # ERROR/WARN 才走 stderr——两路分开落两个文件，看门狗读 stderr 判病因，倍率回传读 stdout。
+        $p = if ($cmd -and $StderrFile -and $StdoutFile) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru -RedirectStandardError $StderrFile -RedirectStandardOutput $StdoutFile -RedirectStandardInput (Get-NulStdin) -WindowStyle $winStyle }
+        elseif ($cmd -and $StderrFile) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru -RedirectStandardError $StderrFile -RedirectStandardInput (Get-NulStdin) -WindowStyle $winStyle }
         elseif ($cmd) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru -WindowStyle $winStyle}
         else { Start-Process -FilePath $exe -WorkingDirectory $PSScriptRoot -PassThru -WindowStyle $winStyle }
     } catch {
@@ -575,17 +601,35 @@ function Start-Scrcpy {
 # 启动一个 scrcpy 并把 Process 对象拿回来（摄像头看门狗要盯它的退出码和 stderr）；启动失败返回 $null。
 # Start-Scrcpy 本身不返回进程（返回值会顺着事件处理器输出流漏出去），这里用「启动前后 $scrcpyProcs 数量」判断拿最后一个。
 function Start-CamProc {
-    param([string[]]$argv, [string]$errFile)
+    param([string[]]$argv, [string]$errFile, [string]$outFile)
     $before = $scrcpyProcs.Count
-    Start-Scrcpy $argv -StderrFile $errFile
+    Start-Scrcpy $argv -StderrFile $errFile -StdoutFile $outFile
     if ($scrcpyProcs.Count -gt $before) { return $scrcpyProcs[$scrcpyProcs.Count - 1].Proc }
     return $null
 }
-# 摘掉一个摄像头看门狗会话并清掉它的 stderr 临时文件
+# 从 scrcpy 的 stdout 日志里取「最后一次生效的倍率」：投屏中每按一下 MOD+↑/↓ 都会打一行 "Set camera zoom: 3.1640973"。
+# 按住不放会自动重复刷几十行、到端点后还会重复打同一个夹住值，所以只认最后一条。
+# 值是 3.1640973 这种脏浮点（每按一步约 +6%），四舍五入到 0.1 就够——面板的步进也是 0.1。
+function Read-CamZoom {
+    param([string]$file)
+    if (-not $file) { return $null }
+    try { $txt = [System.IO.File]::ReadAllText($file) } catch { return $null }
+    $m = [regex]::Matches($txt, 'Set camera zoom:\s*([\d.]+)')
+    if ($m.Count -eq 0) { return $null }
+    return [Math]::Round([double]$m[$m.Count - 1].Groups[1].Value, 1)
+}
+# 摘掉一个摄像头看门狗会话并清掉它的临时日志。所有结束路径（用户关窗 / 助手主动停 / 看门狗放弃）都过这里，
+# 所以倍率回传收在这一处：把用户在画面里按出来的倍率写回设置，下次打开面板就是这个值。
 function Remove-CamSession {
     param($cs)
     [void]$script:camSessions.Remove($cs)
+    $z = Read-CamZoom $cs.OutFile
+    if ($null -eq $z) { $z = $cs.LastZoom }   # 被抢重连过：日志被新进程截断，用重连前存下的那次
+    # SkipZoom：用户从面板重开同一台时旧会话会被标停，那次不能回写——否则刚在面板里选好的倍率
+    # 会被上一场的运行时倍率盖掉，下次打开面板看到的不是自己选的值。
+    if ($null -ne $z -and $cs.Serial -and -not $cs.SkipZoom) { Set-CamZoom $cs.Serial $cs.Facing (Format-Zoom $z); Save-Settings }
     if ($cs.ErrFile) { try { Remove-Item -LiteralPath $cs.ErrFile -Force } catch {} }
+    if ($cs.OutFile) { try { Remove-Item -LiteralPath $cs.OutFile -Force } catch {} }
 }
 
 # 是否有正在进行的录屏（关助手时据此决定要不要提醒）
@@ -2401,7 +2445,7 @@ try {
         $camSizes = Get-CameraSizes $serial
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
         $camDetected = ((@($camSizes.back).Count + @($camSizes.front).Count) -gt 0)
-        $dlg = New-Dialog '手机当摄像头' 264 344 $form
+        $dlg = New-Dialog '手机当摄像头' 264 408 $form
 
         $gb1 = New-Object System.Windows.Forms.GroupBox
         $gb1.Text = '摄像头'; $gb1.Location = '16,12'; $gb1.Size = '232,52'
@@ -2452,22 +2496,50 @@ try {
             $cbRes.SelectedIndex = $idx
         }
         $capRes.Text = if ($camDetected) { '✓ 已读取本机支持的尺寸；个别高档位编码器可能带不动，打不开会自动降一档重试' } else { '没读到支持列表，用通用档位；打不开会自动重试' }
-        & $fillRes $(if ($settings.camFacing -eq 'front') { 'front' } else { 'back' })   # 按上次记住的前后置初始填充
-        $rbBack.Add_CheckedChanged({ if ($rbBack.Checked) { & $fillRes 'back' } })
-        $rbFront.Add_CheckedChanged({ if ($rbFront.Checked) { & $fillRes 'front' } })
+        # 初始倍率：可填范围按这台设备实测的 zoom-range 定（读不到就 1~10 通用范围），倍率值让用户自己填并按设备+前后记住。
+        # 控件摆在下面的复选框之后，但得赶在朝向事件之前定义好——前后置的变焦范围不一样，切朝向要跟着重填。
+        $lblZoom = New-Lbl '初始倍率' 18 272
+        $nudZoom = New-Object System.Windows.Forms.NumericUpDown
+        $nudZoom.DecimalPlaces = 1; $nudZoom.Increment = [decimal]0.1
+        $nudZoom.Location = New-Object System.Drawing.Point(78, 269); $nudZoom.Size = New-Object System.Drawing.Size(90, 26)
+        $nudZoom.BorderStyle = 'FixedSingle'; $nudZoom.BackColor = $cWhite   # 扁平描边，同 New-Nud
+        $fillZoom = {
+            param($facing)
+            # 兜底范围故意放得很宽（不是 1~10）：读不到 zoom-range 时我们并不知道这台机器支持到哪，
+            # 写窄了会把「支持 0.5x 超广角但列表没读到」的机型挡在门外。放宽是安全的——实测越界由设备侧夹住
+            # （--camera-zoom=99 → Set camera zoom: 10.0，客户端不校验），而且会话结束回传的是夹住后的真实值，
+            # 下次打开面板会自己修正成这台机器的实际上限。
+            $rg = $camSizes.zoom[$facing]
+            $lo = if ($rg) { [decimal]$rg[0] } else { [decimal]0.1 }
+            $hi = if ($rg) { [decimal]$rg[1] } else { [decimal]100 }
+            $nudZoom.Minimum = $lo; $nudZoom.Maximum = $hi     # 先定范围再赋值，否则超范围的记忆值会被 WinForms 挡下
+            $v = [decimal](Get-CamZoom $serial $facing)
+            if ($v -lt $lo) { $v = $lo }; if ($v -gt $hi) { $v = $hi }
+            $nudZoom.Value = $v
+        }
+        $initFacing = if ($settings.camFacing -eq 'front') { 'front' } else { 'back' }   # 按上次记住的前后置初始填充
+        & $fillRes $initFacing
+        & $fillZoom $initFacing
+        $rbBack.Add_CheckedChanged({ if ($rbBack.Checked) { & $fillRes 'back'; & $fillZoom 'back' } })
+        $rbFront.Add_CheckedChanged({ if ($rbFront.Checked) { & $fillRes 'front'; & $fillZoom 'front' } })
 
         $chkTorch = New-Chk '打开补光灯' $settings.camTorch 18 214
         $chkMic = New-Chk '同时采集麦克风声音' $settings.camMic 18 240
 
-        $btnGo = New-PrimaryBtn '开始' 16 280 232 32 11
+        $capZoom = New-Caption '投屏中还能按 左Alt + ↑ / ↓ 实时变焦' 18 300
+        $capZoom.MaximumSize = New-Object System.Drawing.Size(230, 0)
+
+        $btnGo = New-PrimaryBtn '开始' 16 344 232 32 11
         $btnGo.Add_Click({ $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close() })
 
-        $dlg.Controls.AddRange(@($gb1, $gb2, $lblRes, $cbRes, $capRes, $chkTorch, $chkMic, $btnGo))
+        $dlg.Controls.AddRange(@($gb1, $gb2, $lblRes, $cbRes, $capRes, $chkTorch, $chkMic, $lblZoom, $nudZoom, $capZoom, $btnGo))
         $dlg.AcceptButton = $btnGo
         if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
             $selVal = [string]$cbRes.Vals[$cbRes.SelectedIndex]
             $facing = if ($rbFront.Checked) { 'front' } else { 'back' }
+            $zs = Format-Zoom $nudZoom.Value
             Set-CamRemembered $serial $facing $selVal                  # 分辨率按设备+前后记
+            Set-CamZoom $serial $facing $zs                            # 初始倍率同理（看门狗重连沿用同一份参数，倍率不会丢）
             # 面板其余选择记成全局偏好，下次打开沿用：前后置 / 横竖屏 / 补光灯 / 麦克风
             $settings.camFacing = $facing
             $settings.camOrientation = if ($rbPort.Checked) { 'port' } else { 'land' }
@@ -2475,6 +2547,7 @@ try {
             $settings.camMic = $chkMic.Checked
             Save-Settings
             $a = @('-s', $serial, '--video-source=camera', "--camera-facing=$facing")
+            if ($zs -ne '1') { $a += "--camera-zoom=$zs" }   # 1 倍是默认值，不必显式传
             if ($selVal -match '^\d+x\d+$') {
                 # 设备实测支持的精确采集尺寸：直接用 --camera-size，不再加 --camera-ar 以免比例冲突。
                 # 不再加 --no-downsize-on-error：scrcpy 4.1 若这档编码器带不动，会用分级阶梯 {2560..800} 单步降档、进程不退继续跑
@@ -2493,14 +2566,16 @@ try {
             if ($chkMic.Checked) { $a += '--audio-source=mic' } else { $a += '--no-audio' }
             # 交给看门狗盯着（$script:camWatch）：只管「亮屏被抢自动重连」；分辨率带不动已交给 scrcpy 4.1 原生降档，看门狗不再手动换档
             # 同一台的旧会话先标停：用户重新从面板开摄像头 = 放弃旧会话，否则两个会话的看门狗会抢着拉进程
-            foreach ($old in @($script:camSessions)) { if ($old.Serial -eq $serial) { $old.Stopped = $true } }
-            $errFile = Join-Path $env:TEMP ("scrcpy-helper-cam-{0}.log" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
-            $p = Start-CamProc $a $errFile
+            foreach ($old in @($script:camSessions)) { if ($old.Serial -eq $serial) { $old.Stopped = $true; $old.SkipZoom = $true } }
+            $tag = [guid]::NewGuid().ToString('N').Substring(0, 8)
+            $errFile = Join-Path $env:TEMP ("scrcpy-helper-cam-{0}.log" -f $tag)
+            $outFile = Join-Path $env:TEMP ("scrcpy-helper-cam-{0}.out.log" -f $tag)   # 倍率回传用，见 Read-CamZoom
+            $p = Start-CamProc $a $errFile $outFile
             if ($p) {
                 [void]$script:camSessions.Add([pscustomobject]@{
                     Serial = $serial; Facing = $facing; Args = [string[]]$a
-                    Proc = $p; StartedAt = (Get-Date); ErrFile = $errFile
-                    Fails = 0; Proven = $false; Stopped = $false; NextTryAt = [datetime]::MinValue
+                    Proc = $p; StartedAt = (Get-Date); ErrFile = $errFile; OutFile = $outFile; LastZoom = $null
+                    Fails = 0; Proven = $false; Stopped = $false; SkipZoom = $false; NextTryAt = [datetime]::MinValue
                 })
                 $script:camWatch.Start()
             }
@@ -2598,7 +2673,9 @@ try {
                     continue
                 }
                 $cs.NextTryAt = $now.AddSeconds([Math]::Min(2 * $cs.Fails, 10))
-                $cs.Proc = Start-CamProc $cs.Args $cs.ErrFile
+                # 重连会用新进程覆盖掉日志文件，先把这次按出来的倍率存下来，免得被抢一次就把用户调的倍率丢了
+                $zNow = Read-CamZoom $cs.OutFile; if ($null -ne $zNow) { $cs.LastZoom = $zNow }
+                $cs.Proc = Start-CamProc $cs.Args $cs.ErrFile $cs.OutFile
                 $cs.StartedAt = Get-Date
                 if ($cs.Proc) { & $script:showTempHint '摄像头被亮屏打断，已自动重连；关窗即停' $cGreen }
             } elseif ($kind -eq 'cfg') {
