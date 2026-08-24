@@ -1,90 +1,66 @@
-# scrcpy 投屏助手 · scrcpy Helper (Windows)
+# scrcpy 投屏助手
 
-给 [scrcpy](https://github.com/Genymobile/scrcpy) 套一层 **免安装、双击即用、全中文** 的 Windows 图形界面。
-A zero-install, double-click, Chinese-first GUI wrapper for **scrcpy** on Windows.
-
-> 给 scrcpy 套一层免安装、双击即用、全中文的 Windows 投屏图形界面
+> 不用背命令行参数，勾几个选项就把安卓手机投屏到电脑 —— 免安装，双击即用
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE) [![365 开源计划 #019](https://img.shields.io/badge/365%20%E5%BC%80%E6%BA%90%E8%AE%A1%E5%88%92-%23019-1f6feb)](https://github.com/rockbenben/365opensource)
 
-**[⬇ 下载最新版](https://github.com/rockbenben/scrcpy-helper/releases/latest)** —— 已内置 scrcpy，解压双击即用，免安装
+**[⬇ 下载最新版](https://github.com/rockbenben/scrcpy-helper/releases/latest)** · Windows 10 / 11 · 已内置 scrcpy，不用另外装
 
-![scrcpy 投屏助手界面](./assets/scrcpy-helper-ui.png)
+![scrcpy 投屏助手：主界面与「手机当摄像头」面板](./assets/scrcpy-helper-hero.png)
 
-## 这是什么 · What
+[scrcpy](https://github.com/Genymobile/scrcpy) 是最好用的安卓投屏工具，但它只有命令行。本项目用一个单文件 PowerShell 脚本给它套了层图形界面：解压、双击、点按钮，清晰度和编码勾一下就好，不必再记 `--video-codec=h265 --max-size=1920` 这类参数。想要功能完整、跨平台，[QtScrcpy](https://github.com/barry-ran/QtScrcpy) 和 [escrcpy](https://github.com/viarotel-org/escrcpy) 更成熟；这里走的是另一条路——一个绿色便携的小工具，全中文，拷进 U 盘也能跑。
 
-scrcpy 是优秀的安卓投屏工具，但它是命令行程序，对普通用户不友好。本项目用一个 **单文件 PowerShell 脚本** 给它套了个图形界面：解压、双击，点按钮就能投屏，常用设置一键勾选，零基础也能上手。
+> [!TIP]
+> 全程本地直连（数据线，或同一个 Wi-Fi），画面不经过任何服务器；手机端不 root、不装 App，只需打开「USB 调试」。
 
-> scrcpy is great but command-line only. This wraps it in a tiny PowerShell GUI — unzip, double-click, click a button. No install, no runtime, all Chinese UI.
+## 支持范围
 
-## 特点 · Features
+| 项目 | 支持情况 |
+| --- | --- |
+| 电脑 | Windows 10 / 11，用系统自带 PowerShell，无需 .NET 或其他运行库 |
+| 安装 | 不需要，解压双击即可；卸载 = 删掉文件夹 |
+| 手机 | Android 5.0 起可投屏、录屏；配对码无线连接与独立窗口需 11+，手机当摄像头需 12+ |
+| 连接 | 数据线，或无线（同一局域网），可同时连多台 |
+| 管理员权限 | 不需要，而且别用——会导致拖文件进投屏窗口失效 |
 
-- 🟢 **绿色单文件**：一个 `.ps1` + 一个 `.bat`，零依赖、免安装，U 盘 / 受限电脑也能跑。
-- 🇨🇳 **全中文 + 人话提示**：每个设置悬停都有大白话说明。
-- 🖥️ 有线 / 无线投屏、手机当摄像头、录屏、独立窗口（虚拟显示器），都是一个按钮。
-- 📶 **无线三种方式**：插一次线自动切无线（可拔线）；Android 11+ 支持配对码连接，全程免插线（只填配对地址 + 配对码，连接端口自动识别）；或直接输入 IP 连接作保底（手机开了网络 adb 即可，不限系统版本）。
-- 🗂️ **多设备管理 + 同时多投**：「设备管理」里连接与投屏分开，可重命名 / 设默认 / 断开 / 忘记；连过的无线设备自动记住。支持「全部投屏」/ 多选投屏，多台各开一个窗口同时镜像（窗口标题即设备名、列表标「▶ 投屏中」），「停止投屏」可单独关掉某一台。**断线后直接点投屏/录屏/摄像头/独立窗口**，会先自动连回「记住的、当前在线」的设备再开始（带连接提示、离线地址快速跳过），不必每次重选连接方式。
-- 📷 **摄像头按机型自适配**：打开摄像头时运行时读取本机真正支持的采集分辨率（`--list-camera-sizes`），下拉按实测列表用精确 `--camera-size` 启动，根治写死 1920x1080 在部分机型/前置摄像头上的 `Camera configuration error`；前/后置切换自动刷新，读不到列表时回退到高 / 中 / 原始最高档位。前/后置、横/竖屏、分辨率、补光灯、麦克风等选择都会记住，下次打开沿用（前置竖屏方向也已校正、不再上下颠倒）。
-- 🎥 **摄像头看门狗**：手机亮屏 / 人脸解锁会把摄像头从 scrcpy 手里抢走（Android 系统仲裁，scrcpy 挡不住），助手检测到中断后**自动重连**（底部提示、退避重试，用户自己关窗则不重连）；分辨率带不动时交给 **scrcpy 4.1 的原生分级降档**（`{2560…800}` 单步下降，不再是旧版一步砍到 800 糊成一片），阶梯试完仍开不出才提示你选更低分辨率。
-- 🪟 **独立窗口可调方向**：单开 App 的虚拟屏可选竖屏·手机版面 / 横屏·平板版面 / 自定义比例（解决微信、QQ 被当平板、显示不全），并可「固定方向」缓解最大化/全屏时画面循环自转。
-- 🧠 **省心细节**：顶部显示手机型号 + 安卓版本；摄像头(12+)/独立窗口(11+)版本不够会友好提示；独立窗口可从手机已装 App 列表直接挑（中文名、可搜索），还能固定成自己的常用清单；录屏文件名自动带时间戳不覆盖。
-- ⌨️ **快捷键速查 + 拖拽**：内置 scrcpy 常用快捷键速查表（全屏 / 息屏 / 旋转 / 复制粘贴…）；投屏窗口可拖入文件传到手机、拖入 APK 一键安装。
-- ⚙️ 「常用」设置页按使用度聚合最高频项：清晰度、传声音、保持唤醒、投屏关屏、无线自动重连……改完自动记忆。
-- 🎞️ **编码可选**：视频编码除默认 H.264 外，可选 H.265 / AV1（更省带宽）、VP8 / VP9（少数机型三大编码都不支持时的兜底；装不进 mp4，录屏自动转 mkv）；「画面」页另有「忽略编码器分辨率约束」兜底开关——机型上报的约束值不准、导致分辨率 / 独立窗口选不对时勾上（对应 `--ignore-video-encoder-constraints`，需 scrcpy 4.1）。
-- 🔌 关窗口=停投屏（录屏先确认，且会给录制进程发 Ctrl+C 正常收尾、保证文件完整，后台录制也不例外），最小化=投屏继续；关闭时自动结束自带 adb 后台进程、可选断开无线连接，助手自身也随之干净退出、不留残留进程。
-- 1️⃣ **单实例**：同一时间只运行一个助手；启动即把窗口带到最前（`conhost --headless` 下也不再开在后台），已经开着时再次双击运行只会激活已有窗口、不重复叠开（也避免两个进程互相覆盖设置）。
-- 🔍 **高分屏清晰**：助手界面已做高 DPI 适配（声明系统级 DPI 感知 + 按屏幕缩放比等比放大控件），在 150% / 200% 缩放屏上不再发虚发糊；从高缩放主屏拖到不同缩放的副屏也**完整显示、不截断**（副屏上会由系统整幅缩放、略微发软）。
-- 📁 **可指定 adb / scrcpy 路径**：默认用同目录自带的；也能在「设置 > 通用」里指向电脑里别处装的 scrcpy / adb（存进设置、保存即时生效、无需重启）。adb 留空时自动取所选 scrcpy 旁边的 adb，并让 scrcpy 与助手用同一个 adb（避免版本不一致互相踢服务）。万一自带 scrcpy 缺失，启动时会让你直接选一次它的位置，而不是直接退出。
+## 能做什么
 
-### 已知限制 · Known limitations
+- 🖥️ **有线 / 无线投屏**：无线有三种走法——插一次线自动切换（之后可拔线）、Android 11+ 用配对码全程免插线、或直接填 IP 保底。
+- 📷 **手机当摄像头**：分辨率按机型实测列表给，不会选到开不起来的档位；可变焦到超广角或长焦，倍率会记住；手机亮屏被系统抢走摄像头时自动重连。
+- 🎥 **录制屏幕**：边投边录，存 mp4 / mkv，文件名带时间戳不会覆盖上一次。
+- 🪟 **独立窗口**：在电脑上单开一块虚拟屏跑某个 App，手机照常用；可选竖屏·手机版面 / 横屏·平板版面 / 自定义比例。
+- 🗂️ **多设备**：连接与投屏分开，可同时投多台各开一窗；连过的设备自动记住，断线后点任意功能会先自动连回。
+- 📎 **拖拽即传**：文件拖进投屏窗口就传到手机，拖 APK 进去直接安装。
+- ⚙️ **全中文，改完就记**：每个设置悬停都有大白话说明；清晰度、编码、声音等选择自动记忆，下次沿用。
 
-- **以「管理员身份」运行助手时，拖文件进投屏窗口会显示禁止图标、传不进去**：Windows 不允许从普通权限的文件资源管理器向管理员权限的窗口拖放（UIPI 隔离）。助手本就无需管理员——正常双击 `.bat` 即可；若曾设过「以管理员身份运行」（或快捷方式里勾了），取消后普通打开即恢复拖拽传文件。
-- **电脑输入法的中文打不进投屏窗口**（只能粘贴）：scrcpy + Windows 输入法的固有限制，输入法「组词」阶段的字捕获不到。临时用 `Ctrl+V` 粘贴；彻底解决可给手机装 [ADBKeyboard](https://github.com/senzhk/ADBKeyBoard) 设为输入法，或键盘模式选「游戏模式」用手机自带输入法打拼音。
-- **应用双开 / 分身在独立窗口里黑屏**：分身运行在另一个安卓用户身份下、且部分应用拒绝在虚拟屏渲染，scrcpy 无法定向到分身；建议改用普通投屏在手机上开分身。
-
-## 界面 · Screenshots
-
-|         设备管理：多设备切换 / 同时多投         |         设置：左侧分类，改完自动记忆         |
-| :---------------------------------------------: | :------------------------------------------: |
+| 设备管理：多设备切换 / 同时多投 | 设置：左侧分类，改完自动记忆 |
+| :---: | :---: |
 | ![设备管理](./assets/scrcpy-helper-devices.png) | ![设置](./assets/scrcpy-helper-settings.png) |
 
-## 怎么用（普通用户）· Usage
+## 快速开始
 
-1. 到 [Releases](../../releases) 下载打包好的 zip（已内置 scrcpy），解压到任意文件夹。
-2. 手机开启「USB 调试」（设置 > 关于手机 > 连点 7 次版本号 > 开发者选项）。
-3. 双击 `投屏助手-双击运行.bat`，点「有线投屏」即可。
+1. 下载 [Releases](https://github.com/rockbenben/scrcpy-helper/releases/latest) 里的 zip，解压到任意文件夹。
+2. 手机开启「USB 调试」：设置 > 关于手机 > 连点 7 次版本号，返回设置进「开发者选项」打开。
+3. 双击 `投屏助手-双击运行.bat`，插上数据线，点「有线投屏」。
 
-详见随包的 `使用说明.txt`。
+首次连接时手机上会弹「允许 USB 调试」，点允许就好。逐项说明见随包的 `使用说明.txt`，也可看[图文教程](https://newzone.top/posts/2019-08-26-scrcpy_screen_projection.html)。
 
-## 与 QtScrcpy / escrcpy 的区别 · Why another one
+## 已知限制
 
-想要功能完整、跨平台，更推荐成熟的 [QtScrcpy](https://github.com/barry-ran/QtScrcpy) 或 [escrcpy](https://github.com/viarotel-org/escrcpy)。本项目走的是另一条路：一个单脚本、免安装的小工具，界面全中文。如果你只是想简单投个屏、又偏爱绿色便携，可以试试它。
+- **以管理员身份运行时，拖文件进投屏窗口会显示禁止图标。** Windows 不允许普通权限的资源管理器向管理员权限的窗口拖放（UIPI 隔离）。助手本就无需管理员，正常双击 `.bat` 即恢复。
+- **电脑输入法的中文打不进投屏窗口**（只能 `Ctrl+V` 粘贴）。这是 scrcpy + Windows 输入法的固有限制，组词阶段的字捕获不到。彻底解决可给手机装 [ADBKeyboard](https://github.com/senzhk/ADBKeyBoard)，或键盘模式选「游戏模式」用手机自带输入法。
+- **应用双开 / 分身在独立窗口里黑屏。** 分身跑在另一个安卓用户身份下，且部分应用拒绝在虚拟屏渲染，scrcpy 无法定向过去；改用普通投屏在手机上开分身即可。
 
-> Want full features? Go with QtScrcpy / escrcpy. This is just a tiny, no-install, Chinese GUI for simple mirroring.
-
-## 打包发布 · Build a release
-
-仓库不含 scrcpy 二进制。打包很简单：把 `scrcpy-helper.ps1`、`投屏助手-双击运行.bat`、`使用说明.txt` 三个文件复制进 [scrcpy](https://github.com/Genymobile/scrcpy/releases) 的解压目录，整个文件夹压成 zip 即可。用户解压后双击 `.bat` 就能用。
-
-打包时**还要把本仓库的 `LICENSE` 一并复制进去，改名为 `LICENSE-scrcpy-helper.txt`**。scrcpy 发行包里那个 `LICENSE.txt` 是它自己的 Apache-2.0，不覆盖本助手的三个文件；两份都放，解压的人才分得清哪个文件按哪个许可。scrcpy 的 `LICENSE.txt` 不要删——原样保留它是 Apache-2.0 的要求。
-
-> **请用 scrcpy 4.1 及以上版本打包**。助手用到了 `--flex-display`（独立窗口）、`--keep-active`（无线投屏保持唤醒，4.0 起），以及 VP8/VP9 视频编码、`--ignore-video-encoder-constraints`（编码器约束兜底，4.1 起）；用旧版打包会导致相关功能因「未知参数」失败。升到 4.1 还白得：拖拽传文件后相册/文件管理器即时可见（媒体扫描）、色彩空间转换修复、若干稳定性修复（FFmpeg 8.1.2 / SDL 3.4.12）。
-
-## 致谢 · Credits
-
-- 投屏核心：[scrcpy](https://github.com/Genymobile/scrcpy)（Apache-2.0）by Genymobile。本项目仅是其图形外壳。
-- 图文教程：<https://newzone.top/posts/2019-08-26-scrcpy_screen_projection.html>
-
-## 许可证 · License
+## 许可证
 
 本仓库的三个文件（`scrcpy-helper.ps1`、`投屏助手-双击运行.bat`、`使用说明.txt`）以 [MIT](./LICENSE) 开源。
 
-发行包里除此之外的一切都来自 scrcpy 官方 win64 发行包，**原样转发、未作修改**，遵循其 Apache-2.0 许可，随包附带的 `LICENSE.txt` 即该许可全文。逐项清单见 [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md)。
+发行包里除此之外的一切都来自 Genymobile 的 [scrcpy](https://github.com/Genymobile/scrcpy) 官方 win64 发行包，**原样转发、未作修改**，遵循其 Apache-2.0 许可，随包的 `LICENSE.txt` 即该许可全文。逐项清单见 [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md)。
 
-## 贡献 · Contributing
-
-欢迎 issue / PR。**多语言（i18n）** 尤其欢迎：当前界面文案内嵌在脚本里，后续可抽成字符串表以支持英文等语言。
+想自己打包发行版、或帮忙做界面多语言，见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
 
 ## 关于 365 开源计划
 
-[365 开源计划](https://github.com/rockbenben/365opensource) 的第 **#019** 个项目——一个人 + AI，一年 300+ 个开源项目。[提交你的需求 →](https://365.aishort.top/) · [Discord](https://discord.gg/PZTQfJ4GjX) · [Telegram](https://t.me/aishort_top)
+[365 开源计划](https://github.com/rockbenben/365opensource) 的第 **#019** 个项目——一个人 + AI，一年 300+ 个开源项目。
+
+[提交你的需求 →](https://365.aishort.top/) · [Discord](https://discord.gg/PZTQfJ4GjX) · [Telegram](https://t.me/aishort_top)
