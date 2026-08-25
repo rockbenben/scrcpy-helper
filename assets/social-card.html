@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>scrcpy 投屏助手 · social card</title>
+<style>
+  /* 1280×640 —— GitHub Settings › Social preview 推荐尺寸
+     安全区：官方模板要求四周留 40pt = 80px；这里统一用 88px，再多 8px 余量
+     渲染: node ~/.claude/skills/html-shot/render.mjs assets/social-card.html assets/social-card.png --palette */
+  :root{
+    --red:#E05B4A;          /* app 图标那支红，在墨底上提亮一档 */
+    --ground:#201E1B;       /* app 图标的墨色；截图成为全图最亮的东西 */
+    --text:#F4F1EB;
+    --sub:#C3BCB1;
+    --mute:#948C80;
+    --rule:#37342E;
+    --foot:#7E766A;
+    --shadow:rgba(0,0,0,.55);
+    --iconring:rgba(255,255,255,.18); /* 把墨色图标从墨色底里托出来 */
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{
+    position:relative;width:1280px;height:640px;overflow:hidden;
+    background:var(--ground);color:var(--text);
+    font-family:"MiSans","Segoe UI Variable Text","Microsoft YaHei UI",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .mono{font-family:"Cascadia Mono","Cascadia Code",Consolas,monospace}
+
+  /* ── 左：说清楚是什么 ── */
+  .say{position:absolute;left:88px;top:88px;width:486px;height:464px;display:flex;flex-direction:column;justify-content:center}
+  .icon{width:64px;height:64px;border-radius:14px;display:block;box-shadow:0 0 0 1px var(--iconring)}
+  .name{font-family:"MiSans Semibold","MiSans","Segoe UI Variable Display","Microsoft YaHei UI",sans-serif;
+        font-weight:600;font-size:59px;line-height:1.12;letter-spacing:-.012em;margin-top:24px}
+  .line{font-size:21px;line-height:1.6;color:var(--sub);margin-top:16px;letter-spacing:.005em}
+  .facts{margin-top:26px;font-size:15.5px;color:var(--mute);letter-spacing:.02em}
+  .facts b{color:var(--red);font-weight:inherit}
+  .foot{position:absolute;left:0;right:0;bottom:0;border-top:1px solid var(--rule);padding-top:17px;
+        display:flex;justify-content:space-between;align-items:baseline;font-size:13px;color:var(--foot)}
+
+  /* ── 右：产品本人 ── */
+  .shot{position:absolute;right:88px;top:90px;width:570px;height:459px;
+        border-radius:10px;overflow:hidden;
+        box-shadow:0 28px 64px var(--shadow),0 4px 12px rgba(34,32,29,.13)}
+  .shot img{position:absolute;width:1015.31px;left:-59.38px;top:-34.14px;display:block}
+</style>
+
+<div class="say">
+  <img class="icon" src="scrcpy-helper-icon.png" alt="">
+  <h1 class="name">scrcpy 投屏助手</h1>
+  <p class="line">不用背命令行参数，勾几个选项<br>就把安卓手机投屏到电脑</p>
+  <p class="facts">Windows 10 / 11 · 免安装 · 全中文 · <b>已内置 scrcpy</b></p>
+  <div class="foot">
+    <span class="mono">github.com/rockbenben/scrcpy-helper</span>
+    <span>365 开源计划 · 第 019 号</span>
+  </div>
+</div>
+
+<div class="shot"><img src="scrcpy-helper-hero.png" alt=""></div>
+</html>
