@@ -55,14 +55,33 @@ try {
 # （如「更多应用」里 --list-apps 列出的 App 中文名）读成乱码。统一按 UTF-8 解码原生命令输出。
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
-# 任务栏图标：把本进程标识成自己的 App，而不是跟着宿主 powershell.exe 走，
-# 否则任务栏按钮会沿用 PowerShell 的蓝色图标（标题栏图标由 $form.Icon 控制，不受影响）。
+# 任务栏图标 / 通知身份：把本进程标识成自己的 App，而不是跟着宿主 powershell.exe 走，
+# 否则任务栏按钮沿用 PowerShell 的蓝色图标，托盘通知顶部的应用名也是乱的。
+# 必须满足两点，缺一通知身份行就会出问题：
+# 1) P/Invoke 必须显式 CharSet.Unicode——该 API 只有 Unicode 版本，漏写时按 ANSI 封送，
+#    系统把单字节串当 UTF-16 读，进程 AUMID 会变成乱码（通知顶部显示一堆汉字乱码，实测）。
+# 2) AUMID 要在 HKCU 注册显示名，否则通知顶部只能显示裸的 AUMID 字符串。
+# 用 Reflection.Emit 在内存里发出 P/Invoke，不走 Add-Type/csc（后者在部分管控机上编译失败）。
 try {
-    Add-Type -Namespace Native -Name Shell -MemberDefinition @'
-[System.Runtime.InteropServices.DllImport("shell32.dll", SetLastError = true)]
-public static extern int SetCurrentProcessExplicitAppUserModelID(string AppID);
-'@
-    [Native.Shell]::SetCurrentProcessExplicitAppUserModelID('rockbenben.scrcpyHelper') | Out-Null
+    $appId = 'rockbenben.scrcpyHelper'
+    try {
+        $aumidKey = "HKCU:\Software\Classes\AppUserModelId\$appId"
+        if (-not (Test-Path -LiteralPath $aumidKey)) { New-Item -Path $aumidKey -Force | Out-Null }
+        New-ItemProperty -Path $aumidKey -Name DisplayName -Value 'scrcpy 投屏助手' -PropertyType String -Force | Out-Null
+    } catch {}
+    if (-not ('Native.ShellEmit' -as [type])) {
+        $_asm = [AppDomain]::CurrentDomain.DefineDynamicAssembly(
+            (New-Object Reflection.AssemblyName('scrcpyHelperNative')), [Reflection.Emit.AssemblyBuilderAccess]::Run)
+        $_mod = $_asm.DefineDynamicModule('scrcpyHelperNative')
+        $_tb = $_mod.DefineType('Native.ShellEmit', [Reflection.TypeAttributes]'Public, Class, Sealed, Abstract')
+        [void]$_tb.DefinePInvokeMethod(
+            'SetCurrentProcessExplicitAppUserModelID', 'shell32.dll',
+            [Reflection.MethodAttributes]'Public, Static, PinvokeImpl', [Reflection.CallingConventions]::Standard,
+            [int], @([string]),
+            [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
+        [void]$_tb.CreateType()
+    }
+    [Native.ShellEmit]::SetCurrentProcessExplicitAppUserModelID($appId) | Out-Null
 } catch {}
 
 # 控制台信号 API：关闭 / 停止时给「录制中」的 scrcpy 发 Ctrl+C 让它优雅收尾（见 Stop-ScrcpyGraceful）。
@@ -87,6 +106,7 @@ try {
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hWnd);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool IsIconic(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr hWnd);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(uint dwProcessId);
 '@
@@ -218,7 +238,7 @@ $defaults = [ordered]@{
     # 摄像头面板上次的选择（全局偏好）：前后置 back/front、方向 land/port、补光灯、麦克风。分辨率另按设备+前后记在 camResByDevice。
     camFacing = 'back'; camOrientation = 'land'; camTorch = $false; camMic = $false
     # 窗口
-    fullscreen = $false; onTop = $false; borderless = $false
+    fullscreen = $false; onTop = $false; borderless = $false; minToTray = $false
     # 独立窗口
     ndSize = ''; ndDpi = ''; ndNoDecor = $false; ndMode = 'settings'; ndFixed = $false
     # 录制
@@ -1145,8 +1165,10 @@ function Show-Settings {
     $chkFull = New-Chk '启动即全屏' $settings.fullscreen 14 18
     $chkTop = New-Chk '窗口总在最前' $settings.onTop 14 50
     $chkBorderless = New-Chk '无边框窗口' $settings.borderless 14 82
+    $chkMinTray = New-Chk '最小化时收起到系统托盘（不在任务栏占位）' $settings.minToTray 14 114
     $tt.SetToolTip($chkTop, '投屏窗口始终浮在其它窗口上方，边看手机边操作电脑很方便。')
-    $tabWin.Controls.AddRange(@($chkFull, $chkTop, $chkBorderless))
+    $tt.SetToolTip($chkMinTray, '勾上后点标题栏最小化，助手窗口会收起到右下角托盘区，任务栏不再占位；单击/双击托盘图标还原，右键菜单可退出。投屏、录制等功能在托盘下照常运行。')
+    $tabWin.Controls.AddRange(@($chkFull, $chkTop, $chkBorderless, $chkMinTray))
 
     # ===== 独立窗口 =====
     $tabNd = New-Object System.Windows.Forms.Panel
@@ -1264,6 +1286,7 @@ function Show-Settings {
         $settings.fullscreen = $chkFull.Checked
         $settings.onTop      = $chkTop.Checked
         $settings.borderless = $chkBorderless.Checked
+        $settings.minToTray  = $chkMinTray.Checked
         $settings.ndSize     = if ($ndText -eq '跟手机一致') { '' } else { $ndText }
         $settings.ndDpi      = $cbNdDpi.Vals[$cbNdDpi.SelectedIndex]
         $settings.ndNoDecor  = $chkNoDecor.Checked
@@ -2170,10 +2193,11 @@ function Start-ActivationWaiter {
             if ($shared.stop) { break }                       # 关闭时唤醒：检出停止标记就退出，让线程结束、进程可正常退出
             if (-not $sig) { continue }
             try {
-                if ([Native.Win]::IsIconic($hwnd)) { [void][Native.Win]::ShowWindow($hwnd, 9) }   # SW_RESTORE：最小化先还原
+                if ([Native.Win]::IsIconic($hwnd)) { [void][Native.Win]::ShowWindow($hwnd, 1) }   # SW_SHOWNORMAL：最小化/收进托盘（隐藏且最小化）时一步还原并显示；SW_RESTORE 不会给隐藏窗口加 WS_VISIBLE
+                if (-not [Native.Win]::IsWindowVisible($hwnd)) { [void][Native.Win]::ShowWindow($hwnd, 5) }   # SW_SHOW：窗口只是被隐藏（托盘态）时显示
                 [void][Native.Win]::SetForegroundWindow($hwnd)
                 Start-Sleep -Milliseconds 60
-                if ([Native.Win]::GetForegroundWindow() -ne $hwnd) { [void][Native.Win]::ShowWindow($hwnd, 6); [void][Native.Win]::ShowWindow($hwnd, 9) }   # 6=SW_MINIMIZE→9=SW_RESTORE 兜底，必成
+                if ([Native.Win]::GetForegroundWindow() -ne $hwnd) { [void][Native.Win]::ShowWindow($hwnd, 6); [void][Native.Win]::ShowWindow($hwnd, 1) }   # 6=SW_MINIMIZE→1=SW_SHOWNORMAL 兜底，必成
             } catch {}
         }
     })
@@ -2700,6 +2724,47 @@ try {
         # 本进程激活自己的窗口是可靠的：Activate + TopMost 翻转 + SetForegroundWindow(自身句柄)。
         try { $form.Activate(); $form.TopMost = $true; $form.TopMost = $false; [void][Native.Win]::SetForegroundWindow($form.Handle) } catch {}
     })
+    # ---------------- 最小化到系统托盘（设置 > 窗口 里开关，默认关） ----------------
+    $tray = New-Object System.Windows.Forms.NotifyIcon
+    $tray.Icon = Get-AppIcon
+    $tray.Text = 'scrcpy 投屏助手'
+    $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+    $miTrayRestore = $trayMenu.Items.Add('显示主窗口')
+    [void]$trayMenu.Items.Add('-')
+    $miTrayExit = $trayMenu.Items.Add('退出助手')
+    $tray.ContextMenuStrip = $trayMenu
+    $script:trayHintShown = $false
+    $restoreFromTray = {
+        if ($form.IsDisposed) { return }
+        # 必须先 Show 再把状态设回 Normal：隐藏状态下直接改 WindowState 不生效，会变成「可见但仍最小化」
+        $tray.Visible = $false
+        $form.Show()
+        $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+        $form.Activate()
+    }
+    $miTrayRestore.Add_Click($restoreFromTray)
+    $tray.Add_DoubleClick($restoreFromTray)
+    # Win11 习惯：单击托盘图标也还原；右键仍由系统弹菜单
+    $tray.Add_MouseClick({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { & $restoreFromTray } })
+    $miTrayExit.Add_Click({ $form.Close() })
+    # 最小化时收进托盘：延迟到本轮 Resize 消息处理完再 Hide，避免在系统最小化过程中同步隐藏
+    $form.Add_Resize({
+        if ($settings.minToTray -and $form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+            [void]$form.BeginInvoke([System.Action]{
+                if (-not $form.IsDisposed -and $settings.minToTray -and $form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+                    $form.Hide()
+                    $tray.Visible = $true
+                    if (-not $script:trayHintShown) {
+                        $script:trayHintShown = $true
+                        $tray.BalloonTipTitle = 'scrcpy 投屏助手'
+                        $tray.BalloonTipText = '已收起到系统托盘，单击/双击图标即可还原窗口。'
+                        $tray.ShowBalloonTip(2000)
+                    }
+                }
+            })
+        }
+    })
+
     # 从任务栏还原「点标题栏最小化」的窗口时，资源管理器的顺序是：先激活窗口、几毫秒后再发还原指令。
     # 这里一激活就同步跑 adb devices 刷状态（实测几十到上百毫秒），会卡住 UI 线程，导致资源管理器的
     # 还原指令发不出来——窗口停在「活动但仍最小化」，点一下没反应还响错误提示音，必须再点第二下。
@@ -2740,9 +2805,13 @@ try {
         # 用本助手目录里的 adb 自己 kill-server（只停默认端口的 server，下次用到会自动重启）。
         try { Invoke-Hidden -FilePath $adb -ArgumentList @('kill-server') -DiscardStderr | Out-Null } catch {}
     })
-    $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose(); $script:camWatch.Stop(); $script:camWatch.Dispose(); $script:hintRestore.Stop(); $script:hintRestore.Dispose(); Stop-ActivationWaiter })   # 让激活等待线程退出，否则它阻塞 WaitOne 会钉住进程不退出
+    $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose(); $script:camWatch.Stop(); $script:camWatch.Dispose(); $script:hintRestore.Stop(); $script:hintRestore.Dispose(); Stop-ActivationWaiter; $tray.Visible = $false; $tray.Dispose(); $trayMenu.Dispose() })   # 让激活等待线程退出，否则它阻塞 WaitOne 会钉住进程不退出；托盘图标先隐藏再释放，避免退出后残留幽灵图标
 
-    [void]$form.ShowDialog()
+    # 必须用非模态消息循环（Show + Application::Run），不能 ShowDialog()：「最小化到托盘」要在
+    # 窗口隐藏（Hide）后进程继续存活；实测模态循环在窗口 Hide 的瞬间就直接返回，进程随即退出，
+    # 托盘图标变成点不动的幽灵图标。非模态循环只在窗口真正关闭时才结束。
+    $form.Show()
+    [System.Windows.Forms.Application]::Run($form)
 }
 catch {
     [System.Windows.Forms.MessageBox]::Show("启动出错：`n$($_.Exception.Message)", 'scrcpy 投屏助手') | Out-Null
