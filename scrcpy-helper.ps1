@@ -2700,7 +2700,26 @@ try {
         # 本进程激活自己的窗口是可靠的：Activate + TopMost 翻转 + SetForegroundWindow(自身句柄)。
         try { $form.Activate(); $form.TopMost = $true; $form.TopMost = $false; [void][Native.Win]::SetForegroundWindow($form.Handle) } catch {}
     })
-    $form.Add_Activated({ & $updateStatus; if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() } else { $timer.Stop() } })
+    # 从任务栏还原「点标题栏最小化」的窗口时，资源管理器的顺序是：先激活窗口、几毫秒后再发还原指令。
+    # 这里一激活就同步跑 adb devices 刷状态（实测几十到上百毫秒），会卡住 UI 线程，导致资源管理器的
+    # 还原指令发不出来——窗口停在「活动但仍最小化」，点一下没反应还响错误提示音，必须再点第二下。
+    # 最小化期间把这次刷新延后 200ms（一次性定时器），让还原指令先走完；窗口正常时照旧立即刷新。
+    $form.Add_Activated({
+        if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+            $deferRefresh = New-Object System.Windows.Forms.Timer
+            $deferRefresh.Interval = 200
+            $deferRefresh.Add_Tick({
+                param($s)
+                $s.Stop(); $s.Dispose()
+                if ($form.IsDisposed) { return }
+                & $updateStatus
+                if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() } else { $timer.Stop() }
+            })
+            $deferRefresh.Start()
+        } else {
+            & $updateStatus; if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() } else { $timer.Stop() }
+        }
+    })
     $form.Add_Deactivate({ $timer.Stop() })
     # 关闭助手 = 停止它开过的所有投屏；正在录屏时先确认，避免误关丢录像
     $form.Add_FormClosing({
