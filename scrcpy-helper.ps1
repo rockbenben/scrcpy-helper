@@ -616,7 +616,9 @@ function Start-Scrcpy {
                 if ($script:showTempHint) { & $script:showTempHint '该手机已有窗口在播放声音，本窗口已自动静音（避免重音）' $cMuted 8000 }
             }
             elseif ($AudioMode -eq 'On') {
-                if ($script:showTempHint) { & $script:showTempHint '本窗口强制播放声音，与已有窗口同时出声会有重音' $cMuted 8000 }
+                # 麦克风输入（摄像头面板）与媒体外放叠加是回声/啸叫风险，不是普通重音，分开提示
+                $onHint = if (@($clean | Where-Object { $_ -like '--audio-source=*mic*' }).Count) { '麦克风已开启，建议戴耳机，避免与已有窗口声音叠加产生回声啸叫' } else { '本窗口强制播放声音，与已有窗口同时出声会有重音' }
+                if ($script:showTempHint) { & $script:showTempHint $onHint $cMuted 8000 }
             }
         }
     }
@@ -1549,6 +1551,9 @@ function Show-NewDisplay {
             }
         }
         $audioSel = [string]$cbAudio.Vals[$cbAudio.SelectedIndex]
+        # 「自动」要服从设置里的总开关「把手机声音传到电脑」：总开关关了就不出声（独立窗口不带 Get-AudioArgs，否则总开关管不到它）；
+        # 用户显式选的「播放/静音」以当次选择为准，不被总开关覆盖。
+        $effAudio = if (-not $settings.audioOn -and $audioSel -eq 'auto') { 'off' } else { $audioSel }
         $settings.ndMode = $ndModeSel; $settings.ndFixed = $chkFixed.Checked; $settings.ndAudio = $audioSel; Save-Settings
         $pre = if ($serial) { @('-s', $serial) } else { @() }
         # 自动模式(手机/平板版面)：窗口适配屏幕；用 --window-* 就必须非 flex（否则 scrcpy 报错），非 flex 也顺带避免最大化画面自转。
@@ -1557,7 +1562,7 @@ function Show-NewDisplay {
         # 虚拟屏保留系统装饰（状态栏/导航栏）：去掉 --no-vd-system-decorations 后，像微信这种 App 会把自己的顶栏
         # 同时画进「状态栏预留区」和正常位置，出现「两条一样的顶栏」；保留系统栏则是正常的「状态栏+单顶栏」手机观感。
         # @() 防单元素退化粘连（同 Get-MirrorArgs 处的坑）：$pre 为空时 $null+单元素串 会变字符串拼接
-        Start-Scrcpy ($pre + @(Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + "--start-app=$target") -AudioMode $audioSel
+        Start-Scrcpy ($pre + @(Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + "--start-app=$target") -AudioMode $effAudio
     }
 }
 
