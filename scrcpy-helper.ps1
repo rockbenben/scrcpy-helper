@@ -240,7 +240,7 @@ $defaults = [ordered]@{
     # 窗口
     fullscreen = $false; onTop = $false; borderless = $false; minToTray = $false
     # 独立窗口
-    ndSize = ''; ndDpi = ''; ndNoDecor = $false; ndMode = 'settings'; ndFixed = $false
+    ndSize = ''; ndDpi = ''; ndNoDecor = $false; ndMode = 'settings'; ndFixed = $false; ndAudio = 'auto'
     # 录制
     recFormat = 'mp4'; recTimeLimit = 0; recBackground = $false
     # 通用
@@ -579,7 +579,14 @@ function Get-NulStdin {
 
 # 启动 scrcpy（不阻塞界面；自动过滤空参数）
 function Start-Scrcpy {
-    param([string[]]$Options, [switch]$Recording, [string]$StderrFile, [string]$StdoutFile)
+    param(
+        [string[]]$Options,
+        [switch]$Recording,
+        [string]$StderrFile,
+        [string]$StdoutFile,
+        # 本窗口声音：Auto=同设备已有出声窗口时自动静音（默认）；On=强制出声；Off=强制静音
+        [ValidateSet('Auto', 'On', 'Off')][string]$AudioMode = 'Auto'
+    )
     $extra = @(); if ($settings.extraArgs) { $extra = @($settings.extraArgs -split '\s+' | Where-Object { $_ }) }
     $clean = @(($Options + $extra) | Where-Object { $_ -ne '' -and $null -ne $_ })
     # 解析目标设备序列号（来自 -s），用于「投屏中」标记 / 「停止这台」，并据此给窗口起友好标题
@@ -590,20 +597,26 @@ function Start-Scrcpy {
         $title = (Get-FriendlyName $serial) -replace '\s+', '-'
         if ($title) { $clean += "--window-title=$title" }
     }
-    # 同一台手机只保留一路在电脑上出声：scrcpy 捕获的是整机一路混音，与主屏幕/虚拟屏无关，
-    # 同设备开第二个会话等于把同一份声音在电脑上再播一遍 → 音量叠加、发重音。
-    # 已有存活的「出声会话」时，给新会话补 --no-audio。--no-playback（后台录制）不在电脑播放，既不占位也不参与判定。
-    # 录制会话(-Recording)例外：--no-audio 会连录进文件的声音一起掐掉，宁可录制窗口短暂多播一路，也不能毁录音。
+    # 声音三态：Off=强制静音；On=用户显式选了「播放」，不参与多开去重（但已有窗口出声时会提示可能重音）；
+    # Auto=同一台手机只保留第一路在电脑出声——scrcpy 捕获整机一路混音，与主屏幕/虚拟屏无关，
+    # 同设备开第二个会话等于把同一份声音再播一遍，音量叠加、发重音。
+    # --no-playback（后台录制）不在电脑播放，不占位也不参与判定。
+    # 录制会话(-Recording)即使传了模式也不静音：--no-audio 会连录进文件的声音一起掐掉，宁可短暂多播一路也不能毁录音。
+    if ($AudioMode -eq 'Off' -and -not $Recording -and -not @($clean | Where-Object { $_ -eq '--no-audio' }).Count) { $clean += '--no-audio' }
     $playsAudio = (@($clean | Where-Object { $_ -eq '--no-audio' -or $_ -eq '--no-playback' }).Count -eq 0)
     if ($serial -and $playsAudio -and -not $Recording) {
+        $otherLive = $false
         foreach ($it in @($scrcpyProcs)) {
             if ($it.Serial -ne $serial -or -not $it.Audio) { continue }
-            $alive = $false
-            try { $alive = [bool]($it.Proc -and -not $it.Proc.HasExited) } catch {}
-            if ($alive) {
+            try { if ($it.Proc -and -not $it.Proc.HasExited) { $otherLive = $true; break } } catch {}
+        }
+        if ($otherLive) {
+            if ($AudioMode -eq 'Auto') {
                 $clean += '--no-audio'; $playsAudio = $false
                 if ($script:showTempHint) { & $script:showTempHint '该手机已有窗口在播放声音，本窗口已自动静音（避免重音）' $cMuted 8000 }
-                break
+            }
+            elseif ($AudioMode -eq 'On') {
+                if ($script:showTempHint) { & $script:showTempHint '本窗口强制播放声音，与已有窗口同时出声会有重音' $cMuted 8000 }
             }
         }
     }
@@ -641,7 +654,10 @@ function Start-Scrcpy {
 function Start-CamProc {
     param([string[]]$argv, [string]$errFile, [string]$outFile)
     $before = $scrcpyProcs.Count
-    Start-Scrcpy $argv -StderrFile $errFile -StdoutFile $outFile
+    # 摄像头面板已显式决定声音：勾麦克风=强制有声（视频通话要用，不能被多开去重静音），否则强制静音。
+    # 看门狗重连也走这个入口，按 $argv 里既有的音频参数还原模式，重连后选择不丢。
+    $camMode = if ($argv -contains '--no-audio') { 'Off' } else { 'On' }
+    Start-Scrcpy $argv -StderrFile $errFile -StdoutFile $outFile -AudioMode $camMode
     if ($scrcpyProcs.Count -gt $before) { return $scrcpyProcs[$scrcpyProcs.Count - 1].Proc }
     return $null
 }
@@ -1448,7 +1464,7 @@ function Show-ManageApps {
 # ---------------- 独立窗口：选 App ----------------
 function Show-NewDisplay {
     param($owner, $serial)
-    $dlg = New-Dialog '独立窗口' 320 336 $owner
+    $dlg = New-Dialog '独立窗口' 320 372 $owner
 
     $l1 = New-Lbl '在电脑上单开一块屏，运行下面这个 App：' 18 18
     $l2 = New-Lbl '（手机照常用，互不影响；需 Android 11+）' 18 42; $l2.ForeColor = $cMuted
@@ -1469,9 +1485,15 @@ function Show-NewDisplay {
     $capMode = New-Caption "竖屏适合聊天/刷信息；横屏适合看视频。乱转就勾上「固定方向」。`n应用双开/分身在独立窗口常黑屏、点不到，建议改用普通投屏在手机上开分身。" 18 176
     $capMode.MaximumSize = New-Object System.Drawing.Size(284, 0)
 
-    $btnGo = New-PrimaryBtn '打开' 18 254 284 38 11
+    # 声音三态（记住上次选择）：自动=同设备只让第一个窗口出声；播放=这扇窗强制出声；静音=这扇窗不出声
+    $lblAudio = New-Lbl '声音' 18 250
+    $cbAudio = New-Combo @('自动（多开时静音）', '播放（这扇窗始终出声）', '静音（这扇窗不出声）') @('auto', 'on', 'off') $settings.ndAudio 86 246 216
+    $audioTt = '自动（推荐）：同一台手机只让第一个窗口出声，后开的窗口自动静音，避免重音；播放：这扇窗强制出声，可能与已有窗口重音；静音：这扇窗不发声。'
+    if ($tt) { $tt.SetToolTip($cbAudio, $audioTt); $tt.SetToolTip($lblAudio, $audioTt) }   # $tt 是主窗体作用域的，动态查找；空值守卫
+
+    $btnGo = New-PrimaryBtn '打开' 18 290 284 38 11
     $btnGo.Add_Click({ $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close() })
-    $dlg.Controls.AddRange(@($l1, $l2, $cb, $lblMode, $cbMode, $chkFixed, $capMode, $btnGo))
+    $dlg.Controls.AddRange(@($l1, $l2, $cb, $lblMode, $cbMode, $chkFixed, $capMode, $lblAudio, $cbAudio, $btnGo))
     $dlg.AcceptButton = $btnGo
     if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
         $sel = [string]$cb.SelectedItem
@@ -1526,7 +1548,8 @@ function Show-NewDisplay {
                 $settings.ndSize = $ndSz; $settings.ndDpi = $ndDpi
             }
         }
-        $settings.ndMode = $ndModeSel; $settings.ndFixed = $chkFixed.Checked; Save-Settings
+        $audioSel = [string]$cbAudio.Vals[$cbAudio.SelectedIndex]
+        $settings.ndMode = $ndModeSel; $settings.ndFixed = $chkFixed.Checked; $settings.ndAudio = $audioSel; Save-Settings
         $pre = if ($serial) { @('-s', $serial) } else { @() }
         # 自动模式(手机/平板版面)：窗口适配屏幕；用 --window-* 就必须非 flex（否则 scrcpy 报错），非 flex 也顺带避免最大化画面自转。
         $fitWin = if ($autoFit) { Get-FitWindowArgs $ndSz } else { @() }
@@ -1534,7 +1557,7 @@ function Show-NewDisplay {
         # 虚拟屏保留系统装饰（状态栏/导航栏）：去掉 --no-vd-system-decorations 后，像微信这种 App 会把自己的顶栏
         # 同时画进「状态栏预留区」和正常位置，出现「两条一样的顶栏」；保留系统栏则是正常的「状态栏+单顶栏」手机观感。
         # @() 防单元素退化粘连（同 Get-MirrorArgs 处的坑）：$pre 为空时 $null+单元素串 会变字符串拼接
-        Start-Scrcpy ($pre + @(Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + "--start-app=$target")
+        Start-Scrcpy ($pre + @(Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + "--start-app=$target") -AudioMode $audioSel
     }
 }
 
