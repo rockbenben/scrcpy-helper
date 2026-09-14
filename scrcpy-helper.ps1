@@ -590,6 +590,23 @@ function Start-Scrcpy {
         $title = (Get-FriendlyName $serial) -replace '\s+', '-'
         if ($title) { $clean += "--window-title=$title" }
     }
+    # 同一台手机只保留一路在电脑上出声：scrcpy 捕获的是整机一路混音，与主屏幕/虚拟屏无关，
+    # 同设备开第二个会话等于把同一份声音在电脑上再播一遍 → 音量叠加、发重音。
+    # 已有存活的「出声会话」时，给新会话补 --no-audio。--no-playback（后台录制）不在电脑播放，既不占位也不参与判定。
+    # 录制会话(-Recording)例外：--no-audio 会连录进文件的声音一起掐掉，宁可录制窗口短暂多播一路，也不能毁录音。
+    $playsAudio = (@($clean | Where-Object { $_ -eq '--no-audio' -or $_ -eq '--no-playback' }).Count -eq 0)
+    if ($serial -and $playsAudio -and -not $Recording) {
+        foreach ($it in @($scrcpyProcs)) {
+            if ($it.Serial -ne $serial -or -not $it.Audio) { continue }
+            $alive = $false
+            try { $alive = [bool]($it.Proc -and -not $it.Proc.HasExited) } catch {}
+            if ($alive) {
+                $clean += '--no-audio'; $playsAudio = $false
+                if ($script:showTempHint) { & $script:showTempHint '该手机已有窗口在播放声音，本窗口已自动静音（避免重音）' $cMuted 8000 }
+                break
+            }
+        }
+    }
     # Start-Process 数组传参不会给「含空格的参数」加引号——会把录屏路径 C:\My Videos\x.mp4 拆成多段、
     # 让 scrcpy 收到的 -r 路径残缺、录屏失败。这里自己给含空格/引号的参数补引号，整体作为命令行串传。
     $cmd = (@($clean | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
@@ -615,7 +632,8 @@ function Start-Scrcpy {
         try { $lp = Join-Path $PSScriptRoot '投屏助手-错误日志.txt'; Add-Content -LiteralPath $lp -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Start-Scrcpy 启动失败: $($_.Exception.Message)`r`n" -Encoding UTF8 } catch {}
         return
     }
-    if ($p) { [void]$scrcpyProcs.Add([pscustomobject]@{ Proc = $p; Rec = [bool]$Recording; Serial = $serial }) }
+    # Audio=本会话是否在电脑上出声（被自动静音的新会话记 false，供后续同设备会话判定「是否已有出声窗口」）
+    if ($p) { [void]$scrcpyProcs.Add([pscustomobject]@{ Proc = $p; Rec = [bool]$Recording; Serial = $serial; Audio = [bool]$playsAudio }) }
 }
 
 # 启动一个 scrcpy 并把 Process 对象拿回来（摄像头看门狗要盯它的退出码和 stderr）；启动失败返回 $null。
