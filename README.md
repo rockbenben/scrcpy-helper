@@ -4,14 +4,14 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE) [![365 开源计划 #019](https://img.shields.io/badge/365%20%E5%BC%80%E6%BA%90%E8%AE%A1%E5%88%92-%23019-1f6feb)](https://github.com/rockbenben/365opensource)
 
-**[⬇ 下载最新版](https://github.com/rockbenben/scrcpy-helper/releases/latest)** · Windows 10 / 11 · 已内置 scrcpy，不用另外装
+**[⬇ 下载最新版](https://github.com/rockbenben/scrcpy-helper/releases/latest)** · Windows 10 / 11 · 已内置 scrcpy
 
 ![scrcpy 投屏助手：主界面与「手机当摄像头」面板](./assets/scrcpy-helper-hero.png)
 
-[scrcpy](https://github.com/Genymobile/scrcpy) 是最好用的安卓投屏工具，但它只有命令行。本项目用一个单文件 PowerShell 脚本给它套了层图形界面：解压、双击、点按钮，清晰度和编码勾一下就好，不必再记 `--video-codec=h265 --max-size=1920` 这类参数。想要功能完整、跨平台，[QtScrcpy](https://github.com/barry-ran/QtScrcpy) 和 [escrcpy](https://github.com/viarotel-org/escrcpy) 更成熟；这里走的是另一条路——一个绿色便携的小工具，全中文，拷进 U 盘也能跑。
+[scrcpy](https://github.com/Genymobile/scrcpy) 是口碑最好的安卓投屏工具之一，但它只有命令行。本项目用一个单文件 PowerShell 脚本给它套了层图形界面：`--video-codec=h265` 这类参数，变成了窗口里的下拉和勾选。想要功能完整、跨平台，[QtScrcpy](https://github.com/barry-ran/QtScrcpy) 和 [escrcpy](https://github.com/viarotel-org/escrcpy) 更成熟；这里走的是另一条路——一个绿色便携的小工具，全中文，拷进 U 盘也能跑。
 
 > [!TIP]
-> 全程本地直连（数据线，或同一个 Wi-Fi），画面不经过任何服务器；手机端不 root、不装 App，只需打开「USB 调试」。
+> 全程本地直连（数据线，或同一个 Wi-Fi），画面不经过任何服务器；手机端不 root、不装 App，只需在开发者选项里打开调试开关（USB 调试或无线调试）。
 
 ## 支持范围
 

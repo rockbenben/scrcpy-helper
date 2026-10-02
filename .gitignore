@@ -17,7 +17,11 @@ scrcpy.png
 
 # superpowers 技能生成的计划/设计稿 —— 本地产物，不入库
 docs/superpowers/
+.qoder*
 
 # 系统杂项
 Thumbs.db
 .DS_Store
+
+# 设计稿预览产物（打磨工作流本地文件，不入库）
+design-preview/
