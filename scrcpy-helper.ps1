@@ -2096,7 +2096,7 @@ function Show-DeviceManager {
     $tt.SetToolTip($btnStop, '只关选中那台的镜像窗口，其它设备不受影响。')
     $tt.SetToolTip($btnAll, '给每台已连接、还没开窗的设备各开一个窗口。')
     $tt.SetToolTip($btnDefault, '多设备时，其它功能默认对这台做；再点一次取消。')
-    $tt.SetToolTip($btnDisc, '断开这台的无线连接（不影响其它设备），它仍留在「已记住」里，下次会自动连回。USB 设备请直接拔数据线。')
+    $tt.SetToolTip($btnDisc, '断开这台的无线连接，并先关掉它的投屏窗口（其它设备不受影响）。它仍留在「已记住」里，下次打开助手会自动连回，但断开后不会立刻自己偷偷连回来。想让它以后都不自动连，用「不自动连」。USB 设备请直接拔数据线。')
     $tt.SetToolTip($btnRename, '起个好认的名字，窗口标题和设备列表都会用。')
     $tt.SetToolTip($btnForget, '从「已记住」里去掉；以后连上会重新记住。设备还连着时点不动——要先「断开」（或拔掉数据线），否则它会立刻被重新记住。')
     $tt.SetToolTip($btnAuto, '不自动连：助手启动和掉线时都不再自动连这台（再点恢复自动连）。')
@@ -2224,7 +2224,12 @@ function Show-DeviceManager {
         $addr = $items[0].Tag.Serial
         Stop-DeviceScrcpy $addr   # 断开前先停掉它的投屏窗口，避免悬空
         try { Invoke-Hidden -FilePath $adb -ArgumentList @('disconnect', $addr) -DiscardStderr | Out-Null } catch {}
-        if ($settings.defaultDevice -eq $addr) { $settings.defaultDevice = ''; Save-Settings }
+        $dirty = $false
+        if ($settings.defaultDevice -eq $addr) { $settings.defaultDevice = ''; $dirty = $true }
+        # 主动断开的那台别再被 8s 轮询连回来：Reconnect-LastAsync 只认 lastWirelessAddr，不清就等于「断开没生效」。
+        # （「忘记」同理，见下面的 btnForget。）
+        if ($settings.lastWirelessAddr -eq $addr) { $settings.lastWirelessAddr = ''; $dirty = $true }
+        if ($dirty) { Save-Settings }
         & $refresh
     }) $dlg $script:dmFlow })
     $btnDefault.Add_Click({ Invoke-MainFlow ({
