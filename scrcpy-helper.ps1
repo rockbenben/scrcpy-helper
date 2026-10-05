@@ -2096,9 +2096,9 @@ function Show-DeviceManager {
     $tt.SetToolTip($btnStop, '只关选中那台的镜像窗口，其它设备不受影响。')
     $tt.SetToolTip($btnAll, '给每台已连接、还没开窗的设备各开一个窗口。')
     $tt.SetToolTip($btnDefault, '多设备时，其它功能默认对这台做；再点一次取消。')
-    $tt.SetToolTip($btnDisc, '断开这台的无线连接（不影响其它设备）。')
+    $tt.SetToolTip($btnDisc, '断开这台的无线连接（不影响其它设备），它仍留在「已记住」里，下次会自动连回。USB 设备请直接拔数据线。')
     $tt.SetToolTip($btnRename, '起个好认的名字，窗口标题和设备列表都会用。')
-    $tt.SetToolTip($btnForget, '从「已记住」里去掉；以后连上会重新记住。')
+    $tt.SetToolTip($btnForget, '从「已记住」里去掉；以后连上会重新记住。设备还连着时点不动——要先「断开」（或拔掉数据线），否则它会立刻被重新记住。')
     $tt.SetToolTip($btnAuto, '不自动连：助手启动和掉线时都不再自动连这台（再点恢复自动连）。')
 
     # refresh 把「已连接设备」「正在投屏的序列号」算一次塞进 $state；updateButtons 只读它，不再每次点都跑 adb
@@ -2214,33 +2214,33 @@ function Show-DeviceManager {
     }
 
     $lv.Add_SelectedIndexChanged($updateButtons)
-    $lv.Add_DoubleClick($rowDouble)
-    $btnConnect.Add_Click($connectSelected)
-    $btnCast.Add_Click($castSelected)
-    $btnStop.Add_Click($stopSelected)
-    $btnAll.Add_Click($castAll)
-    $btnDisc.Add_Click({
+    $lv.Add_DoubleClick({ Invoke-MainFlow ({ & $rowDouble }) $dlg $script:dmFlow })
+    $btnConnect.Add_Click({ Invoke-MainFlow ({ & $connectSelected }) $dlg $script:dmFlow })
+    $btnCast.Add_Click({ Invoke-MainFlow ({ & $castSelected }) $dlg $script:dmFlow })
+    $btnStop.Add_Click({ Invoke-MainFlow ({ & $stopSelected }) $dlg $script:dmFlow })
+    $btnAll.Add_Click({ Invoke-MainFlow ({ & $castAll }) $dlg $script:dmFlow })
+    $btnDisc.Add_Click({ Invoke-MainFlow ({
         $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
         $addr = $items[0].Tag.Serial
         Stop-DeviceScrcpy $addr   # 断开前先停掉它的投屏窗口，避免悬空
         try { Invoke-Hidden -FilePath $adb -ArgumentList @('disconnect', $addr) -DiscardStderr | Out-Null } catch {}
         if ($settings.defaultDevice -eq $addr) { $settings.defaultDevice = ''; Save-Settings }
         & $refresh
-    })
-    $btnDefault.Add_Click({
+    }) $dlg $script:dmFlow })
+    $btnDefault.Add_Click({ Invoke-MainFlow ({
         $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
         $s = $items[0].Tag.Serial
         $settings.defaultDevice = if ($settings.defaultDevice -eq $s) { '' } else { $s }   # 再点一次取消默认
         Save-Settings; & $refresh
-    })
-    $btnRename.Add_Click({
+    }) $dlg $script:dmFlow })
+    $btnRename.Add_Click({ Invoke-MainFlow ({
         $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
         $s = $items[0].Tag.Serial
         $name = [Microsoft.VisualBasic.Interaction]::InputBox("给这台设备起个名字（如 客厅电视）：", '重命名设备', (Get-FriendlyName $s))
         $name = $name.Trim()
         if ($name -and $name -ne (Get-FriendlyName $s)) { $script:deviceNames[$s] = $name; Save-Settings; & $refresh }
-    })
-    $btnForget.Add_Click({
+    }) $dlg $script:dmFlow })
+    $btnForget.Add_Click({ Invoke-MainFlow ({
         $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
         $addr = $items[0].Tag.Serial
         if ($script:knownDevices.Contains($addr)) { $script:knownDevices.Remove($addr) }
@@ -2249,16 +2249,16 @@ function Show-DeviceManager {
         # 若忘记的正是"上次无线地址"，一并清掉——否则主界面 8s 轮询会用它 Reconnect-LastAsync 连回来、再 Add-KnownDevice 把它重新记住，忘记等于白忘
         if ($settings.lastWirelessAddr -eq $addr) { $settings.lastWirelessAddr = '' }
         Save-Settings; & $refresh
-    })
-    $btnAuto.Add_Click({
+    }) $dlg $script:dmFlow })
+    $btnAuto.Add_Click({ Invoke-MainFlow ({
         $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
         $addr = $items[0].Tag.Serial
         if (-not (Test-Wireless $addr)) { return }
         Set-AutoConnectExcluded $addr (-not (Test-AutoConnectExcluded $addr))
         & $refresh
-    })
-    $btnIp.Add_Click({ if (Connect-ByIp $dlg) { & $refresh } })
-    $btnRefresh2.Add_Click($refresh)
+    }) $dlg $script:dmFlow })
+    $btnIp.Add_Click({ Invoke-MainFlow ({ if (Connect-ByIp $dlg) { & $refresh } }) $dlg $script:dmFlow })
+    $btnRefresh2.Add_Click({ Invoke-MainFlow ({ & $refresh }) $dlg $script:dmFlow })
     $btnDone.Add_Click({ $dlg.Close() })
 
     $dlg.Controls.AddRange(@($lv, $capNoDev, $line1, $line2, $capCast, $capManage,
@@ -2449,7 +2449,7 @@ try {
     $form.Controls.Add($btnGh)
     $tt.SetToolTip($btnGh, '在 GitHub 查看源码 / 反馈问题')
 
-    $tt.SetToolTip($btnWired, '用数据线连接，最稳定、延迟最低。')
+    $tt.SetToolTip($btnWired, '用数据线连接，最稳定、延迟最低。若当前没有数据线设备，这个按钮投的是已连上的那台无线设备。')
     $tt.SetToolTip($btnWireless, '不用线。已连手机时直接开始；首次可选插一次线，或 Android 11+ 用配对码免插线。')
     $tt.SetToolTip($btnCamera, '把手机摄像头当电脑摄像头用（需 Android 12+）。')
     $tt.SetToolTip($btnRecord, '把手机屏幕录制成视频文件。')
@@ -2501,14 +2501,23 @@ try {
     # 能阻塞界面 ~2.4 秒且毫无反馈，正是诱发那一次重复点击的源头，所以忙时同时挂等待光标。
     # 标志必须走「哈希表 + 引用」：闭包里写 $script:裸布尔 只改到闭包模块的副本（见 Reconnect-LastAsync 上方注释）。
     $script:mainFlow = @{ Busy = $false }
+    # 设备管理另用一把锁：它是模态窗，「设备」那条流程的锁会占满整个设备管理开着的时段，
+    # 窗内按钮若共用同一把，开完窗就全点不动了。
+    $script:dmFlow = @{ Busy = $false }
     function Invoke-MainFlow {
-        param([scriptblock]$Body)
-        if ($script:mainFlow.Busy) { & $script:showTempHint '正在处理上一步，请稍候' $cMuted 3000; return }
-        $script:mainFlow.Busy = $true
-        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        param([scriptblock]$Body, $Owner, $Flag)
+        if (-not $Flag) { $Flag = $script:mainFlow }
+        if ($Flag.Busy) {
+            # 忙时不动光标：正在跑的那条流程已经把窗口设成等待光标了，这里再设一次没人给它复位
+            & $script:showTempHint '正在处理上一步，请稍候' $cMuted 3000
+            return
+        }
+        $Flag.Busy = $true
+        $w = if ($Owner) { $Owner } else { $form }
+        $w.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         try { & $Body } finally {
-            $form.Cursor = [System.Windows.Forms.Cursors]::Default
-            $script:mainFlow.Busy = $false
+            $w.Cursor = [System.Windows.Forms.Cursors]::Default
+            $Flag.Busy = $false
         }
     }
 
