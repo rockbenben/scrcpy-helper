@@ -42,9 +42,14 @@ try {
 
 # UI 线程事件处理器里的漏网异常：默认会弹 .NET Framework 的「未经处理的异常」模态窗（还带「退出」按钮，
 # 一点就把助手整个杀掉、收尾代码全跳过）。改为记到脚本旁的错误日志里、程序照常继续，用户不被打断还留下线索。
+# 但 PipelineStoppedException 例外：它不是程序出错，而是「某个 Timer 的 tick 想在一个已经跑着脚本块的线程上
+# 再开一条管道」被 PowerShell 拒绝——典型场景是模态框开着的时候看门狗/提示还原定时器跳了一下。
+# 被拒的只是这一次 tick，定时器照旧按间隔继续跳（模态框一关就正常执行），所以既没丢状态也没卡死。
+# 记进日志反而会把真正的异常淹掉，故直接放过。
 [System.Windows.Forms.Application]::add_ThreadException([System.Threading.ThreadExceptionEventHandler]{
     param($s, $e)
     try {
+        if ($e.Exception -is [System.Management.Automation.PipelineStoppedException]) { return }
         $logPath = Join-Path $PSScriptRoot '投屏助手-错误日志.txt'
         if ((Test-Path -LiteralPath $logPath) -and ((Get-Item -LiteralPath $logPath).Length -gt 262144)) { Remove-Item -LiteralPath $logPath -Force }   # 日志封顶 256KB，超了重头记
         Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $($e.Exception)`r`n" -Encoding UTF8
