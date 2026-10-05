@@ -2492,11 +2492,27 @@ try {
     $btnShortcuts.Add_Click({ Show-Shortcuts $form })
     $btnSettings.Add_Click({ Show-Settings $form })
     # 设备管理入口：底部「设备」链接 + 右上角状态药丸都可进；关掉后刷新一次状态
-    $openDevices = { Show-DeviceManager $form; & $updateStatus }
+    $openDevices = { Invoke-MainFlow ({ Show-DeviceManager $form; & $updateStatus }) }
     $btnDevices.Add_Click($openDevices)
     $lblStatus.Add_Click($openDevices)
 
-    $btnWired.Add_Click({
+    # 主操作防重入。这些流程内部全是模态框（ShowDialog 自己会泵消息队列），期间排队的第二次点击
+    # 会被立刻派发 → 整条流程跑两遍（表现为同一个提示弹两次、叠两个设备管理窗）。而 adb 冷启动一次
+    # 能阻塞界面 ~2.4 秒且毫无反馈，正是诱发那一次重复点击的源头，所以忙时同时挂等待光标。
+    # 标志必须走「哈希表 + 引用」：闭包里写 $script:裸布尔 只改到闭包模块的副本（见 Reconnect-LastAsync 上方注释）。
+    $script:mainFlow = @{ Busy = $false }
+    function Invoke-MainFlow {
+        param([scriptblock]$Body)
+        if ($script:mainFlow.Busy) { & $script:showTempHint '正在处理上一步，请稍候' $cMuted 3000; return }
+        $script:mainFlow.Busy = $true
+        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        try { & $Body } finally {
+            $form.Cursor = [System.Windows.Forms.Cursors]::Default
+            $script:mainFlow.Busy = $false
+        }
+    }
+
+    $btnWired.Add_Click({ Invoke-MainFlow ({
         $devs = @(Ensure-Devices $form)
         if ($devs.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('没检测到手机。请用数据线连接并点「允许 USB 调试」，或点右上角的连接状态走无线连接。', '有线投屏') | Out-Null; return }
         $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
@@ -2509,9 +2525,9 @@ try {
              elseif ($settings.defaultDevice -and ($pool -contains $settings.defaultDevice)) { $settings.defaultDevice }
              else { Select-Device $form $pool '有线投屏 · 选择设备' }   # 多台同类设备 → 弹窗问要投哪台
         if ($t) { Start-Scrcpy (@('-s', $t) + (Get-MirrorArgs -Wireless:(Test-Wireless $t))) }
-    })
+    }) })
 
-    $btnWireless.Add_Click({
+    $btnWireless.Add_Click({ Invoke-MainFlow ({
         $devs = @(Ensure-Devices $form)
         $wl = @($devs | Where-Object { Test-Wireless $_ })
         $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
@@ -2566,9 +2582,9 @@ try {
                 }
             }
         }
-    })
+    }) })
 
-    $btnCamera.Add_Click({
+    $btnCamera.Add_Click({ Invoke-MainFlow ({
         $serial = Resolve-TargetForFeature $form 12 '手机当摄像头'   # 点击即定设备、查版本，不够直接弹提示并中止
         if (-not $serial) { return }
         # 自动读取这台设备真正支持的采集分辨率（约 1~2 秒），让分辨率下拉只列“一定能开”的尺寸
@@ -2713,9 +2729,9 @@ try {
                 $script:camWatch.Start()
             }
         }
-    })
+    }) })
 
-    $btnRecord.Add_Click({
+    $btnRecord.Add_Click({ Invoke-MainFlow ({
         $tgt = Resolve-Target $form
         if (-not $tgt.Ok) { if ($tgt.Reason -eq 'none') { [System.Windows.Forms.MessageBox]::Show('没检测到手机，请先连接手机再录制。', '录制屏幕') | Out-Null }; return }
         # VP8/VP9 装不进 mp4 容器(scrcpy 会直接拒)：这两种编码时强制走 mkv——默认名与筛选器都用 mkv，用户手选 mp4 也纠正回来。
@@ -2741,13 +2757,13 @@ try {
             $recTip = if ($settings.recBackground) { '● 后台录制中 · 「设备」里停止投屏即保存' } else { '● 录制中 · 关掉投屏窗口即停止并保存' }
             & $script:showTempHint $recTip $cGreen
         }
-    })
+    }) })
 
-    $btnNd.Add_Click({
+    $btnNd.Add_Click({ Invoke-MainFlow ({
         $serial = Resolve-TargetForFeature $form 11 '独立窗口'   # 点击即定设备、查版本，不够直接弹提示并中止
         if (-not $serial) { return }
         Show-NewDisplay $form $serial
-    })
+    }) })
 
     # 设备状态轮询：仅在窗口处于前台时进行；最小化/失焦自动暂停，省电省资源
     $timer = New-Object System.Windows.Forms.Timer
