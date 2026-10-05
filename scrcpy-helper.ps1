@@ -1494,6 +1494,43 @@ function Show-ManageApps {
     [void]$dlg.ShowDialog($owner)
 }
 
+# ---------------- 独立窗口：自定义虚拟屏尺寸 ----------------
+# 不能用 Interaction.InputBox：它把「取消」和「留空」都返回空串，用户点取消等于把已存的
+# 自定义尺寸静默抹掉（实测：1080x2340 → 空）。这里用带真「取消」的对话框，取消 = 什么都不改。
+function Show-CustomDisplaySize {
+    param($owner, $size, $dpi)
+    $d = New-Dialog '独立窗口 - 自定义尺寸' 360 214 $owner
+    $l1 = New-Lbl '分辨率（宽x高）：' 16 21
+    $t1 = New-Txt 150 17 190
+    $t1.Text = $size
+    $c1 = New-Caption '例 1080x2340；留空 = 跟设备一致' 16 49
+    $l2 = New-Lbl 'DPI：' 16 89
+    $t2 = New-Txt 150 85 190
+    $t2.Text = $dpi
+    $c2 = New-Caption '例 420，数值越大界面越像手机版；留空 = 默认' 16 117
+    $ok = New-PrimaryBtn '确定' 150 160 96 34 10
+    $cancel = New-SecondaryBtn '取消' 254 160 86 34
+    $ok.Add_Click({
+        $s = $t1.Text.Trim(); $p = $t2.Text.Trim()
+        if ($s -and $s -notmatch '^\d{3,4}x\d{3,4}$') {
+            [System.Windows.Forms.MessageBox]::Show('分辨率格式应为 宽x高（用小写字母 x），例如 1080x2340。留空表示跟设备一致。', '独立窗口') | Out-Null
+            return
+        }
+        if ($p -and $p -notmatch '^\d+$') {
+            [System.Windows.Forms.MessageBox]::Show('DPI 应为纯数字，例如 420。留空表示用默认。', '独立窗口') | Out-Null
+            return
+        }
+        $d.Tag = @{ Size = $s; Dpi = $p }
+        $d.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    })
+    $cancel.Add_Click({ $d.DialogResult = [System.Windows.Forms.DialogResult]::Cancel })
+    $d.Controls.AddRange(@($l1, $t1, $c1, $l2, $t2, $c2, $ok, $cancel))
+    $d.AcceptButton = $ok
+    $d.CancelButton = $cancel
+    if ($d.ShowDialog($owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+    return $d.Tag
+}
+
 # ---------------- 独立窗口：选 App ----------------
 function Show-NewDisplay {
     param($owner, $serial)
@@ -1570,16 +1607,9 @@ function Show-NewDisplay {
             }
             'landscape' { $ndSz = '1920x1080'; $ndDpi = '240'; $autoFit = $true }
             'custom'    {
-                $ndSz  = ([Microsoft.VisualBasic.Interaction]::InputBox("分辨率（宽x高），如 1080x2340。`n留空 = 跟设备一致。", '独立窗口 - 自定义尺寸', $settings.ndSize)).Trim()
-                if ($ndSz -and $ndSz -notmatch '^\d{3,4}x\d{3,4}$') {
-                    [System.Windows.Forms.MessageBox]::Show('分辨率格式应为 宽x高（用小写字母 x），例如 1080x2340。留空表示跟设备一致。', '独立窗口') | Out-Null
-                    return
-                }
-                $ndDpi = ([Microsoft.VisualBasic.Interaction]::InputBox("DPI（数字），如 420。留空 = 默认。`n数值越大，应用界面越像手机版。", '独立窗口 - 自定义 DPI', $settings.ndDpi)).Trim()
-                if ($ndDpi -and $ndDpi -notmatch '^\d+$') {
-                    [System.Windows.Forms.MessageBox]::Show('DPI 应为纯数字，例如 420。留空表示用默认。', '独立窗口') | Out-Null
-                    return
-                }
+                $ask = Show-CustomDisplaySize $dlg $settings.ndSize $settings.ndDpi
+                if (-not $ask) { return }   # 取消 = 整个「打开独立窗口」作废，已存的尺寸/DPI 一个字都不动
+                $ndSz = $ask.Size; $ndDpi = $ask.Dpi
                 $settings.ndSize = $ndSz; $settings.ndDpi = $ndDpi
             }
         }
@@ -2098,7 +2128,7 @@ function Show-DeviceManager {
     $tt.SetToolTip($btnDefault, '多设备时，其它功能默认对这台做；再点一次取消。')
     $tt.SetToolTip($btnDisc, '断开这台的无线连接，并先关掉它的投屏窗口（其它设备不受影响）。它仍留在「已记住」里，下次打开助手会自动连回，但断开后不会立刻自己偷偷连回来。想让它以后都不自动连，用「不自动连」。USB 设备请直接拔数据线。')
     $tt.SetToolTip($btnRename, '起个好认的名字，窗口标题和设备列表都会用。')
-    $tt.SetToolTip($btnForget, '从「已记住」里去掉；以后连上会重新记住。设备还连着时点不动——要先「断开」（或拔掉数据线），否则它会立刻被重新记住。')
+    $tt.SetToolTip($btnForget, '从「已记住」里去掉，这台设备的自定义名字和「默认设备」标记也一并清掉；以后连上会重新记住。设备还连着时点不动——要先「断开」（或拔掉数据线），否则它会立刻被重新记住。')
     $tt.SetToolTip($btnAuto, '不自动连：助手启动和掉线时都不再自动连这台（再点恢复自动连）。')
 
     # refresh 把「已连接设备」「正在投屏的序列号」算一次塞进 $state；updateButtons 只读它，不再每次点都跑 adb
@@ -2577,7 +2607,19 @@ try {
             if ($pick.Tag -eq 'cable') {
                 $msg = "请用数据线把手机连上电脑，并点「允许 USB 调试」。`n`n连好后点「确定」，会自动切到无线（连上后即可拔掉数据线）。`n若手机重启过导致连不上，也请重新插线再点一次。"
                 if ([System.Windows.Forms.MessageBox]::Show($msg, '无线投屏', 'OKCancel', 'Information') -eq 'OK') {
-                    Start-Scrcpy (@('--tcpip') + (Get-MirrorArgs -Wireless:$true))
+                    # 点完确定必须重新数一遍设备：不带 -s 的 scrcpy 遇到「还没插线」会报 Could not find any
+                    # ADB device、遇到「插着两台」会报 Multiple (2) ADB devices 然后退出，而控制台默认隐藏——
+                    # 用户看到的就是「点了确定什么都没发生」。
+                    $devs = @(Get-DeviceList)
+                    if ($devs.Count -eq 0) {
+                        [System.Windows.Forms.MessageBox]::Show('还是没检测到手机。请插好数据线、在手机上点「允许 USB 调试」，再点一次「无线投屏」。', '无线投屏') | Out-Null
+                        return
+                    }
+                    $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
+                    $t = if ($usb.Count -eq 1) { $usb[0] }
+                         elseif ($devs.Count -eq 1) { $devs[0] }
+                         else { Select-Device $form $devs '无线投屏 · 选择设备' }
+                    if ($t) { Start-Scrcpy (@('-s', $t, '--tcpip') + (Get-MirrorArgs -Wireless:$true)) }
                 }
             }
             elseif ($pick.Tag -eq 'pair') {
