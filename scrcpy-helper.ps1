@@ -225,7 +225,7 @@ $apps = [ordered]@{
 # 用 [ordered] 有序表：保存出来的 JSON 键顺序就按下面的分组排（画面/声音/控制/…），不再是哈希随机序、看着乱。
 $defaults = [ordered]@{
     # 画面
-    maxSize = 1496; maxFps = 0; bitRate = 0; videoCodec = ''; crop = ''; ignoreEncoderConstraints = $false
+    maxSize = 1496; maxFps = 0; bitRate = 0; videoCodec = ''; crop = ''; hwDec = ''; ignoreEncoderConstraints = $false
     # 声音
     audioOn = $true; audioSource = ''; audioCodec = ''
     # 控制
@@ -401,6 +401,13 @@ if (-not (Test-Path -LiteralPath $exe)) {
 }
 
 # ---------------- 参数拼接 ----------------
+# 解码方式：不选就什么都不传（scrcpy 自己优先用显卡解码，显卡解不了它会回落软件解码）。
+# 选「软件解码」= --hwdec=disabled，是画面花屏/偏色/黑屏时排除显卡兼容问题的开关。
+# 摄像头、独立窗口两段自己拼参数数组、不走 Get-VideoArgs，所以它们要单独带上这个（录制走 Get-VideoArgs，已覆盖）。
+function Get-HwDecArgs {
+    if ($settings.hwDec) { return @("--hwdec=$($settings.hwDec)") }
+    return @()
+}
 function Get-VideoArgs {
     $a = @()
     if ([int]$settings.maxSize -gt 0) { $a += @('-m', "$($settings.maxSize)") }
@@ -408,6 +415,7 @@ function Get-VideoArgs {
     if ([int]$settings.bitRate -gt 0) { $a += "--video-bit-rate=$($settings.bitRate)M" }
     if ($settings.videoCodec)         { $a += "--video-codec=$($settings.videoCodec)" }
     if ($settings.crop)               { $a += "--crop=$($settings.crop)" }
+    $a += @(Get-HwDecArgs)
     # 忽略机型上报的编码器分辨率约束(含对齐)：某些机型上报值不准，导致分辨率/独立窗口选不对时的兜底。scrcpy 4.1+ 参数。
     if ($settings.ignoreEncoderConstraints) { $a += '--ignore-video-encoder-constraints' }
     return $a
@@ -1161,6 +1169,8 @@ function Show-Settings {
     $txtCrop.Text = $settings.crop
     $chkIgnoreEnc = New-Chk '忽略编码器分辨率约束（分辨率/独立窗口选不对时再勾）' $settings.ignoreEncoderConstraints 14 184
     $tt.SetToolTip($chkIgnoreEnc, '高级兜底：某些机型上报的编码器限制值不准，导致分辨率或独立窗口画面不对。勾上让 scrcpy 完全忽略这些限制（含对齐要求）。一般不用勾。需 scrcpy 4.1+。')
+    $cbHwDec = New-Combo @('自动（用显卡解码，省电脑性能）', '软件解码（画面不对时再选）') @('', 'disabled') $settings.hwDec 110 220 230
+    $tt.SetToolTip($cbHwDec, '电脑怎么把收到的画面还原出来。自动=优先让显卡干活，CPU 占用能低一个数量级、笔记本更省电，显卡干不了会自动改用 CPU。要是投屏出现花屏、偏色或整块变黑，改成「软件解码」再投，就能排除显卡的兼容问题；它更吃 CPU，平时不用选。')
     $tt.SetToolTip($nudFps, '每秒帧数上限。0=用默认；填 60 更顺滑、填 30 更省资源。')
     $tt.SetToolTip($nudBit, '视频码率（Mbps）。越高越清晰越占带宽；0=用默认（约 8M）。无线卡顿可调小。')
     $tt.SetToolTip($cbVCodec, 'H.265/AV1 同等清晰度更省带宽，但老机型/老电脑可能不支持，卡顿就换回 H.264。VP8/VP9 仅当机型这几种都不支持时才用作兜底；它们装不进 mp4，录屏会自动转存 mkv。')
@@ -1171,7 +1181,8 @@ function Show-Settings {
         (New-Lbl '视频编码：' 14 91), $cbVCodec,
         (New-Lbl '裁剪画面：' 14 127), $txtCrop,
         (New-Caption '宽:高:左:上，留空=投整屏。例 1080:1080:0:300' 14 156),
-        $chkIgnoreEnc))
+        $chkIgnoreEnc,
+        (New-Lbl '解码方式：' 14 223), $cbHwDec))
 
     # ===== 声音 =====
     $tabAudio = New-Object System.Windows.Forms.Panel
@@ -1321,6 +1332,7 @@ function Show-Settings {
         $settings.bitRate    = [int]$nudBit.Value
         $settings.videoCodec = $cbVCodec.Vals[$cbVCodec.SelectedIndex]
         $settings.crop       = $cropText
+        $settings.hwDec      = $cbHwDec.Vals[$cbHwDec.SelectedIndex]
         $settings.ignoreEncoderConstraints = $chkIgnoreEnc.Checked
         $settings.audioOn    = $chkAudio.Checked
         $settings.audioSource = $cbASrc.Vals[$cbASrc.SelectedIndex]
@@ -1583,7 +1595,7 @@ function Show-NewDisplay {
         # 虚拟屏保留系统装饰（状态栏/导航栏）：去掉 --no-vd-system-decorations 后，像微信这种 App 会把自己的顶栏
         # 同时画进「状态栏预留区」和正常位置，出现「两条一样的顶栏」；保留系统栏则是正常的「状态栏+单顶栏」手机观感。
         # @() 防单元素退化粘连（同 Get-MirrorArgs 处的坑）：$pre 为空时 $null+单元素串 会变字符串拼接
-        Start-Scrcpy ($pre + @(Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + "--start-app=$target") -AudioMode $effAudio
+        Start-Scrcpy ($pre + @(Get-HwDecArgs) + @(Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + "--start-app=$target") -AudioMode $effAudio
     }
 }
 
@@ -2684,6 +2696,7 @@ try {
             if ($rbPort.Checked) { $a += $(if ($rbFront.Checked) { '--capture-orientation=270' } else { '--capture-orientation=90' }) }
             if ($chkTorch.Checked) { $a += '--camera-torch' }
             if ($chkMic.Checked) { $a += '--audio-source=mic' } else { $a += '--no-audio' }
+            $a += @(Get-HwDecArgs)
             # 交给看门狗盯着（$script:camWatch）：只管「亮屏被抢自动重连」；分辨率带不动已交给 scrcpy 4.1 原生降档，看门狗不再手动换档
             # 同一台的旧会话先标停：用户重新从面板开摄像头 = 放弃旧会话，否则两个会话的看门狗会抢着拉进程
             foreach ($old in @($script:camSessions)) { if ($old.Serial -eq $serial) { $old.Stopped = $true; $old.SkipZoom = $true } }
