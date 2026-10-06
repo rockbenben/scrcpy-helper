@@ -1112,7 +1112,7 @@ function New-EscCancel {
 
 function Show-Settings {
     param($owner)
-    $dlg = New-Dialog '设置' 570 340 $owner
+    $dlg = New-Dialog '设置' 570 356 $owner
     $tt = New-Object System.Windows.Forms.ToolTip
     $tt.AutoPopDelay = 12000
 
@@ -1120,7 +1120,7 @@ function Show-Settings {
     # 右侧是对应的设置面板，按选中项切换显示。
     $nav = New-Object System.Windows.Forms.ListBox
     $nav.Location = New-Object System.Drawing.Point(16, 14)
-    $nav.Size = New-Object System.Drawing.Size(110, 264)
+    $nav.Size = New-Object System.Drawing.Size(110, 280)
     $nav.BorderStyle = 'None'; $nav.BackColor = $cPaper
     $nav.DrawMode = 'OwnerDrawFixed'; $nav.ItemHeight = 33; $nav.IntegralHeight = $false
     $nav.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10.5)
@@ -1142,19 +1142,19 @@ function Show-Settings {
         $fg.Dispose(); $f.Dispose()
     })
     $navDivider = New-Object System.Windows.Forms.Panel
-    $navDivider.Size = New-Object System.Drawing.Size(1, 264); $navDivider.Location = New-Object System.Drawing.Point(133, 14); $navDivider.BackColor = $cLine
+    $navDivider.Size = New-Object System.Drawing.Size(1, 280); $navDivider.Location = New-Object System.Drawing.Point(133, 14); $navDivider.BackColor = $cLine
 
     # ===== 常用（把最常用 / 最重要的几项聚合在第一页） =====
     $tabCommon = New-Object System.Windows.Forms.Panel
     # 顺序按使用度：人人都调的清晰度/声音在前，只无线用户才碰的两项次之，调试用的控制台沉到最后
-    $nudSize = New-Nud $settings.maxSize 0 4096 16 250 13
+    $nudSize = New-Nud $settings.maxSize 0 4096 16 110 13
     $chkAudio = New-Chk '把手机声音也传到电脑' $settings.audioOn 14 46
     $chkStay = New-Chk '保持手机唤醒（避免锁屏 / 无线中途断开）' $settings.stayAwake 14 74
     $chkScreenOff = New-Chk '投屏时关闭手机屏幕（省电、防偷看）' $settings.screenOff 14 102
     $chkReconnect = New-Chk '自动连接记住的无线设备（开机自动连附近的 · 掉线自动重连）' $settings.autoConnect 14 130
     $chkDisconnect = New-Chk '关闭助手时断开无线连接（默认保持，重开即用）' $settings.disconnectOnClose 14 158
     $chkShowConsole = New-Chk '显示 scrcpy 控制台窗口（调试用，会弹黑窗）' $settings.showConsole 14 186
-    $tt.SetToolTip($nudSize, '画面最大边长（像素）。数值越大越清晰、越小越流畅；0=原画不限制。')
+    $tt.SetToolTip($nudSize, '画面最大边长（像素）。数值越大越清晰、越小越流畅；不填=不限制。')
     $tt.SetToolTip($chkAudio, '取消勾选则完全不传声音（等同 --no-audio）。')
     $tt.SetToolTip($chkStay, '保持手机不锁屏，避免无线投屏中途断开。想更省电可关掉，让手机自然休眠。')
     $tt.SetToolTip($chkScreenOff, '投屏时关掉手机屏幕，明显省电、还能防偷看（投屏照常进行）。无线投屏想省电首选它。')
@@ -1162,64 +1162,71 @@ function Show-Settings {
     $tt.SetToolTip($chkDisconnect, '不勾（默认）：关掉助手后仍保持手机连接，重开即用、几乎不耗电。勾上：关助手时一并断开无线连接，重开需重新连（可能要再插一次线）。')
     $tt.SetToolTip($chkShowConsole, '勾上后投屏时会弹出一个黑色控制台窗口，里面显示 scrcpy 的运行日志。默认关闭，不影响正常使用。')
     $tabCommon.Controls.AddRange(@(
-        (New-Lbl '清晰度（越大越清晰，0=原画）' 14 16), $nudSize,
+        (New-Lbl '清晰度：' 14 16), $nudSize, (New-Caption '越大越清晰，不填=不限制' 210 19),
         $chkAudio, $chkStay, $chkScreenOff, $chkReconnect, $chkDisconnect, $chkShowConsole))
 
     # ===== 画面 =====
     $tabVideo = New-Object System.Windows.Forms.Panel
-    $nudFps  = New-Nud $settings.maxFps  0 240 5  250 16
-    $nudBit  = New-Nud $settings.bitRate 0 50  1  250 52
+    $nudFps  = New-Nud $settings.maxFps  0 240 5  110 16
+    $nudBit  = New-Nud $settings.bitRate 0 50  1  110 52
     $cbVCodec = New-Combo @('默认（H.264，兼容最好）', 'H.265（更清晰）', 'AV1（更省流量）', 'VP8（兜底）', 'VP9（兜底）') @('', 'h265', 'av1', 'vp8', 'vp9') $settings.videoCodec 110 88 230
     $txtCrop = New-Txt 110 124 230
     $txtCrop.Text = $settings.crop
-    $chkIgnoreEnc = New-Chk '忽略编码器分辨率约束（分辨率/独立窗口选不对时再勾）' $settings.ignoreEncoderConstraints 14 184
+    $chkIgnoreEnc = New-Chk '忽略编码器分辨率限制（分辨率或独立窗口画面不对时再勾）' $settings.ignoreEncoderConstraints 14 184
     $tt.SetToolTip($chkIgnoreEnc, '高级兜底：某些机型上报的编码器限制值不准，导致分辨率或独立窗口画面不对。勾上让 scrcpy 完全忽略这些限制（含对齐要求）。一般不用勾。需 scrcpy 4.1+。')
-    $cbHwDec = New-Combo @('自动（用显卡解码，省电脑性能）', '软件解码（画面不对时再选）') @('', 'disabled') $settings.hwDec 110 220 230
+    $cbHwDec = New-Combo @('自动（用显卡解码，省电脑性能）', '软件解码（画面不对时再选）') @('', 'disabled') $settings.hwDec 110 217 230
     $tt.SetToolTip($cbHwDec, '电脑怎么把收到的画面还原出来。自动=优先让显卡干活，CPU 占用能低一个数量级、笔记本更省电，显卡干不了会自动改用 CPU。要是投屏出现花屏、偏色或整块变黑，改成「软件解码」再投，就能排除显卡的兼容问题；它更吃 CPU，平时不用选。')
-    $tt.SetToolTip($nudFps, '每秒帧数上限。0=用默认；填 60 更顺滑、填 30 更省资源。')
-    $tt.SetToolTip($nudBit, '视频码率（Mbps）。越高越清晰越占带宽；0=用默认（约 8M）。无线卡顿可调小。')
+    $tt.SetToolTip($nudFps, '每秒帧数上限。不填=用默认；填 60 更顺滑、填 30 更省资源。')
+    $tt.SetToolTip($nudBit, '视频码率（Mbps）。越高越清晰越占带宽；不填=用默认（约 8M）。无线卡顿可调小。')
     $tt.SetToolTip($cbVCodec, 'H.265/AV1 同等清晰度更省带宽，但老机型/老电脑可能不支持，卡顿就换回 H.264。VP8/VP9 仅当机型这几种都不支持时才用作兜底；它们装不进 mp4，录屏会自动转存 mkv。')
-    $tt.SetToolTip($txtCrop, '只投屏幕的一块区域。格式 宽:高:左:上（像素），例如 1080:1080:0:300。留空=投整屏。')
+    $tt.SetToolTip($txtCrop, '只投屏幕的一块区域。格式 宽:高:左:上（像素），例如 1080:1080:0:300。不填=投整屏。')
     $tabVideo.Controls.AddRange(@(
-        (New-Lbl '帧率（越高越流畅，0=默认）' 14 19), $nudFps,
-        (New-Lbl '画质（越高越清晰，0=默认）' 14 55), $nudBit,
+        (New-Lbl '帧率：' 14 19), $nudFps, (New-Caption '越高越流畅，不填=默认' 210 21),
+        (New-Lbl '画质：' 14 55), $nudBit, (New-Caption '越高越清晰，不填=默认' 210 57),
         (New-Lbl '视频编码：' 14 91), $cbVCodec,
         (New-Lbl '裁剪画面：' 14 127), $txtCrop,
-        (New-Caption '宽:高:左:上，留空=投整屏。例 1080:1080:0:300' 14 156),
+        (New-Caption '宽:高:左:上，不填=投整屏。例 1080:1080:0:300' 110 156),
         $chkIgnoreEnc,
-        (New-Lbl '解码方式：' 14 223), $cbHwDec))
+        (New-Lbl '解码方式：' 14 220), $cbHwDec,
+        (New-Caption '画面花屏、偏色或整块变黑时，改成「软件解码」再投一次' 110 249)))
 
     # ===== 声音 =====
     $tabAudio = New-Object System.Windows.Forms.Panel
-    $cbASrc = New-Combo @('手机外放声音', '麦克风') @('', 'mic') $settings.audioSource 110 50 230
-    $cbACodec = New-Combo @('默认（Opus）', 'AAC（兼容）', 'FLAC（无损）', '原始 PCM') @('', 'aac', 'flac', 'raw') $settings.audioCodec 110 88 230
-    $lblAudioTip = New-Lbl '是否传声音，请到「常用」页开关。下面是进阶项：' 14 18; $lblAudioTip.ForeColor = $cMuted
+    $cbASrc = New-Combo @('手机外放声音', '麦克风') @('', 'mic') $settings.audioSource 110 73 230
+    $cbACodec = New-Combo @('默认（Opus）', 'AAC（兼容）', 'FLAC（无损）', '原始 PCM') @('', 'aac', 'flac', 'raw') $settings.audioCodec 110 111 230
+    # 主开关在「常用」页也有一个：两扇页同时存在，勾选状态必须互相同步，否则保存时后读的会把先改的抹掉
+    $chkAudio2 = New-Chk '把手机声音也传到电脑' $settings.audioOn 14 18
+    $chkAudio2.Add_CheckedChanged({ $chkAudio.Checked = $chkAudio2.Checked }.GetNewClosure())
+    $chkAudio.Add_CheckedChanged({ $chkAudio2.Checked = $chkAudio.Checked }.GetNewClosure())
+    $lblAudioTip = New-Caption '不勾就完全不出声。下面两项只在勾选时生效：' 14 46
     $tt.SetToolTip($cbASrc, '「手机外放声音」把手机正在播放的声音传到电脑；「麦克风」采集手机话筒，适合当摄像头/直播。')
     $tt.SetToolTip($cbACodec, '一般保持默认即可；个别播放器不出声时可改 AAC。')
     $tabAudio.Controls.AddRange(@(
         $lblAudioTip,
-        (New-Lbl '声音来源：' 14 53), $cbASrc,
-        (New-Lbl '音频编码：' 14 91), $cbACodec))
+        $chkAudio2,
+        (New-Lbl '声音来源：' 14 76), $cbASrc,
+        (New-Lbl '音频编码：' 14 114), $cbACodec))
 
     # ===== 控制 =====
     $tabCtrl = New-Object System.Windows.Forms.Panel
-    $cbKb = New-Combo @('默认（推荐，能打中文）', '游戏模式（更跟手，不能打中文）', 'USB 直连（特殊情况）') @('', 'uhid', 'aoa') $settings.keyboard 110 13 300
-    $cbMouse = New-Combo @('默认（推荐）', '游戏模式（更跟手）', 'USB 直连（特殊情况）') @('', 'uhid', 'aoa') $settings.mouse 110 49 300
+    $cbKb = New-Combo @('默认（推荐，能打中文）', '游戏模式（更跟手，用不了电脑输入法）', 'USB 直连（特殊情况）') @('', 'uhid', 'aoa') $settings.keyboard 110 13 300
+    $cbMouse = New-Combo @('默认（推荐）', '游戏模式（更跟手）', 'USB 直连（特殊情况）') @('', 'uhid', 'aoa') $settings.mouse 110 89 300
     # 顺序按使用度：键鼠模式在前，常用的「只投屏」「关窗息屏」次之，niche 的触摸点 / 手柄沉底
-    $chkNoCtrl = New-Chk '只投屏，不允许控制手机' $settings.noControl 14 86
-    $chkPowerOff = New-Chk '结束投屏后熄灭手机屏幕' $settings.powerOffOnClose 14 114
-    $chkTouches = New-Chk '显示触摸点' $settings.showTouches 14 142
-    $chkGamepad = New-Chk '启用手柄（把电脑手柄映射到手机）' $settings.gamepad 14 170
+    $chkNoCtrl = New-Chk '只投屏，不允许控制手机' $settings.noControl 14 126
+    $chkPowerOff = New-Chk '结束投屏后熄灭手机屏幕' $settings.powerOffOnClose 14 154
+    $chkTouches = New-Chk '显示触摸点' $settings.showTouches 14 182
+    $chkGamepad = New-Chk '启用手柄（把电脑手柄映射到手机）' $settings.gamepad 14 210
     $tt.SetToolTip($chkTouches, '手机画面上触点处显示小白点，演示时让别人看清你点了哪里。')
-    $tt.SetToolTip($cbKb, '绝大多数人选「默认」即可，能正常用中文输入法。「游戏模式」让电脑键盘像真键盘一样直接控制游戏，但用不了中文输入法。')
+    $tt.SetToolTip($cbKb, '绝大多数人选「默认」即可，能正常用电脑上的中文输入法。「游戏模式」让电脑键盘像真键盘一样直接控制游戏，但用不了电脑输入法——想打字就改用手机屏幕上的输入法。装过 ADBKeyboard 这类输入法时可在手机上正常打字。')
     $tt.SetToolTip($chkNoCtrl, '只看画面、禁止鼠标键盘操作手机，适合演示/防误触。')
     $tt.SetToolTip($chkPowerOff, '结束投屏（关掉投屏窗口）时，顺手把手机屏幕熄灭，省电、防亮屏。')
     $tt.SetToolTip($chkGamepad, '把连在电脑上的游戏手柄映射给手机，适合手游。')
-    $capKbCn = New-Caption "中文打不进投屏窗口？这是 scrcpy 的已知限制：输入法「组词」阶段的字它收不到。`n· 临时：电脑里复制好，再到投屏窗口按 Ctrl+V 粘贴。`n· 彻底：手机装「ADBKeyboard」，或键盘模式选「游戏模式」用手机输入法。" 14 196
-    $capKbCn.MaximumSize = New-Object System.Drawing.Size(396, 0)   # 不限宽会把最长行裁出面板右缘
+    # 说明紧跟「键盘模式」，两行封顶：离得远用户不知道它讲的是哪一项，长段落还会折出孤儿字
+    $capKbCn = New-Caption "打不进中文？电脑里复制好，到投屏窗口按 Ctrl+V 粘贴。`n或选「游戏模式」，改用手机自己的输入法打字。" 14 44
+    $capKbCn.MaximumSize = New-Object System.Drawing.Size(396, 0)   # 不限宽会裁出面板右缘；窄于 396 第一行就折出孤儿字
     $tabCtrl.Controls.AddRange(@(
         (New-Lbl '键盘模式：' 14 16), $cbKb,
-        (New-Lbl '鼠标模式：' 14 52), $cbMouse,
+        (New-Lbl '鼠标模式：' 14 92), $cbMouse,
         $chkNoCtrl, $chkPowerOff, $chkTouches, $chkGamepad, $capKbCn))
 
     # ===== 窗口 =====
@@ -1238,30 +1245,32 @@ function Show-Settings {
     $tabNd = New-Object System.Windows.Forms.Panel
     $cbNdSize = New-Object System.Windows.Forms.ComboBox
     $cbNdSize.DropDownStyle = 'DropDown'
-    $cbNdSize.Location = New-Object System.Drawing.Point(14, 42); $cbNdSize.Size = New-Object System.Drawing.Size(200, 26)
+    $cbNdSize.Location = New-Object System.Drawing.Point(110, 15); $cbNdSize.Size = New-Object System.Drawing.Size(200, 26)
     @('跟手机一致', '1280x720', '1600x900', '1920x1080') | ForEach-Object { [void]$cbNdSize.Items.Add($_) }
     $cbNdSize.Text = if ($settings.ndSize) { $settings.ndSize } else { '跟手机一致' }
-    $cbNdDpi = New-Combo @('自动', '小', '中', '大') @('', '160', '240', '320') $settings.ndDpi 110 79 110
-    $chkNoDecor = New-Chk '隐藏独立窗口顶部的手机状态栏' $settings.ndNoDecor 14 116
+    $cbNdDpi = New-Combo @('自动', '小', '中', '大') @('', '160', '240', '320') $settings.ndDpi 110 73 110
+    $chkNoDecor = New-Chk '隐藏独立窗口顶部的手机状态栏' $settings.ndNoDecor 14 110
     $tt.SetToolTip($cbNdSize, '独立窗口（虚拟显示器）的分辨率。可直接输入自定义值，如 2560x1440。')
     $tt.SetToolTip($cbNdDpi, '虚拟屏里界面元素的大小。手机 App 显示太大就选「小」。')
     $tt.SetToolTip($chkNoDecor, '独立窗口顶部不再显示时间/电量那一条，App 内容顶到边；隐藏后通知栏也拉不出来。')
     $tabNd.Controls.AddRange(@(
-        (New-Lbl '分辨率（可直接输入，如 2560x1440）：' 14 17), $cbNdSize,
-        (New-Lbl '界面缩放：' 14 82), $cbNdDpi,
+        (New-Lbl '分辨率：' 14 18), $cbNdSize,
+        (New-Caption '可直接输入，如 2560x1440；不填=跟手机一致' 110 46),
+        (New-Lbl '界面缩放：' 14 76), $cbNdDpi,
         $chkNoDecor))
 
     # ===== 录制 =====
     $tabRec = New-Object System.Windows.Forms.Panel
     $cbRecFmt = New-Combo @('mp4', 'mkv') @('mp4', 'mkv') $settings.recFormat 110 15 110
-    $nudTime = New-Nud $settings.recTimeLimit 0 86400 10 250 51
-    $chkRecBg = New-Chk '后台录制（不显示画面，更省资源）' $settings.recBackground 14 90
-    $tt.SetToolTip($nudTime, '到达该秒数自动停止录制。0=不限时，手动关窗即停。')
+    $nudTime = New-Nud $settings.recTimeLimit 0 86400 10 110 77
+    $chkRecBg = New-Chk '后台录制（不显示画面，更省资源）' $settings.recBackground 14 114
+    $tt.SetToolTip($nudTime, '到达该秒数自动停止录制。不填=不限时，手动关窗即停。')
     $tt.SetToolTip($cbRecFmt, 'mp4 通用好打开；mkv 更稳——录制中途若被强退，mp4 可能整段丢失，mkv 一般能保住已录部分。')
     $tt.SetToolTip($chkRecBg, '勾选后录制时不弹出投屏窗口，画面只写入文件，更省 CPU。')
     $tabRec.Controls.AddRange(@(
         (New-Lbl '保存格式：' 14 18), $cbRecFmt,
-        (New-Lbl '录制时长上限（秒，0=不限）：' 14 54), $nudTime,
+        (New-Caption 'mp4 好打开；担心中途被强退丢整段，选 mkv 更稳' 110 46),
+        (New-Lbl '录制时长：' 14 80), $nudTime, (New-Caption '秒，不填=不限时长' 210 82),
         $chkRecBg))
 
     # ===== 通用 =====
@@ -1271,10 +1280,10 @@ function Show-Settings {
     $txtExtra.Text = $settings.extraArgs
     $lblExHint = New-Lbl '例如：--angle=90   --display-id=1   --time-limit=300' 14 108; $lblExHint.ForeColor = $cMuted
     $tt.SetToolTip($chkLive, '它只决定窗口顶部「已连接/未连接」多久自动更新一次，不影响投屏。开着时仅在窗口处于前台才每几秒刷一次；关掉后改为手动点「刷新」，更省资源。')
-    $tt.SetToolTip($txtExtra, '高级用法（看不懂就留空，不影响正常使用）：在这里追加 scrcpy 命令行参数，会拼到启动命令末尾，多个用空格分隔。例如 --crop=1080:1920:0:0（裁剪画面）、--angle=90（旋转）、--display-id=1（指定屏幕）。')
+    $tt.SetToolTip($txtExtra, '高级用法（可选，一般不用填）：在这里追加 scrcpy 命令行参数，会拼到启动命令末尾，多个用空格分隔。例如 --crop=1080:1920:0:0（裁剪画面）、--angle=90（旋转）、--display-id=1（指定屏幕）。')
 
     # 自定义 adb / scrcpy 路径（留空=用本助手同目录自带的）
-    $lblPathHdr = New-Lbl '自定义 adb / scrcpy 路径（留空 = 用自带的）：' 14 150; $lblPathHdr.ForeColor = $cMuted
+    $lblPathHdr = New-Lbl '自定义 adb / scrcpy 路径（不填=用自带的）：' 14 150; $lblPathHdr.ForeColor = $cMuted
     $lblAdbCap = New-Lbl 'adb' 14 181
     $txtAdbPath = New-Txt 66 177 248
     $txtAdbPath.Text = $settings.adbPath
@@ -1295,18 +1304,18 @@ function Show-Settings {
         if ($txtScrcpyPath.Text -and (Test-Path -LiteralPath $txtScrcpyPath.Text)) { try { $ofd.InitialDirectory = Split-Path -Parent $txtScrcpyPath.Text } catch {} }
         if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txtScrcpyPath.Text = $ofd.FileName }
     }.GetNewClosure())
-    $tt.SetToolTip($txtAdbPath, 'adb.exe 路径。留空 = 优先用所选 scrcpy 旁边的 adb、没有再用自带的；填了也让 scrcpy 用同一个 adb。保存即时生效。')
-    $tt.SetToolTip($txtScrcpyPath, 'scrcpy.exe 路径。留空 = 用自带的；想用电脑里别处 / 更新版的 scrcpy 时填。保存即时生效。')
+    $tt.SetToolTip($txtAdbPath, 'adb.exe 路径。不填=优先用所选 scrcpy 旁边的 adb、没有再用自带的；填了也让 scrcpy 用同一个 adb。保存即时生效。')
+    $tt.SetToolTip($txtScrcpyPath, 'scrcpy.exe 路径。不填=用自带的；想用电脑里别处 / 更新版的 scrcpy 时填。保存即时生效。')
 
     $tabGen.Controls.AddRange(@(
         $chkLive,
-        (New-Lbl '高级·其它命令行参数（看不懂就留空，多个用空格隔开）：' 14 52), $txtExtra, $lblExHint,
+        (New-Lbl '其它命令行参数（可选，一般不用填；多个用空格隔开）：' 14 52), $txtExtra, $lblExHint,
         $lblPathHdr, $lblAdbCap, $txtAdbPath, $btnAdbBrowse, $lblScrcpyCap, $txtScrcpyPath, $btnScrcpyBrowse))
 
     # 把 8 个面板叠放到右侧内容区，只显示选中的那个；导轨切换驱动显示
     $panels = @($tabCommon, $tabVideo, $tabAudio, $tabCtrl, $tabWin, $tabNd, $tabRec, $tabGen)
     foreach ($p in $panels) {
-        $p.Location = New-Object System.Drawing.Point(142, 14); $p.Size = New-Object System.Drawing.Size(412, 264)
+        $p.Location = New-Object System.Drawing.Point(142, 14); $p.Size = New-Object System.Drawing.Size(412, 280)
         $p.BackColor = $cPaper; $p.Visible = $false; $dlg.Controls.Add($p)
     }
     @('常用', '画面', '声音', '控制', '窗口', '独立窗口', '录制', '通用') | ForEach-Object { [void]$nav.Items.Add($_) }
@@ -1317,9 +1326,9 @@ function Show-Settings {
     $dlg.Controls.Add($nav); $dlg.Controls.Add($navDivider)
     $nav.SelectedIndex = 0
 
-    $btnSave = New-PrimaryBtn '保存' 358 292 96 34 10
+    $btnSave = New-PrimaryBtn '保存' 358 308 96 34 10
     $btnCancel = New-Object System.Windows.Forms.Button
-    $btnCancel.Text = '取消'; $btnCancel.Size = New-Object System.Drawing.Size(96, 34); $btnCancel.Location = New-Object System.Drawing.Point(458, 292)
+    $btnCancel.Text = '取消'; $btnCancel.Size = New-Object System.Drawing.Size(96, 34); $btnCancel.Location = New-Object System.Drawing.Point(458, 308)
     $btnCancel.Add_Click({ $dlg.Close() })
     $btnSave.Add_Click({
         $ndText = $cbNdSize.Text.Trim()
@@ -1380,7 +1389,7 @@ function Show-Settings {
         $dlg.Close()
     })
     $btnReset = New-Object System.Windows.Forms.Button
-    $btnReset.Text = '恢复默认'; $btnReset.Size = New-Object System.Drawing.Size(110, 34); $btnReset.Location = New-Object System.Drawing.Point(16, 292)
+    $btnReset.Text = '恢复默认'; $btnReset.Size = New-Object System.Drawing.Size(110, 34); $btnReset.Location = New-Object System.Drawing.Point(16, 308)
     $btnReset.Add_Click({
         if ([System.Windows.Forms.MessageBox]::Show('确定把所有设置恢复为默认值吗？', '恢复默认', 'YesNo', 'Warning') -eq 'Yes') {
             foreach ($k in @($defaults.Keys)) { $settings[$k] = $defaults[$k] }
