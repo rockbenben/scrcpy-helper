@@ -1560,6 +1560,76 @@ function Show-CustomDisplaySize {
     return $d.Tag
 }
 
+# ---------------- 错误日志：把机器话收进文件，界面只留人话 ----------------
+function Add-ErrorLog {
+    param($Tag, $Text)
+    try {
+        $logPath = Join-Path $PSScriptRoot '投屏助手-错误日志.txt'
+        if ((Test-Path -LiteralPath $logPath) -and ((Get-Item -LiteralPath $logPath).Length -gt 262144)) { Remove-Item -LiteralPath $logPath -Force }   # 与未处理异常共用一份，封顶 256KB
+        Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Tag`r`n$Text`r`n" -Encoding UTF8
+        return $logPath
+    } catch { return '' }
+}
+
+# ---------------- 结果窗：结论在前、出路给全、原始报错折进「查看原因」 ----------------
+# 系统 MessageBox 是白底黑框，和助手的暖米色自绘窗两副面孔；按钮只有「确定」，失败时等于把人弹回起点重做。
+# $Buttons 按主次顺序传（第一个是深色主按钮，最后一个兼作 Esc/取消），返回被点按钮的键。
+function Show-ResultDialog {
+    param($owner, $Title, $Heading, $Body, $Detail = '', $Buttons = @('ok'))
+    $labels = @{ ok = '确定'; continue = '继续'; retry = '重试'; ip = '输入 IP 连接'; cancel = '取消' }
+    $widths = @{ ok = 96; continue = 96; retry = 96; ip = 112; cancel = 84 }
+    # 正文按限宽量一次真实高度再定窗高：写死高度会在长文案时把最后一行裁掉
+    $capFont = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
+    $sz = [System.Windows.Forms.TextRenderer]::MeasureText([string]$Body, $capFont, (New-Object System.Drawing.Size(388, 0)), [System.Windows.Forms.TextFormatFlags]::WordBreak)
+    $bodyH = [Math]::Max([int]$sz.Height, 18)
+    $linkTop = 44 + $bodyH + 8
+    $btnTop = $linkTop + $(if ($Detail) { 28 } else { 8 })
+    $baseH = $btnTop + 50
+    $d = New-Dialog $Title 420 $baseH $owner
+    $lHead = New-Lbl $Heading 16 16
+    $lHead.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10.5, [System.Drawing.FontStyle]::Bold)
+    $lBody = New-Caption $Body 16 44
+    $lBody.MaximumSize = New-Object System.Drawing.Size(388, 0)
+    $link = $null; $txt = $null
+    if ($Detail) {
+        $link = New-Object System.Windows.Forms.LinkLabel
+        $link.Text = '查看原因'; $link.AutoSize = $true
+        $link.Font = $capFont
+        $link.LinkColor = $cMuted; $link.VisitedLinkColor = $cMuted; $link.Visited = $true
+        $link.Location = New-Object System.Drawing.Point(16, $linkTop)
+        $txt = New-Object System.Windows.Forms.TextBox
+        $txt.Multiline = $true; $txt.ReadOnly = $true; $txt.ScrollBars = 'Vertical'
+        $txt.Text = $Detail; $txt.Visible = $false; $txt.TabStop = $false
+        $txt.Font = New-Object System.Drawing.Font('Consolas', 8.5)
+        $txt.Size = New-Object System.Drawing.Size(388, 92)
+        $txt.BackColor = $cWhite
+        $txt.Location = New-Object System.Drawing.Point(16, $linkTop + 22)
+        [void](Add-ErrorLog $Title $Detail)   # 展不展开都先落盘，用户不必为了留证据去截图
+        $link.Add_Click({
+            $txt.Visible = -not $txt.Visible
+            $link.Text = $(if ($txt.Visible) { '收起原因' } else { '查看原因' })
+            $d.ClientSize = New-Object System.Drawing.Size(420, $baseH + $(if ($txt.Visible) { 100 } else { 0 }))
+        }.GetNewClosure())
+    }
+    $x = 420 - 16
+    $created = @()
+    for ($i = $Buttons.Count - 1; $i -ge 0; $i--) {   # 从右往左排：$created[0] 是最右（取消），$created[-1] 是主按钮
+        $key = [string]$Buttons[$i]; $w = $widths[$key]
+        $x -= $w
+        $b = if ($i -eq 0) { New-PrimaryBtn $labels[$key] $x $btnTop $w 34 10 } else { New-SecondaryBtn $labels[$key] $x $btnTop $w 34 }
+        $b.Add_Click({ $d.Tag = $key; $d.Close() }.GetNewClosure())
+        $created += $b
+        $x -= 8
+    }
+    $ctl = @($lHead, $lBody) + @($created)
+    if ($link) { $ctl += @($link, $txt) }
+    $d.Controls.AddRange($ctl)
+    $d.AcceptButton = $created[-1]
+    $d.CancelButton = $created[0]
+    [void]$d.ShowDialog($owner)
+    return [string]$d.Tag
+}
+
 # ---------------- 独立窗口：选 App ----------------
 function Show-NewDisplay {
     param($owner, $serial)
@@ -1692,7 +1762,7 @@ function Show-WirelessPair {
         if ($code -notmatch '^\d{6}$') { [System.Windows.Forms.MessageBox]::Show('配对码应为 6 位数字。', '配对') | Out-Null; return }
         try { $pairOut = (Invoke-Hidden -FilePath $adb -ArgumentList @('pair', $pairAddr, $code)) -join "`n" } catch { $pairOut = $_.Exception.Message }
         if ($pairOut -notmatch 'Successfully paired') {
-            [System.Windows.Forms.MessageBox]::Show("配对失败：多半是配对码过期或地址抄错。`n请在手机上重新生成配对码，把弹窗里的地址和 6 位数字一起照抄再试。`n`n（原始报错：$pairOut）", '配对') | Out-Null
+            [void](Show-ResultDialog $owner '用配对码连接' '配对失败' '多半是配对码过期或地址抄错。请在手机上重新生成配对码，把弹窗里的地址和 6 位数字一起照抄再试。' $pairOut @('ok'))
             return
         }
         # 配对成功：用 mdns 自动发现连接端口（同一 IP，端口不同），轮询几次等服务出现
@@ -1717,7 +1787,7 @@ function Show-WirelessPair {
             $result.addr = $connAddr
             $dlg.Close()
         } else {
-            [System.Windows.Forms.MessageBox]::Show("已配对成功，但连接 $connAddr 失败。`n可在手机「无线调试」主界面核对端口后重试。`n`n（原始报错：$connOut）", '配对') | Out-Null
+            [void](Show-ResultDialog $owner '用配对码连接' "已配对成功，但连接 $connAddr 失败" '可在手机「无线调试」主界面核对端口后重试。' $connOut @('ok'))
         }
     })
     $dlg.Controls.AddRange(@($l1, $l2, $l3, $txtPair, $l4, $txtCode, $lblNote, $btnGo))
@@ -2101,7 +2171,7 @@ function Connect-ByIp {
         if ($out -match 'connected to') {
             $result.addr = $addr; $dlg.Close()
         } else {
-            [System.Windows.Forms.MessageBox]::Show("连不上 $addr。`n`n手机没开「无线调试」就连不上：Android 11+ 去开发者选项里打开；更早的手机先插一次线，点「无线投屏 → 插数据线连接」切换。`n`n（原始报错：$out）", '输入 IP 连接') | Out-Null
+            [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '手机没开「无线调试」就连不上：Android 11+ 去开发者选项里打开；更早的手机先插一次线，点「无线投屏 → 插数据线连接」切换。' $out @('ok'))
         }
     })
     $dlg.Controls.AddRange(@($l1, $l2, $l3, $txtIp, $l4, $txtPort, $btnGo))
@@ -2243,7 +2313,7 @@ function Show-DeviceManager {
             if ($out -match 'connected to') { Touch-KnownDevice $addr } else { $fail += "$addr：$out" }
         }
         $owner.Cursor = [System.Windows.Forms.Cursors]::Default
-        if ($fail) { [System.Windows.Forms.MessageBox]::Show("有 " + $fail.Count + " 台没连上。`n`n多半是手机不在线，或没开「无线调试」。确认手机和电脑连的同一个 WiFi 后可重试，或先插一次线。`n`n（原始报错：`n" + ($fail -join "`n") + "）", '设备管理') | Out-Null }
+        if ($fail) { [void](Show-ResultDialog $dlg '设备管理' ("有 " + $fail.Count + " 台没连上") '多半是手机不在线，或没开「无线调试」。确认手机和电脑连的同一个 Wi-Fi 后可重试，或先插一次线。' ($fail -join "`r`n") @('ok')) }
         & $refresh
     }
     # 投屏选中的已连设备（只投，不连）：已在投的跳过不重复开，窗口保持打开方便继续管理
@@ -2653,22 +2723,33 @@ try {
             [void]$pick.ShowDialog($form)
 
             if ($pick.Tag -eq 'cable') {
-                $msg = "请用数据线把手机连上电脑，并点「允许 USB 调试」。`n`n连好后点「确定」，会自动切到无线（连上后即可拔掉数据线）。`n若手机重启过导致连不上，也请重新插线再点一次。"
-                if ([System.Windows.Forms.MessageBox]::Show($msg, '无线投屏', 'OKCancel', 'Information') -eq 'OK') {
-                    # 点完确定必须重新数一遍设备：不带 -s 的 scrcpy 遇到「还没插线」会报 Could not find any
+                # 引导 → 重新数设备 → 没连上就地给「重试 / 输入 IP / 取消」，不再用一句「确定」把人弹回起点重做整条流程
+                $devs = @(); $wantIp = $false
+                while ($true) {
+                    $ask = Show-ResultDialog $form '连接手机' '插一次数据线，之后就能免线' "1. 用数据线把手机连上电脑`n2. 手机上点「允许 USB 调试」`n`n连好后点「继续」，会自动切到无线，之后就能拔掉数据线。" '' @('continue', 'cancel')
+                    if ($ask -ne 'continue') { return }
+                    # 点完继续必须重新数一遍设备：不带 -s 的 scrcpy 遇到「还没插线」会报 Could not find any
                     # ADB device、遇到「插着两台」会报 Multiple (2) ADB devices 然后退出，而控制台默认隐藏——
-                    # 用户看到的就是「点了确定什么都没发生」。
+                    # 用户看到的就是「点了继续什么都没发生」。
                     $devs = @(Get-DeviceList)
-                    if ($devs.Count -eq 0) {
-                        [System.Windows.Forms.MessageBox]::Show('还是没检测到手机。请插好数据线、在手机上点「允许 USB 调试」，再点一次「无线投屏」。', '无线投屏') | Out-Null
-                        return
-                    }
-                    $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
-                    $t = if ($usb.Count -eq 1) { $usb[0] }
-                         elseif ($devs.Count -eq 1) { $devs[0] }
-                         else { Select-Device $form $devs '无线投屏 · 选择设备' }
-                    if ($t) { Start-Scrcpy (@('-s', $t, '--tcpip') + (Get-MirrorArgs -Wireless:$true)) }
+                    if ($devs.Count -gt 0) { break }
+                    $again = Show-ResultDialog $form '连接手机' '还是没检测到手机' '检查数据线是否插好、手机上是否点过「允许 USB 调试」。手机重启过也要重新插一次线；不想插线也可以直接输 IP。' '' @('retry', 'ip', 'cancel')
+                    if ($again -eq 'ip') { $wantIp = $true; break }
+                    if ($again -ne 'retry') { return }
                 }
+                if ($wantIp) {
+                    $addr = Connect-ByIp $form   # 内部已成功即记住
+                    if ($addr) {
+                        if ($settings.lastWirelessAddr -ne $addr) { $settings.lastWirelessAddr = $addr; Save-Settings }
+                        Start-Scrcpy (@('-s', $addr) + (Get-MirrorArgs -Wireless:$true))
+                    }
+                    return
+                }
+                $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
+                $t = if ($usb.Count -eq 1) { $usb[0] }
+                     elseif ($devs.Count -eq 1) { $devs[0] }
+                     else { Select-Device $form $devs '无线投屏 · 选择设备' }
+                if ($t) { Start-Scrcpy (@('-s', $t, '--tcpip') + (Get-MirrorArgs -Wireless:$true)) }
             }
             elseif ($pick.Tag -eq 'pair') {
                 $addr = Show-WirelessPair $form
