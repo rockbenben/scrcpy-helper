@@ -1798,7 +1798,7 @@ function Show-WirelessPair {
 }
 
 # ---------------- 快捷键速查 ----------------
-# 内容依据 scrcpy 官方 doc/shortcuts.md；MOD 默认 = 左 Alt 或 左 Super。
+# 内容依据 scrcpy 官方 doc/shortcuts.md；官方写作 MOD（默认 = 左 Alt 或左 Super），界面按用户口径统一叫 Alt。
 function Show-Shortcuts {
     param($owner)
     $dlg = New-Dialog '快捷键速查' 380 432 $owner
@@ -1806,39 +1806,39 @@ function Show-Shortcuts {
     $txt.Multiline = $true; $txt.ReadOnly = $true; $txt.ScrollBars = 'Vertical'
     $txt.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
     $txt.Text = (@'
-MOD 键 = 左 Alt 或 左 Win 键
+下面的 Alt，指左 Alt 或左 Win（两个都能用）
 
 — 窗口 —
-全屏：MOD+f 或 F11
-退出：MOD+q
-去黑边：MOD+w（或双击画面）
-显示帧率：MOD+i
+全屏：Alt+f 或 F11
+退出：Alt+q
+去黑边：Alt+w（或双击画面）
+显示帧率：Alt+i
 
 — 手机操作 —
-回到桌面：MOD+h（或鼠标中键）
-返回：MOD+b（或鼠标右键）
-多任务：MOD+s
-菜单：MOD+m
-音量 加/减：MOD+↑ / MOD+↓
-电源键：MOD+p
-通知栏 展开/收起：MOD+n / MOD+Shift+n
-复制到电脑：MOD+c
-粘贴到手机：MOD+v
+回到桌面：Alt+h（或鼠标中键）
+返回：Alt+b（或鼠标右键）
+多任务：Alt+s
+菜单：Alt+m
+音量 加/减：Alt+↑ / Alt+↓（投屏窗口里）
+锁屏/解锁手机：Alt+p
+通知栏 展开/收起：Alt+n / Alt+Shift+n
+复制到电脑：Alt+c
+粘贴到手机：Alt+v
 
 — 屏幕 —
-手机息屏（继续投屏）：MOD+o
-手机点亮：MOD+Shift+o
-旋转手机屏幕：MOD+r
-旋转投屏画面：MOD+← / MOD+→
-暂停/恢复画面：MOD+z / MOD+Shift+z
+手机息屏（继续投屏）：Alt+o
+手机点亮：Alt+Shift+o
+旋转手机屏幕：Alt+r
+旋转投屏画面：Alt+← / Alt+→
+暂停/恢复画面：Alt+z / Alt+Shift+z
 
 — 拖拽（拖进投屏窗口）—
 拖入 APK：安装到手机
 拖入其它文件：传到手机
 
 — 相机（手机当摄像头时）—
-补光灯 开/关：MOD+t / MOD+Shift+t
-放大/缩小：MOD+↑ / MOD+↓
+补光灯 开/关：Alt+t / Alt+Shift+t
+放大/缩小：Alt+↑ / Alt+↓（只有「手机当摄像头」时才是变焦）
 '@ -replace "`r?`n", "`r`n")
     $txt.Select(0, 0)
     $btnClose = New-PrimaryBtn '知道了' 16 382 348 34 10
