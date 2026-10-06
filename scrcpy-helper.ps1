@@ -2478,7 +2478,8 @@ try {
     # 闭包会绑到新的动态模块，里面 $script: 前缀解析到该模块自己的空 script 作用域全是 $null——
     # 恢复时 ForeColor 被赋 $null 直接抛「无法转换为 System.Drawing.Color」的未处理异常弹窗。
     $script:hintRestore = New-Object System.Windows.Forms.Timer
-    $script:hintRestore.Add_Tick({
+    # 还原动作单独成块：定时器到点走它，防重入提示也要在流程结束时主动走它（否则提示比流程先消失）
+    $script:restoreHint = {
         $script:hintRestore.Stop()
         $lblHint.Text = $script:recHintText; $lblHint.ForeColor = $script:recHintColor
         if ($script:hintLinksHidden) {
@@ -2486,7 +2487,8 @@ try {
             $script:hintLinksHidden = $false
         }
         $script:recTipActive = $false
-    })
+    }
+    $script:hintRestore.Add_Tick({ & $script:restoreHint })
     $script:showTempHint = {
         param($text, $color, $ms = 6000)
         if (-not $script:recTipActive) { $script:recHintText = $lblHint.Text; $script:recHintColor = $lblHint.ForeColor }
@@ -2497,7 +2499,8 @@ try {
             $btnDevices.Visible = $false; $btnShortcuts.Visible = $false; $btnSettings.Visible = $false; $btnGh.Visible = $false
             $script:hintLinksHidden = $true
         }
-        $script:hintRestore.Stop(); $script:hintRestore.Interval = $ms; $script:hintRestore.Start()
+        $script:hintRestore.Stop()
+        if ($null -ne $ms) { $script:hintRestore.Interval = $ms; $script:hintRestore.Start() }   # $null = 挂着不自动还原
     }
     # 不再放「刷新」：状态会在窗口重新获得焦点时自动重测，「设备」管理打开也会重新扫描
     $btnDevices = New-LinkBtn '设备' 288 334 52
@@ -2573,20 +2576,31 @@ try {
     # 设备管理另用一把锁：它是模态窗，「设备」那条流程的锁会占满整个设备管理开着的时段，
     # 窗内按钮若共用同一把，开完窗就全点不动了。
     $script:dmFlow = @{ Busy = $false }
+    # 忙时的可见反馈：只挂沙漏光标 + 一行小字，四个大按钮看着照样能点，用户以为没点上就再点一次。
+    # 置灰只针对主流程那把锁；设备管理窗内的按钮走 dmFlow，不能跟着灰掉。
+    $script:busyButtons = @($btnWired, $btnWireless, $btnCamera, $btnRecord, $btnNd)
     function Invoke-MainFlow {
         param([scriptblock]$Body, $Owner, $Flag)
         if (-not $Flag) { $Flag = $script:mainFlow }
         if ($Flag.Busy) {
             # 忙时不动光标：正在跑的那条流程已经把窗口设成等待光标了，这里再设一次没人给它复位
-            & $script:showTempHint '正在处理上一步，请稍候' $cMuted 3000
+            & $script:showTempHint '正在处理上一步，请稍候' $cMuted $null
+            $script:hintHeld = $true
             return
         }
         $Flag.Busy = $true
         $w = if ($Owner) { $Owner } else { $form }
         $w.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $greyed = @()
+        if ($Flag -eq $script:mainFlow) {
+            $greyed = @($script:busyButtons)
+            foreach ($b in $greyed) { $b.Enabled = $false }
+        }
         try { & $Body } finally {
             $w.Cursor = [System.Windows.Forms.Cursors]::Default
+            foreach ($b in $greyed) { $b.Enabled = $true }
             $Flag.Busy = $false
+            if ($script:hintHeld) { $script:hintHeld = $false; & $script:restoreHint }
         }
     }
 
