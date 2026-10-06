@@ -808,6 +808,14 @@ function New-Lbl {
     return $l
 }
 # 素纸灰小字说明（8.5 号、自适应宽度）：按钮下方 / 弹窗里的次要提示
+function New-ErrCaption {
+    param($x, $y)
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = ''; $l.AutoSize = $true; $l.ForeColor = $cRed
+    $l.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
+    $l.Location = New-Object System.Drawing.Point($x, $y)
+    return $l
+}
 function New-Caption {
     param($text, $x, $y)
     $l = New-Object System.Windows.Forms.Label
@@ -1513,32 +1521,39 @@ function Show-ManageApps {
 # 自定义尺寸静默抹掉（实测：1080x2340 → 空）。这里用带真「取消」的对话框，取消 = 什么都不改。
 function Show-CustomDisplaySize {
     param($owner, $size, $dpi)
-    $d = New-Dialog '独立窗口 - 自定义尺寸' 360 214 $owner
+    $d = New-Dialog '独立窗口 · 自定义尺寸' 360 248 $owner
     $l1 = New-Lbl '分辨率（宽x高）：' 16 21
     $t1 = New-Txt 150 17 190
     $t1.Text = $size
-    $c1 = New-Caption '例 1080x2340；留空 = 跟设备一致' 16 49
-    $l2 = New-Lbl 'DPI：' 16 89
-    $t2 = New-Txt 150 85 190
+    $c1 = New-Caption '不填=跟手机一致。例 1080x2340' 150 47
+    $e1 = New-ErrCaption 16 65
+    $l2 = New-Lbl 'DPI：' 16 96
+    $t2 = New-Txt 150 92 190
     $t2.Text = $dpi
-    $c2 = New-Caption '例 420，数值越大界面越像手机版；留空 = 默认' 16 117
-    $ok = New-PrimaryBtn '确定' 150 160 96 34 10
-    $cancel = New-SecondaryBtn '取消' 254 160 86 34
+    $c2 = New-Caption '不填=默认。常见 160~640' 150 122
+    $e2 = New-ErrCaption 16 140
+    $c3 = New-Caption '数值越大，界面越像手机版' 150 158
+    $ok = New-PrimaryBtn '确定' 150 194 96 34 10
+    $cancel = New-SecondaryBtn '取消' 254 194 86 34
+    # 校验写进字段下方红字，不再弹 MessageBox 打断（G8）：填错时窗不跳、已填内容不清空，光标送回出错那一格
     $ok.Add_Click({
         $s = $t1.Text.Trim(); $p = $t2.Text.Trim()
+        $e1.Text = ''; $e2.Text = ''
         if ($s -and $s -notmatch '^\d{3,4}x\d{3,4}$') {
-            [System.Windows.Forms.MessageBox]::Show('分辨率格式应为 宽x高（用小写字母 x），例如 1080x2340。留空表示跟设备一致。', '独立窗口') | Out-Null
+            $e1.Text = '格式应为 宽x高（用小写 x），例如 1080x2340'
+            [void]$t1.Focus(); $t1.SelectAll()
             return
         }
         if ($p -and $p -notmatch '^\d+$') {
-            [System.Windows.Forms.MessageBox]::Show('DPI 应为纯数字，例如 420。留空表示用默认。', '独立窗口') | Out-Null
+            $e2.Text = 'DPI 要填数字，例如 420'
+            [void]$t2.Focus(); $t2.SelectAll()
             return
         }
         $d.Tag = @{ Size = $s; Dpi = $p }
         $d.DialogResult = [System.Windows.Forms.DialogResult]::OK
     })
     $cancel.Add_Click({ $d.DialogResult = [System.Windows.Forms.DialogResult]::Cancel })
-    $d.Controls.AddRange(@($l1, $t1, $c1, $l2, $t2, $c2, $ok, $cancel))
+    $d.Controls.AddRange(@($l1, $t1, $c1, $e1, $l2, $t2, $c2, $e2, $c3, $ok, $cancel))
     $d.AcceptButton = $ok
     $d.CancelButton = $cancel
     if ($d.ShowDialog($owner) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
@@ -1563,7 +1578,9 @@ function Show-NewDisplay {
 
     # 窗口比例/方向：微信、QQ 等手机应用在“横屏平板”虚拟屏上会用平板版面、显示不全，选「竖屏·手机」即用手机版面
     $lblMode = New-Lbl '窗口比例' 16 110
-    $cbMode = New-Combo @('竖屏·手机版面（推荐微信/QQ）', '横屏·平板版面', '跟随「设置」里的尺寸', '自定义…') @('portrait', 'landscape', 'settings', 'custom') $settings.ndMode 84 107 220
+    # 「自定义」这一项要把已填的尺寸带在标签上，否则选完就看不见自己填的是什么了
+    $customLabel = if ($settings.ndSize) { "自定义 $($settings.ndSize)" } else { '自定义…' }
+    $cbMode = New-Combo @('竖屏·手机版面（推荐微信/QQ）', '横屏·平板版面', '跟随「设置」里的尺寸', $customLabel) @('portrait', 'landscape', 'settings', 'custom') $settings.ndMode 84 107 220
     $chkFixed = New-Chk '固定方向（最大化时画面不乱转）' $settings.ndFixed 16 143
     # 限宽自动换行：两行说明都比固定宽度的窗宽，不限宽会被右边缘裁掉、看不全
     $capMode = New-Caption "竖屏适合聊天/刷信息；横屏适合看视频。乱转就勾上「固定方向」。`n应用双开/分身在独立窗口常黑屏、点不到，建议改用普通投屏在手机上开分身。" 16 167
@@ -1596,7 +1613,7 @@ function Show-NewDisplay {
             }
         }
         elseif ($sel -like '手动输入*') {
-            $name = [Microsoft.VisualBasic.Interaction]::InputBox("输入 App 名字（如 chrome）或完整包名（如 com.tencent.mm）。`n中文 App 建议用包名，更准确。", '独立窗口 - 打开 App', '')
+            $name = [Microsoft.VisualBasic.Interaction]::InputBox("输入 App 名字（如 chrome）或完整包名（如 com.tencent.mm）。`n中文 App 建议用包名，更准确。", '独立窗口 · 打开 App', '')
             if ([string]::IsNullOrWhiteSpace($name)) { return }
             $name = $name.Trim()
             $target = if ($name -match '\.') { "+$name" } else { "+?$name" }
@@ -1625,6 +1642,9 @@ function Show-NewDisplay {
                 if (-not $ask) { return }   # 取消 = 整个「打开独立窗口」作废，已存的尺寸/DPI 一个字都不动
                 $ndSz = $ask.Size; $ndDpi = $ask.Dpi
                 $settings.ndSize = $ndSz; $settings.ndDpi = $ndDpi
+                $i = $cbMode.SelectedIndex
+                $cbMode.Items[3] = $(if ($ndSz) { "自定义 $ndSz" } else { '自定义…' })
+                $cbMode.SelectedIndex = $i
             }
         }
         $audioSel = [string]$cbAudio.Vals[$cbAudio.SelectedIndex]
