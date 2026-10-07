@@ -114,6 +114,10 @@ try {
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr hWnd);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(uint dwProcessId);
+public delegate bool EnumWinProc(System.IntPtr h, System.IntPtr l);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool EnumWindows(EnumWinProc cb, System.IntPtr l);
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, ExactSpelling = true)] public static extern int GetWindowTextW(System.IntPtr h, System.Text.StringBuilder s, int n);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr h, out uint pid);
 '@
 } catch {}
 $script:isFirstInstance = $true
@@ -614,10 +618,14 @@ function Start-Scrcpy {
     # 解析目标设备序列号（来自 -s），用于「投屏中」标记 / 「停止这台」，并据此给窗口起友好标题
     $serial = ''
     for ($i = 0; $i -lt $clean.Count - 1; $i++) { if ($clean[$i] -eq '-s') { $serial = $clean[$i + 1]; break } }
-    if ($serial -and -not @($clean | Where-Object { $_ -like '--window-title=*' }).Count) {
+    $winTitle = ''
+    $hadTitle = @($clean | Where-Object { $_ -like '--window-title=*' })
+    if ($hadTitle.Count) {
+        $winTitle = [string]$hadTitle[0] -replace '^--window-title=', ''
+    } elseif ($serial) {
         # 标题去空格（Windows PowerShell 的 Start-Process 数组传参对带空格的参数引号处理不可靠）
         $title = (Get-FriendlyName $serial) -replace '\s+', '-'
-        if ($title) { $clean += "--window-title=$title" }
+        if ($title) { $clean += "--window-title=$title"; $winTitle = $title }
     }
     # 声音三态：Off=强制静音；On=用户显式选了「播放」，不参与多开去重（但已有窗口出声时会提示可能重音）；
     # Auto=同一台手机只保留第一路在电脑出声——scrcpy 捕获整机一路混音，与主屏幕/虚拟屏无关，
@@ -670,7 +678,58 @@ function Start-Scrcpy {
         return
     }
     # Audio=本会话是否在电脑上出声（被自动静音的新会话记 false，供后续同设备会话判定「是否已有出声窗口」）
-    if ($p) { [void]$scrcpyProcs.Add([pscustomobject]@{ Proc = $p; Rec = [bool]$Recording; Serial = $serial; Audio = [bool]$playsAudio }) }
+    if (-not $p) { return }
+    [void]$scrcpyProcs.Add([pscustomobject]@{ Proc = $p; Rec = [bool]$Recording; Serial = $serial; Audio = [bool]$playsAudio })
+    # 三类不在此等待：摄像头会话有看门狗负责反馈；后台录制本来就没有窗口；勾了「显示控制台」的用户已经在看输出
+    if ($StderrFile -and $StdoutFile) { return }
+    if (@($clean | Where-Object { $_ -eq '--no-playback' }).Count) { return }
+    if ($settings.showConsole) { return }
+    if ($script:showTempHint) { & $script:showTempHint '正在打开投屏窗口…' $cMuted $null; $script:hintHeld = $true }
+    if ((Wait-ScrcpyWindow $p $winTitle) -ne 'exited') { return }
+    $code = try { $p.ExitCode } catch { '未知' }
+    [void](Show-ResultDialog $form '投屏' '投屏窗口没能打开' '多半是数据线松了、手机刚锁屏，或这台正被别的地方占用。重新插一下、点亮屏幕再点一次；反复如此的话，到「设置 > 常用」勾「显示 scrcpy 控制台窗口」，就能看到具体原因。' ("命令：scrcpy.exe $cmd`r`n退出码：$code") @('ok'))
+}
+
+# 进程起来 ≠ 画面出来：实测 scrcpy 从启动到窗口可见还要 0.9~1.5 秒（无线更慢），
+# 这段时间界面已经恢复正常，用户完全不知道成没成。这里等窗口真出现再把忙态交回去；
+# 等不到且进程已退 = 明确失败，给一句人话并把命令与退出码收进「查看原因」，不再静默。
+# 判"窗口出现"：按我们自己设的 --window-title 用 EnumWindows 逐个比标题 + 可见性 + 进程 id。
+# 两个代理方案实测都不行：Process.MainWindowHandle 对秒退的 cmd、隐藏控制台的 powershell 也立刻报"有窗口"；
+# FindWindow 按标题找在部分宿主里恒返回 0（本脚本第 133 行的单实例判定就吃过这个亏）。
+# 同一台手机已经开着同名窗口时不等——那一屏本来就看得见，硬等还会把旧窗口误判成本次的成功。
+function Test-WindowShown {
+    param([string]$Title, [int]$ProcId)
+    # 回调里只能读 \$script: 变量：EnumWindows 是从原生代码反过来调这个 scriptblock，
+    # 它看不到本函数的局部 \$Title/\$ProcId/\$hit（实测恒不匹配、还静默抛异常）。
+    $script:twTitle = $Title; $script:twPid = $ProcId
+    $script:twHit = New-Object System.Collections.ArrayList
+    $cb = [Native.Win+EnumWinProc]{ param($h, $l)
+        $sb = New-Object System.Text.StringBuilder 512
+        [void][Native.Win]::GetWindowTextW($h, $sb, 512)
+        if ($sb.ToString() -eq $script:twTitle -and [Native.Win]::IsWindowVisible($h)) {
+            $p = 0
+            [void][Native.Win]::GetWindowThreadProcessId($h, [ref]$p)
+            if ([int]$p -eq $script:twPid) { [void]$script:twHit.Add($h) }
+        }
+        return $true
+    }
+    [void][Native.Win]::EnumWindows($cb, [IntPtr]::Zero)
+    return $script:twHit.Count -gt 0
+}
+function Wait-ScrcpyWindow {
+    param($Proc, [string]$Title, [int]$TimeoutSec = 6)
+    if (-not $Proc -or -not $Title) { return 'nowait' }
+    $pid_ = 0
+    try { $pid_ = [int]$Proc.Id } catch { return 'nowait' }
+    if ($pid_ -le 0 -or (Test-WindowShown $Title $pid_)) { return 'nowait' }   # 已有同名窗口：不重复等
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        if (Test-WindowShown $Title $pid_) { return 'shown' }
+        try { if ($Proc.HasExited) { return 'exited' } } catch { return 'exited' }
+        [System.Windows.Forms.Application]::DoEvents()   # 泵一下消息：忙态配色要画得出来，界面不能冻成灰块
+        Start-Sleep -Milliseconds 60
+    }
+    return 'timeout'
 }
 
 # 启动一个 scrcpy 并把 Process 对象拿回来（摄像头看门狗要盯它的退出码和 stderr）；启动失败返回 $null。
