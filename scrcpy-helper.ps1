@@ -157,6 +157,15 @@ $cGreenBg = [System.Drawing.Color]::FromArgb(220, 231, 223)
 $cTagBg   = [System.Drawing.Color]::FromArgb(226, 221, 212)   # 未连接药丸
 $cWhite   = [System.Drawing.Color]::FromArgb(252, 251, 249)   # 卡片软白（次要按钮 / 输入）
 $cHover   = [System.Drawing.Color]::FromArgb(243, 240, 234)   # 次要按钮悬停
+# 忙时退档色：主按钮=墨色被纸色冲淡一档，次按钮=卡片白退到悬停白、字收进次要灰，链接再淡一档。
+# 为什么不交给系统禁用态：Enabled=false 时平面渲染器无视 ForeColor 自己派生字色，实测黑底按钮的字被画成
+# #0F0E0D（压在 #2B2926 上 = 1.33:1，读不出），白底按钮的字画成橄榄 #776540（跳出色板）。
+$cBusyInk      = [System.Drawing.Color]::FromArgb(87, 83, 78)
+$cBusyInkText  = [System.Drawing.Color]::FromArgb(228, 224, 216)
+$cBusySecBg    = [System.Drawing.Color]::FromArgb(243, 240, 234)
+$cBusySecText  = [System.Drawing.Color]::FromArgb(108, 104, 96)
+$cBusySecLine  = [System.Drawing.Color]::FromArgb(226, 221, 212)
+$cBusyLink     = [System.Drawing.Color]::FromArgb(180, 174, 164)
 
 $exe = Join-Path $PSScriptRoot 'scrcpy.exe'
 $adb = Join-Path $PSScriptRoot 'adb.exe'
@@ -2631,8 +2640,8 @@ try {
             $lblDevInfo.Text = ''
         }
     }
-    $btnShortcuts.Add_Click({ Show-Shortcuts $form })
-    $btnSettings.Add_Click({ Show-Settings $form })
+    $btnShortcuts.Add_Click({ Invoke-MainFlow ({ Show-Shortcuts $form }) })
+    $btnSettings.Add_Click({ Invoke-MainFlow ({ Show-Settings $form }) })
     # 设备管理入口：底部「设备」链接 + 右上角状态药丸都可进；关掉后刷新一次状态
     $openDevices = { Invoke-MainFlow ({ Show-DeviceManager $form; & $updateStatus }) }
     $btnDevices.Add_Click($openDevices)
@@ -2648,33 +2657,79 @@ try {
     $script:dmFlow = @{ Busy = $false }
     # 忙时的可见反馈：只挂沙漏光标 + 一行小字，四个大按钮看着照样能点，用户以为没点上就再点一次。
     # 置灰只针对主流程那把锁；设备管理窗内的按钮走 dmFlow，不能跟着灰掉。
-    $script:busyButtons = @($btnWired, $btnWireless, $btnCamera, $btnRecord, $btnNd)
+    # 分两组刷：主操作与更多功能各自的退档幅度不同；底部三个链接也要一起退，否则忙时它们成了画面里最亮的东西。
+    $script:busyPrimary   = @($btnWired, $btnWireless)
+    $script:busySecondary = @($btnCamera, $btnRecord, $btnNd)
+    $script:busyLinks     = @($btnDevices, $btnShortcuts, $btnSettings)
+    $script:busySnap = @()
+    function Set-BusyLook {
+        param([bool]$On, $Source)
+        if (-not $On) {
+            foreach ($s in $script:busySnap) {
+                $s.Btn.BackColor = $s.Back; $s.Btn.ForeColor = $s.Fore
+                $s.Btn.FlatAppearance.MouseOverBackColor = $s.Over
+                $s.Btn.FlatAppearance.MouseDownBackColor = $s.Down
+                $s.Btn.FlatAppearance.BorderColor = $s.Line
+            }
+            $script:busySnap = @()
+            foreach ($l in $script:busyLinks) { $l.ForeColor = $cMuted }
+            return
+        }
+        $groups = @(
+            @{ List = $script:busyPrimary;   Back = $cBusyInk;     Fore = $cBusyInkText; Over = $cBusyInk;   Down = $cBusyInk;   Line = $cBusyInk },
+            @{ List = $script:busySecondary; Back = $cBusySecBg;   Fore = $cBusySecText; Over = $cBusySecBg; Down = $cBusySecBg; Line = $cBusySecLine })
+        foreach ($g in $groups) {
+            foreach ($b in $g.List) {
+                if ($b -eq $Source) { continue }   # 被点的那一个留原色——一眼看出是哪一步在跑（Source 由调用处显式传，$sender 在这个宿主里取不到）
+                $script:busySnap += [pscustomobject]@{ Btn = $b; Back = $b.BackColor; Fore = $b.ForeColor; Over = $b.FlatAppearance.MouseOverBackColor; Down = $b.FlatAppearance.MouseDownBackColor; Line = $b.FlatAppearance.BorderColor }
+                $b.BackColor = $g.Back; $b.ForeColor = $g.Fore
+                # hover/按下色一起钉住：否则忙时鼠标一放上去按钮又亮回可用样
+                $b.FlatAppearance.MouseOverBackColor = $g.Over
+                $b.FlatAppearance.MouseDownBackColor = $g.Down
+                $b.FlatAppearance.BorderColor = $g.Line
+            }
+        }
+        foreach ($l in $script:busyLinks) { $l.ForeColor = $cBusyLink }
+    }
     function Invoke-MainFlow {
-        param([scriptblock]$Body, $Owner, $Flag)
+        param([scriptblock]$Body, $Owner, $Flag, $Source)
         if (-not $Flag) { $Flag = $script:mainFlow }
         if ($Flag.Busy) {
             # 忙时不动光标：正在跑的那条流程已经把窗口设成等待光标了，这里再设一次没人给它复位
-            & $script:showTempHint '正在处理上一步，请稍候' $cMuted $null
+            & $script:showTempHint '正在处理，请稍候…' $cMuted $null
             $script:hintHeld = $true
             return
         }
         $Flag.Busy = $true
         $w = if ($Owner) { $Owner } else { $form }
         $w.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-        $greyed = @()
-        if ($Flag -eq $script:mainFlow) {
-            $greyed = @($script:busyButtons)
-            foreach ($b in $greyed) { $b.Enabled = $false }
+        $isMain = ($Flag -eq $script:mainFlow)
+        $statusSnap = $null
+        if ($isMain) {
+            Set-BusyLook -On $true -Source $Source
+            try { $form.ActiveControl = $null } catch {}   # 去掉刚点过那个链接留下的焦点框
+            $statusSnap = @{ Text = $lblStatus.Text; Back = $lblStatus.BackColor; Fore = $lblStatus.ForeColor }
+            $lblStatus.BackColor = $cTagBg; $lblStatus.ForeColor = $cMuted
+            $lblStatus.Text = '○ 正在处理…'
+            # 提示从流程一开始就挂上（不是等第二次点击被挡才亮），并持续到流程结束
+            & $script:showTempHint '正在处理，请稍候…' $cMuted $null
+            $script:hintHeld = $true
         }
         try { & $Body } finally {
             $w.Cursor = [System.Windows.Forms.Cursors]::Default
-            foreach ($b in $greyed) { $b.Enabled = $true }
+            if ($isMain) {
+                Set-BusyLook -On $false
+                if ($statusSnap) {
+                    $lblStatus.Text = $statusSnap.Text; $lblStatus.BackColor = $statusSnap.Back; $lblStatus.ForeColor = $statusSnap.Fore
+                }
+                $script:hintHeld = $false
+                & $script:restoreHint
+            }
             $Flag.Busy = $false
-            if ($script:hintHeld) { $script:hintHeld = $false; & $script:restoreHint }
         }
     }
 
-    $btnWired.Add_Click({ Invoke-MainFlow ({
+    $btnWired.Add_Click({ Invoke-MainFlow -Source $btnWired ({
         $devs = @(Ensure-Devices $form)
         if ($devs.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('没检测到手机。请用数据线连接并点「允许 USB 调试」，或点右上角的连接状态走无线连接。', '有线投屏') | Out-Null; return }
         $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
@@ -2689,7 +2744,7 @@ try {
         if ($t) { Start-Scrcpy (@('-s', $t) + (Get-MirrorArgs -Wireless:(Test-Wireless $t))) }
     }) })
 
-    $btnWireless.Add_Click({ Invoke-MainFlow ({
+    $btnWireless.Add_Click({ Invoke-MainFlow -Source $btnWireless ({
         $devs = @(Ensure-Devices $form)
         $wl = @($devs | Where-Object { Test-Wireless $_ })
         $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
@@ -2769,7 +2824,7 @@ try {
         }
     }) })
 
-    $btnCamera.Add_Click({ Invoke-MainFlow ({
+    $btnCamera.Add_Click({ Invoke-MainFlow -Source $btnCamera ({
         $serial = Resolve-TargetForFeature $form 12 '手机当摄像头'   # 点击即定设备、查版本，不够直接弹提示并中止
         if (-not $serial) { return }
         # 自动读取这台设备真正支持的采集分辨率（约 1~2 秒），让分辨率下拉只列“一定能开”的尺寸
@@ -2916,7 +2971,7 @@ try {
         }
     }) })
 
-    $btnRecord.Add_Click({ Invoke-MainFlow ({
+    $btnRecord.Add_Click({ Invoke-MainFlow -Source $btnRecord ({
         $tgt = Resolve-Target $form
         if (-not $tgt.Ok) { if ($tgt.Reason -eq 'none') { [System.Windows.Forms.MessageBox]::Show('没检测到手机，请先连接手机再录制。', '录制屏幕') | Out-Null }; return }
         # VP8/VP9 装不进 mp4 容器(scrcpy 会直接拒)：这两种编码时强制走 mkv——默认名与筛选器都用 mkv，用户手选 mp4 也纠正回来。
@@ -2944,7 +2999,7 @@ try {
         }
     }) })
 
-    $btnNd.Add_Click({ Invoke-MainFlow ({
+    $btnNd.Add_Click({ Invoke-MainFlow -Source $btnNd ({
         $serial = Resolve-TargetForFeature $form 11 '独立窗口'   # 点击即定设备、查版本，不够直接弹提示并中止
         if (-not $serial) { return }
         Show-NewDisplay $form $serial
