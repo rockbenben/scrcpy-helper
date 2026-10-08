@@ -8,7 +8,7 @@
 
 Release 里的 zip 除上述三个文件外，**其余全部来自 [scrcpy](https://github.com/Genymobile/scrcpy) 官方 win64 发行包，逐字节原样转发、未作任何修改**，遵循 Apache License 2.0（by Genymobile）。
 
-以 scrcpy v5.0 官方发行包 `scrcpy-win64-v5.0.zip` 为例，转发的 16 个文件是：
+以 scrcpy v5.0.1 官方发行包 `scrcpy-win64-v5.0.1.zip` 为例，转发的 16 个文件是：
 
 | 文件 | 说明 |
 | ---- | ---- |
