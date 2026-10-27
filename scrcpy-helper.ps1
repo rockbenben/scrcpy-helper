@@ -239,7 +239,9 @@ $apps = [ordered]@{
     '拼多多' = 'com.xunmeng.pinduoduo'
 }
 
-# ---------------- 设置（在界面里改，自动记忆到 投屏助手-设置.json） ----------------
+# ---------------- 设置（改完点「保存」才写进 投屏助手-设置.json） ----------------
+# 设置窗口里的改动只停在控件上：点「保存」才落盘，点「取消」丢弃。
+# 设置窗口之外的即时选择（设备重命名、常用 App、摄像头分辨率/倍率、独立窗口的比例与声音）当场就存。
 # 用 [ordered] 有序表：保存出来的 JSON 键顺序就按下面的分组排（画面/声音/控制/…），不再是哈希随机序、看着乱。
 $defaults = [ordered]@{
     # 画面
@@ -615,6 +617,7 @@ function Start-Scrcpy {
     )
     $extra = @(); if ($settings.extraArgs) { $extra = @($settings.extraArgs -split '\s+' | Where-Object { $_ }) }
     $clean = @(($Options + $extra) | Where-Object { $_ -ne '' -and $null -ne $_ })
+    $isCamera = @($clean | Where-Object { $_ -like '--video-source=camera*' }).Count -gt 0
     # 解析目标设备序列号（来自 -s），用于「投屏中」标记 / 「停止这台」，并据此给窗口起友好标题
     $serial = ''
     for ($i = 0; $i -lt $clean.Count - 1; $i++) { if ($clean[$i] -eq '-s') { $serial = $clean[$i + 1]; break } }
@@ -625,7 +628,13 @@ function Start-Scrcpy {
     } elseif ($serial) {
         # 标题去空格（Windows PowerShell 的 Start-Process 数组传参对带空格的参数引号处理不可靠）
         $title = (Get-FriendlyName $serial) -replace '\s+', '-'
-        if ($title) { $clean += "--window-title=$title"; $winTitle = $title }
+        if ($title) {
+            # 设备名/App 名可能含引号或换行；标题最终进命令行，先去掉不可控字符
+            $title = $title -replace '[\r\n\x00-\x1F"]', ''
+            if ($Recording) { $title = "$title · 录制" }   # 录屏窗口一眼可辨，避免和普通投屏窗同名
+            elseif ($isCamera) { $title = "$title · 摄像头" }   # 摄像头窗口同理，和普通投屏区分
+            $clean += "--window-title=$title"; $winTitle = $title
+        }
     }
     # 声音三态：Off=强制静音；On=用户显式选了「播放」，不参与多开去重（但已有窗口出声时会提示可能重音）；
     # Auto=同一台手机只保留第一路在电脑出声——scrcpy 捕获整机一路混音，与主屏幕/虚拟屏无关，
@@ -695,7 +704,7 @@ function Start-Scrcpy {
 # 等不到且进程已退 = 明确失败，给一句人话并把命令与退出码收进「查看原因」，不再静默。
 # 判"窗口出现"：按我们自己设的 --window-title 用 EnumWindows 逐个比标题 + 可见性 + 进程 id。
 # 两个代理方案实测都不行：Process.MainWindowHandle 对秒退的 cmd、隐藏控制台的 powershell 也立刻报"有窗口"；
-# FindWindow 按标题找在部分宿主里恒返回 0（本脚本第 133 行的单实例判定就吃过这个亏）。
+# FindWindow 按标题找在部分宿主里恒返回 0（本脚本开头「单实例」那一段的兜底激活就吃过这个亏）。
 # 同一台手机已经开着同名窗口时不等——那一屏本来就看得见，硬等还会把旧窗口误判成本次的成功。
 function Test-WindowShown {
     param([string]$Title, [int]$ProcId)
@@ -846,6 +855,17 @@ function Get-DeviceList {
         return @($lines | ForEach-Object { ($_ -split "`t")[0] })
     } catch { return @() }
 }
+# 读取单个地址的 adb 状态：device / offline / unauthorized。查询本身失败返回 $null，地址不在列表返回空串。
+function Get-AdbDeviceState {
+    param($addr)
+    if (-not $addr) { return $null }
+    try { $out = @(Invoke-Hidden -FilePath $adb -ArgumentList @('devices') -DiscardStderr) } catch { return $null }
+    $text = ($out -join "`n")
+    if ($text -notmatch 'List of devices attached') { return $null }
+    $m = [regex]::Match($text, '(?m)^' + [regex]::Escape([string]$addr) + '\s+(\S+)')
+    if ($m.Success) { return [string]$m.Groups[1].Value }
+    return ''
+}
 # 是否为无线地址（ip:port）
 function Test-Wireless { param($s) return ($s -match '^\d{1,3}(\.\d{1,3}){3}:') }
 
@@ -875,7 +895,7 @@ function New-Lbl {
     $l.Text = $text; $l.AutoSize = $true; $l.Location = New-Object System.Drawing.Point($x, $y)
     return $l
 }
-# 素纸灰小字说明（8.5 号、自适应宽度）：按钮下方 / 弹窗里的次要提示
+# 朱砂红小字（8.5 号、自适应宽度）：字段下方的错误提示
 function New-ErrCaption {
     param($x, $y)
     $l = New-Object System.Windows.Forms.Label
@@ -884,6 +904,7 @@ function New-ErrCaption {
     $l.Location = New-Object System.Drawing.Point($x, $y)
     return $l
 }
+# 素纸灰小字说明（8.5 号、自适应宽度）：按钮下方 / 弹窗里的次要提示
 function New-Caption {
     param($text, $x, $y)
     $l = New-Object System.Windows.Forms.Label
@@ -933,7 +954,7 @@ function New-Chk {
     $c.Location = New-Object System.Drawing.Point($x, $y)
     return $c
 }
-# 主操作按钮（朱砂实心）
+# 主操作按钮（墨黑实心）
 function New-PrimaryBtn {
     param($text, $x, $y, $w, $h, $fontSize = 13)
     $b = New-Object System.Windows.Forms.Button
@@ -958,7 +979,7 @@ function New-SecondaryBtn {
     $b.Cursor = [System.Windows.Forms.Cursors]::Hand
     return $b
 }
-# 文字链接按钮（设置/刷新）
+# 文字链接按钮（设备 / 快捷键 / 设置等次要入口）
 function New-LinkBtn {
     param($text, $x, $y, $w)
     $b = New-Object System.Windows.Forms.Button
@@ -998,7 +1019,7 @@ function Set-Rounded {
     }.GetNewClosure())
 }
 
-# ---------------- 设置窗口（分页） ----------------
+# ---------------- 设置窗口（左侧分类导轨 + 右侧面板） ----------------
 # 窗口/任务栏图标：朱砂印·投屏（墨黑印章 + 素纸屏幕 + 朱砂手机），与界面同源配色。
 # 图标以 base64 内嵌，确保「复制三个文件」打包后仍自带图标，无需附带 .ico 文件。
 $script:AppIcon = $null
@@ -1220,7 +1241,7 @@ function Show-Settings {
     $navDivider = New-Object System.Windows.Forms.Panel
     $navDivider.Size = New-Object System.Drawing.Size(1, 280); $navDivider.Location = New-Object System.Drawing.Point(133, 14); $navDivider.BackColor = $cLine
 
-    # ===== 常用（把最常用 / 最重要的几项聚合在第一页） =====
+    # ===== 常用（把最常用 / 最重要的几项聚合在第一类） =====
     $tabCommon = New-Object System.Windows.Forms.Panel
     # 顺序按使用度：人人都调的清晰度/声音在前，只无线用户才碰的两项次之，调试用的控制台沉到最后
     $nudSize = New-Nud $settings.maxSize 0 4096 16 110 13
@@ -1230,7 +1251,7 @@ function Show-Settings {
     $chkReconnect = New-Chk '自动连接记住的无线设备（开机自动连附近的 · 掉线自动重连）' $settings.autoConnect 14 130
     $chkDisconnect = New-Chk '关闭助手时断开无线连接（默认保持，重开即用）' $settings.disconnectOnClose 14 158
     $chkShowConsole = New-Chk '显示 scrcpy 控制台窗口（调试用，会弹黑窗）' $settings.showConsole 14 186
-    $tt.SetToolTip($nudSize, '画面最大边长（像素）。数值越大越清晰、越小越流畅；不填=不限制。')
+    $tt.SetToolTip($nudSize, '画面最大边长（像素）。数值越大越清晰、越小越流畅；0=不限制。')
     $tt.SetToolTip($chkAudio, '取消勾选则完全不传声音（等同 --no-audio）。')
     $tt.SetToolTip($chkStay, '保持手机不锁屏，避免无线投屏中途断开。想更省电可关掉，让手机自然休眠。')
     $tt.SetToolTip($chkScreenOff, '投屏时关掉手机屏幕，明显省电、还能防偷看（投屏照常进行）。无线投屏想省电首选它。')
@@ -1238,7 +1259,7 @@ function Show-Settings {
     $tt.SetToolTip($chkDisconnect, '不勾（默认）：关掉助手后仍保持手机连接，重开即用、几乎不耗电。勾上：关助手时一并断开无线连接，重开需重新连（可能要再插一次线）。')
     $tt.SetToolTip($chkShowConsole, '勾上后投屏时会弹出一个黑色控制台窗口，里面显示 scrcpy 的运行日志。默认关闭，不影响正常使用。')
     $tabCommon.Controls.AddRange(@(
-        (New-Lbl '清晰度：' 14 16), $nudSize, (New-Caption '越大越清晰，不填=不限制' 210 19),
+        (New-Lbl '清晰度：' 14 16), $nudSize, (New-Caption '越大越清晰，0=不限制' 210 19),
         $chkAudio, $chkStay, $chkScreenOff, $chkReconnect, $chkDisconnect, $chkShowConsole))
 
     # ===== 画面 =====
@@ -1252,13 +1273,13 @@ function Show-Settings {
     $tt.SetToolTip($chkIgnoreEnc, '高级兜底：某些机型上报的编码器限制值不准，导致分辨率或独立窗口画面不对。勾上让 scrcpy 完全忽略这些限制（含对齐要求）。一般不用勾。需 scrcpy 4.1+。')
     $cbHwDec = New-Combo @('自动（用显卡解码，省电脑性能）', '软件解码（画面不对时再选）') @('', 'disabled') $settings.hwDec 110 217 230
     $tt.SetToolTip($cbHwDec, '电脑怎么把收到的画面还原出来。自动=优先让显卡干活，CPU 占用能低一个数量级、笔记本更省电，显卡干不了会自动改用 CPU。要是投屏出现花屏、偏色或整块变黑，改成「软件解码」再投，就能排除显卡的兼容问题；它更吃 CPU，平时不用选。')
-    $tt.SetToolTip($nudFps, '每秒帧数上限。不填=用默认；填 60 更顺滑、填 30 更省资源。')
-    $tt.SetToolTip($nudBit, '视频码率（Mbps）。越高越清晰越占带宽；不填=用默认（约 8M）。无线卡顿可调小。')
+    $tt.SetToolTip($nudFps, '每秒帧数上限。0=用默认；填 60 更顺滑、填 30 更省资源。')
+    $tt.SetToolTip($nudBit, '视频码率（Mbps）。越高越清晰越占带宽；0=用默认（约 8M）。无线卡顿可调小。')
     $tt.SetToolTip($cbVCodec, 'H.265/AV1 同等清晰度更省带宽，但老机型/老电脑可能不支持，卡顿就换回 H.264。VP8/VP9 仅当机型这几种都不支持时才用作兜底；它们装不进 mp4，录屏会自动转存 mkv。')
     $tt.SetToolTip($txtCrop, '只投屏幕的一块区域。格式 宽:高:左:上（像素），例如 1080:1080:0:300。不填=投整屏。')
     $tabVideo.Controls.AddRange(@(
-        (New-Lbl '帧率：' 14 19), $nudFps, (New-Caption '越高越流畅，不填=默认' 210 21),
-        (New-Lbl '画质：' 14 55), $nudBit, (New-Caption '越高越清晰，不填=默认' 210 57),
+        (New-Lbl '帧率：' 14 19), $nudFps, (New-Caption '越高越流畅，0=默认' 210 21),
+        (New-Lbl '画质：' 14 55), $nudBit, (New-Caption '越高越清晰，0=默认' 210 57),
         (New-Lbl '视频编码：' 14 91), $cbVCodec,
         (New-Lbl '裁剪画面：' 14 127), $txtCrop,
         (New-Caption '宽:高:左:上，不填=投整屏。例 1080:1080:0:300' 110 156),
@@ -1270,7 +1291,7 @@ function Show-Settings {
     $tabAudio = New-Object System.Windows.Forms.Panel
     $cbASrc = New-Combo @('手机外放声音', '麦克风') @('', 'mic') $settings.audioSource 110 73 230
     $cbACodec = New-Combo @('默认（Opus）', 'AAC（兼容）', 'FLAC（无损）', '原始 PCM') @('', 'aac', 'flac', 'raw') $settings.audioCodec 110 111 230
-    # 主开关在「常用」页也有一个：两扇页同时存在，勾选状态必须互相同步，否则保存时后读的会把先改的抹掉
+    # 主开关在「常用」类里也有一个：两处勾选框同时存在，状态必须互相同步，否则保存时后读的会把先改的抹掉
     $chkAudio2 = New-Chk '把手机声音也传到电脑' $settings.audioOn 14 18
     $chkAudio2.Add_CheckedChanged({ $chkAudio.Checked = $chkAudio2.Checked }.GetNewClosure())
     $chkAudio.Add_CheckedChanged({ $chkAudio2.Checked = $chkAudio.Checked }.GetNewClosure())
@@ -1340,13 +1361,13 @@ function Show-Settings {
     $cbRecFmt = New-Combo @('mp4', 'mkv') @('mp4', 'mkv') $settings.recFormat 110 15 110
     $nudTime = New-Nud $settings.recTimeLimit 0 86400 10 110 77
     $chkRecBg = New-Chk '后台录制（不显示画面，更省资源）' $settings.recBackground 14 114
-    $tt.SetToolTip($nudTime, '到达该秒数自动停止录制。不填=不限时，手动关窗即停。')
+    $tt.SetToolTip($nudTime, '到达该秒数自动停止录制。0=不限时，手动关窗即停。')
     $tt.SetToolTip($cbRecFmt, 'mp4 通用好打开；mkv 更稳——录制中途若被强退，mp4 可能整段丢失，mkv 一般能保住已录部分。')
     $tt.SetToolTip($chkRecBg, '勾选后录制时不弹出投屏窗口，画面只写入文件，更省 CPU。')
     $tabRec.Controls.AddRange(@(
         (New-Lbl '保存格式：' 14 18), $cbRecFmt,
         (New-Caption 'mp4 好打开；担心中途被强退丢整段，选 mkv 更稳' 110 46),
-        (New-Lbl '录制时长：' 14 80), $nudTime, (New-Caption '秒，不填=不限时长' 210 82),
+        (New-Lbl '录制时长：' 14 80), $nudTime, (New-Caption '秒，0=不限时长' 210 82),
         $chkRecBg))
 
     # ===== 通用 =====
@@ -1355,7 +1376,7 @@ function Show-Settings {
     $txtExtra = New-Txt 14 78 392
     $txtExtra.Text = $settings.extraArgs
     $lblExHint = New-Lbl '例如：--angle=90   --display-id=1   --time-limit=300' 14 108; $lblExHint.ForeColor = $cMuted
-    $tt.SetToolTip($chkLive, '它只决定窗口顶部「已连接/未连接」多久自动更新一次，不影响投屏。开着时仅在窗口处于前台才每几秒刷一次；关掉后改为手动点「刷新」，更省资源。')
+    $tt.SetToolTip($chkLive, '它只决定窗口顶部「已连接/未连接」多久自动更新一次，不影响投屏。开着时仅在窗口处于前台才每几秒刷一次；关掉后不再定时刷新，切回窗口时仍会更新一次，更省资源。')
     $tt.SetToolTip($txtExtra, '高级用法（可选，一般不用填）：在这里追加 scrcpy 命令行参数，会拼到启动命令末尾，多个用空格分隔。例如 --crop=1080:1920:0:0（裁剪画面）、--angle=90（旋转）、--display-id=1（指定屏幕）。')
 
     # 自定义 adb / scrcpy 路径（留空=用本助手同目录自带的）
@@ -1510,6 +1531,9 @@ function Show-AppPicker {
     $lb = New-Object System.Windows.Forms.ListBox
     $lb.Location = '16,74'; $lb.Size = '308,256'
     $lb.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
+    $lblEmpty = New-Caption '没有找到匹配的 App，换个关键词试试' 24 84
+    $lblEmpty.BackColor = $cWhite
+    $lblEmpty.Visible = $false
 
     $shown = New-Object System.Collections.ArrayList
     $fill = {
@@ -1523,19 +1547,23 @@ function Show-AppPicker {
             }
         }
         $lb.EndUpdate()
-        if ($lb.Items.Count -gt 0) { $lb.SelectedIndex = 0 }
+        $has = $lb.Items.Count -gt 0
+        if ($has) { $lb.SelectedIndex = 0 }
+        if ($lblEmpty) { $lblEmpty.Visible = -not $has }
+        if ($btnGo) { $btnGo.Enabled = $has }
     }
+    $btnGo = New-PrimaryBtn '打开' 16 342 308 34 10
     & $fill ''
     $txt.Add_TextChanged({ & $fill $txt.Text.Trim() })
 
-    $btnGo = New-PrimaryBtn '打开' 16 342 308 34 10
     $result = @{ app = $null }
     $pick = {
-        if ($lb.SelectedIndex -ge 0) { $result.app = $shown[$lb.SelectedIndex]; $dlg.Close() }
+        if ($lb.SelectedIndex -ge 0 -and $lb.SelectedIndex -lt $shown.Count) { $result.app = $shown[$lb.SelectedIndex]; $dlg.Close() }
     }
     $btnGo.Add_Click($pick)
     $lb.Add_DoubleClick($pick)
-    $dlg.Controls.AddRange(@($lbl, $txt, $lb, $btnGo))
+    $dlg.Controls.AddRange(@($lbl, $txt, $lb, $lblEmpty, $btnGo))
+    $lblEmpty.BringToFront()
     $dlg.AcceptButton = $btnGo
     New-EscCancel $dlg
     [void]$dlg.ShowDialog($owner)
@@ -1555,13 +1583,17 @@ function Show-ManageApps {
         $lb.BeginUpdate(); $lb.Items.Clear()
         foreach ($k in $script:customApps.Keys) { [void]$lb.Items.Add("$k   ·   $($script:customApps[$k])") }
         $lb.EndUpdate()
-        if ($lb.Items.Count -eq 0) { [void]$lb.Items.Add('（还没有，点下面「手动添加」，或用独立窗口的「更多应用…」挑完选记住）') }
+        if ($lb.Items.Count -eq 0) { [void]$lb.Items.Add('（还没有；点「手动添加」或「更多应用…」）') }
+        if ($btnDel) { $btnDel.Enabled = ($script:customApps.Count -gt 0) }
     }
-    & $refresh
 
     $btnAdd = New-SecondaryBtn '手动添加…' 16 226 156 34
     $btnDel = New-SecondaryBtn '删除选中' 188 226 156 34
-    if ($tt) { $tt.SetToolTip($btnAdd, '不知道包名？用独立窗口的「更多应用…」从手机列表里挑，会自动加进来，不用手填。') }
+    & $refresh
+    if ($tt) {
+        $tt.SetToolTip($btnAdd, '不知道包名？用独立窗口的「更多应用…」从手机列表里挑，会自动加进来，不用手填。')
+        $tt.SetToolTip($lb, '空态：点「手动添加」，或在独立窗口的「更多应用…」里挑')
+    }
     $btnAdd.Add_Click({
         $name = [Microsoft.VisualBasic.Interaction]::InputBox('给这个 App 起个显示名字（如 飞书）：', '手动添加常用应用', '')
         if ([string]::IsNullOrWhiteSpace($name)) { return }
@@ -1603,7 +1635,7 @@ function Show-CustomDisplaySize {
     $c3 = New-Caption '数值越大，界面越像手机版' 150 158
     $ok = New-PrimaryBtn '确定' 150 194 96 34 10
     $cancel = New-SecondaryBtn '取消' 254 194 86 34
-    # 校验写进字段下方红字，不再弹 MessageBox 打断（G8）：填错时窗不跳、已填内容不清空，光标送回出错那一格
+    # 校验写进字段下方红字，不再弹 MessageBox 打断（设计稿问题编号 G8）：填错时窗不跳、已填内容不清空，光标送回出错那一格
     $ok.Add_Click({
         $s = $t1.Text.Trim(); $p = $t2.Text.Trim()
         $e1.Text = ''; $e2.Text = ''
@@ -1663,7 +1695,7 @@ function Show-ResultDialog {
         $link = New-Object System.Windows.Forms.LinkLabel
         $link.Text = '查看原因'; $link.AutoSize = $true
         $link.Font = $capFont
-        $link.LinkColor = $cMuted; $link.VisitedLinkColor = $cMuted; $link.Visited = $true
+        $link.LinkColor = $cMuted; $link.VisitedLinkColor = $cMuted; $link.LinkVisited = $true
         $link.Location = New-Object System.Drawing.Point(16, $linkTop)
         $txt = New-Object System.Windows.Forms.TextBox
         $txt.Multiline = $true; $txt.ReadOnly = $true; $txt.ScrollBars = 'Vertical'
@@ -1671,12 +1703,25 @@ function Show-ResultDialog {
         $txt.Font = New-Object System.Drawing.Font('Consolas', 8.5)
         $txt.Size = New-Object System.Drawing.Size(388, 92)
         $txt.BackColor = $cWhite
-        $txt.Location = New-Object System.Drawing.Point(16, $linkTop + 22)
+        $txtTop = $linkTop + 22
+        $txt.Location = New-Object System.Drawing.Point(16, $txtTop)
         [void](Add-ErrorLog $Title $Detail)   # 展不展开都先落盘，用户不必为了留证据去截图
         $link.Add_Click({
-            $txt.Visible = -not $txt.Visible
-            $link.Text = $(if ($txt.Visible) { '收起原因' } else { '查看原因' })
-            $d.ClientSize = New-Object System.Drawing.Size(420, $baseH + $(if ($txt.Visible) { 100 } else { 0 }))
+            $show = -not $txt.Visible
+            $txt.Visible = $show
+            $link.Text = $(if ($show) { '收起原因' } else { '查看原因' })
+            # 明细框已随窗体按 DPI 缩放：按它的实际高度让按钮和窗体一起让位，
+            # 不能再用未缩放的 100 直接设 ClientSize（会把窗改窄、正文裁掉、按钮压在明细上）。
+            $dh = $txt.Height + 10
+            if (-not $show) { $dh = -$dh }
+            foreach ($b in @($d.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] })) { $b.Top += $dh }
+            $d.ClientSize = New-Object System.Drawing.Size($d.ClientSize.Width, ($d.ClientSize.Height + $dh))
+            # 展开后可能顶出屏幕底部：把窗体夹回工作区，别让“确定/收起”按钮落到屏幕外
+            try {
+                $wa = [System.Windows.Forms.Screen]::FromControl($d).WorkingArea
+                if ($d.Bottom -gt $wa.Bottom) { $d.Top = [Math]::Max($wa.Top, $wa.Bottom - $d.Height) }
+                if ($d.Right -gt $wa.Right) { $d.Left = [Math]::Max($wa.Left, $wa.Right - $d.Width) }
+            } catch {}
         }.GetNewClosure())
     }
     $x = 420 - 16
@@ -1707,12 +1752,17 @@ function Show-NewDisplay {
     $l2 = New-Lbl '（手机照常用，互不影响；需 Android 11+）' 16 38; $l2.ForeColor = $cMuted
     $cb = New-Object System.Windows.Forms.ComboBox
     $cb.DropDownStyle = 'DropDownList'; $cb.Location = New-Object System.Drawing.Point(16, 64); $cb.Size = New-Object System.Drawing.Size(288, 28)
-    foreach ($name in $apps.Keys) { [void]$cb.Items.Add($name) }
-    foreach ($name in $script:customApps.Keys) { [void]$cb.Items.Add($name) }
-    [void]$cb.Items.Add('更多应用…（从手机里挑）')
-    [void]$cb.Items.Add('手动输入名字或包名…')
-    [void]$cb.Items.Add('管理我的常用应用…')
-    $cb.SelectedIndex = 0
+    $specialApps = @('更多应用…（从手机里挑）', '手动输入名字或包名…', '管理我的常用应用…')
+    $refreshApps = {
+        $cur = [string]$cb.SelectedItem
+        $cb.Items.Clear()
+        foreach ($name in $apps.Keys) { [void]$cb.Items.Add($name) }
+        foreach ($name in $script:customApps.Keys) { [void]$cb.Items.Add($name) }
+        foreach ($name in $specialApps) { [void]$cb.Items.Add($name) }
+        $i = $cb.Items.IndexOf($cur)
+        if ($i -ge 0) { $cb.SelectedIndex = $i } else { $cb.SelectedIndex = 0 }
+    }
+    & $refreshApps
 
     # 窗口比例/方向：微信、QQ 等手机应用在“横屏平板”虚拟屏上会用平板版面、显示不全，选「竖屏·手机」即用手机版面
     $lblMode = New-Lbl '窗口比例' 16 110
@@ -1732,17 +1782,37 @@ function Show-NewDisplay {
     if ($tt) { $tt.SetToolTip($cbAudio, $audioTt); $tt.SetToolTip($lblAudio, $audioTt) }   # $tt 是主窗体作用域的，动态查找；空值守卫
 
     $btnGo = New-PrimaryBtn '打开' 16 274 288 38 11
-    $btnGo.Add_Click({ $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close() })
-    $dlg.Controls.AddRange(@($l1, $l2, $cb, $lblMode, $cbMode, $chkFixed, $capMode, $lblAudio, $cbAudio, $btnGo))
-    $dlg.AcceptButton = $btnGo
-    New-EscCancel $dlg
-    if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+    $state = @{ Target = $null; Label = $null; CustomSize = $null; CustomDpi = $null }
+    $ndBusy = $false
+    $btnGo.Add_Click({
+        if ($ndBusy) { return }
+        $ndBusy = $true
+        try {
         $sel = [string]$cb.SelectedItem
-        if ($sel -eq '管理我的常用应用…') { Show-ManageApps $owner; return }
+        if ($sel -eq '管理我的常用应用…') {
+            Show-ManageApps $dlg
+            & $refreshApps
+            return
+        }
+        $ndModeSel = [string]$cbMode.Vals[$cbMode.SelectedIndex]
+        if ($ndModeSel -eq 'custom') {
+            $askSize = if ($state.CustomSize) { [string]$state.CustomSize } else { [string]$settings.ndSize }
+            $askDpi = if ($state.CustomDpi) { [string]$state.CustomDpi } else { [string]$settings.ndDpi }
+            $ask = Show-CustomDisplaySize $dlg $askSize $askDpi
+            if (-not $ask) { return }   # 取消：留在独立窗口面板，比例/声音不丢
+            # 先记在本次面板的 pending 里，真正选定 App 后再写入 settings——取消选 App 不应改已存尺寸
+            $state.CustomSize = [string]$ask.Size; $state.CustomDpi = [string]$ask.Dpi
+            $i = $cbMode.SelectedIndex
+            $cbMode.Items[3] = $(if ($ask.Size) { "自定义 $($ask.Size)" } else { '自定义…' })
+            $cbMode.SelectedIndex = $i
+        }
         if ($sel -like '更多应用*') {
-            $app = Show-AppPicker $owner $serial
-            if (-not $app) { return }
-            $target = "+$($app.Pkg)"
+            $oldText = $btnGo.Text
+            $btnGo.Text = '正在读取应用列表…'; $btnGo.Enabled = $false; $dlg.Refresh()
+            try { $app = Show-AppPicker $dlg $serial } finally { $btnGo.Text = $oldText; $btnGo.Enabled = $true; $dlg.Refresh() }
+            if (-not $app) { return }   # 取消：留在独立窗口面板，比例/声音不丢
+            $state.Label = $app.Name
+            $state.Target = "+$($app.Pkg)"
             # 挑完顺手问一句要不要记住，下次直接在下拉里选
             if (-not $apps.Contains($app.Name) -and -not $script:customApps.Contains($app.Name)) {
                 if ([System.Windows.Forms.MessageBox]::Show("要把「$($app.Name)」加到常用列表吗？以后可直接在下拉里选它。", '常用应用', 'YesNo', 'Question') -eq 'Yes') {
@@ -1752,13 +1822,24 @@ function Show-NewDisplay {
         }
         elseif ($sel -like '手动输入*') {
             $name = [Microsoft.VisualBasic.Interaction]::InputBox("输入 App 名字（如 chrome）或完整包名（如 com.tencent.mm）。`n中文 App 建议用包名，更准确。", '独立窗口 · 打开 App', '')
-            if ([string]::IsNullOrWhiteSpace($name)) { return }
+            if ([string]::IsNullOrWhiteSpace($name)) { return }   # 取消：留在独立窗口面板
             $name = $name.Trim()
-            $target = if ($name -match '\.') { "+$name" } else { "+?$name" }
+            $state.Label = $name
+            $state.Target = if ($name -match '\.') { "+$name" } else { "+?$name" }
         }
-        elseif ($apps.Contains($sel)) { $target = '+' + $apps[$sel] }
-        elseif ($script:customApps.Contains($sel)) { $target = '+' + $script:customApps[$sel] }
+        elseif ($apps.Contains($sel)) { $state.Target = '+' + $apps[$sel]; $state.Label = $sel }
+        elseif ($script:customApps.Contains($sel)) { $state.Target = '+' + $script:customApps[$sel]; $state.Label = $sel }
         else { return }
+        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close()
+        } finally { $ndBusy = $false }
+    })
+    $dlg.Controls.AddRange(@($l1, $l2, $cb, $lblMode, $cbMode, $chkFixed, $capMode, $lblAudio, $cbAudio, $btnGo))
+    $dlg.AcceptButton = $btnGo
+    New-EscCancel $dlg
+    if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+        $target = [string]$state.Target
+        $appLabel = [string]$state.Label
+        if (-not $target) { return }
         # 按所选比例/方向算出虚拟屏尺寸与 DPI
         $ndModeSel = [string]$cbMode.Vals[$cbMode.SelectedIndex]
         $ndSz = $settings.ndSize; $ndDpi = $settings.ndDpi
@@ -1775,29 +1856,32 @@ function Show-NewDisplay {
                 $ndSz = "${w}x${h}"; $ndDpi = "$d"; $autoFit = $true
             }
             'landscape' { $ndSz = '1920x1080'; $ndDpi = '240'; $autoFit = $true }
+            # custom 的 pending 尺寸在“打开”时由 Show-CustomDisplaySize 确认，选定 App 后才落盘
             'custom'    {
-                $ask = Show-CustomDisplaySize $dlg $settings.ndSize $settings.ndDpi
-                if (-not $ask) { return }   # 取消 = 整个「打开独立窗口」作废，已存的尺寸/DPI 一个字都不动
-                $ndSz = $ask.Size; $ndDpi = $ask.Dpi
-                $settings.ndSize = $ndSz; $settings.ndDpi = $ndDpi
-                $i = $cbMode.SelectedIndex
-                $cbMode.Items[3] = $(if ($ndSz) { "自定义 $ndSz" } else { '自定义…' })
-                $cbMode.SelectedIndex = $i
+                if ($state.CustomSize) { $ndSz = [string]$state.CustomSize; $ndDpi = [string]$state.CustomDpi }
             }
         }
         $audioSel = [string]$cbAudio.Vals[$cbAudio.SelectedIndex]
         # 「自动」要服从设置里的总开关「把手机声音传到电脑」：总开关关了就不出声（独立窗口不带 Get-AudioArgs，否则总开关管不到它）；
         # 用户显式选的「播放/静音」以当次选择为准，不被总开关覆盖。
         $effAudio = if (-not $settings.audioOn -and $audioSel -eq 'auto') { 'off' } else { $audioSel }
+        if ($ndModeSel -eq 'custom' -and $state.CustomSize) {
+            $settings.ndSize = [string]$state.CustomSize; $settings.ndDpi = [string]$state.CustomDpi
+        }
         $settings.ndMode = $ndModeSel; $settings.ndFixed = $chkFixed.Checked; $settings.ndAudio = $audioSel; Save-Settings
         $pre = if ($serial) { @('-s', $serial) } else { @() }
+        # 独立窗口和普通投屏窗同用设备名会重名（任务栏分不清），标题里补上 App 名
+        $friendly = if ($serial) { Get-FriendlyName $serial } else { '' }
+        $winLabel = (@($friendly, $appLabel) | Where-Object { $_ }) -join ' · '
+        $winLabel = ($winLabel -replace '[\r\n\x00-\x1F"]', ' ').Trim()
+        $titleArg = if ($winLabel) { @("--window-title=$winLabel") } else { @() }
         # 自动模式(手机/平板版面)：窗口适配屏幕；用 --window-* 就必须非 flex（否则 scrcpy 报错），非 flex 也顺带避免最大化画面自转。
         $fitWin = if ($autoFit) { Get-FitWindowArgs $ndSz } else { @() }
         $useFixed = if ($fitWin.Count -gt 0) { $true } else { $chkFixed.Checked }
         # 虚拟屏保留系统装饰（状态栏/导航栏）：去掉 --no-vd-system-decorations 后，像微信这种 App 会把自己的顶栏
         # 同时画进「状态栏预留区」和正常位置，出现「两条一样的顶栏」；保留系统栏则是正常的「状态栏+单顶栏」手机观感。
         # @() 防单元素退化粘连（同 Get-MirrorArgs 处的坑）：$pre 为空时 $null+单元素串 会变字符串拼接
-        Start-Scrcpy ($pre + @(Get-HwDecArgs) + @(Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + "--start-app=$target") -AudioMode $effAudio
+        Start-Scrcpy ($pre + @(Get-HwDecArgs) + @(Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + $titleArg + "--start-app=$target") -AudioMode $effAudio
     }
 }
 
@@ -2235,11 +2319,38 @@ function Connect-ByIp {
         if (-not $port) { $port = '5555' }
         if ($port -notmatch '^\d+$') { [System.Windows.Forms.MessageBox]::Show('端口应为纯数字，常见是 5555。', '输入 IP 连接') | Out-Null; return }
         $addr = "${ip}:$port"
+        # 先短探一下地址是否可达：不可达时 adb connect 在 Windows 上会卡 10~40 秒，
+        # 输入框看着像死机；探测失败直接给人话，不进入那次长阻塞。
+        # 手动输入给 3 秒：弱 Wi-Fi/手机休眠时 TCP 握手可能超过 1.2 秒，太短会误拒可达设备。
+        $reach = @(Get-ReachableAddrs @($addr) 3000)
+        if ($reach.Count -eq 0) {
+            [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '手机没开「无线调试」或与电脑不在同一 WiFi：Android 11+ 去开发者选项里打开；更早的手机先插一次线，点「无线投屏 → 插数据线连接」切换。' "电脑上探测不到 $addr（IP 或端口没有响应）。" @('ok'))
+            return
+        }
         try { $out = (Invoke-Hidden -FilePath $adb -ArgumentList @('connect', $addr)) -join "`n" } catch { $out = $_.Exception.Message }
-        if ($out -match 'connected to') {
+        # 刚连上的设备可能短暂 offline；轮询 3 秒再判定。只有明确 offline/unauthorized 才 disconnect，
+        # 查询本身失败或地址没出现时绝不 disconnect，避免拆掉可能正在工作的无线会话（录制中会丢文件）。
+        $state = $null
+        $deadline = (Get-Date).AddSeconds(3)
+        do {
+            $state = Get-AdbDeviceState $addr
+            if ($state -eq 'device' -or $state -eq 'unauthorized') { break }
+            Start-Sleep -Milliseconds 250
+        } while ((Get-Date) -lt $deadline)
+        if ($state -eq 'device') {
             $result.addr = $addr; $dlg.Close()
+        } elseif ($state -eq 'offline' -or $state -eq 'unauthorized') {
+            try { Invoke-Hidden -FilePath $adb -ArgumentList @('disconnect', $addr) | Out-Null } catch {}
+            $body = if ($state -eq 'unauthorized') {
+                '手机上还没允许这台电脑调试：点亮手机，在「允许 USB 调试」弹窗里点允许后再试。'
+            } else {
+                '设备处于 offline 状态（常见于无线调试未完全就绪），已清理这次连接，请再试一次。'
+            }
+            [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" $body $out @('ok'))
+        } elseif ($state -eq '') {
+            [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '手机没开「无线调试」或与电脑不在同一 WiFi：Android 11+ 去开发者选项里打开；更早的手机先插一次线，点「无线投屏 → 插数据线连接」切换。' $out @('ok'))
         } else {
-            [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '手机没开「无线调试」就连不上：Android 11+ 去开发者选项里打开；更早的手机先插一次线，点「无线投屏 → 插数据线连接」切换。' $out @('ok'))
+            [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '电脑上查询设备状态失败（adb 没返回设备列表），这次没有断开任何连接；请稍后重试。' $out @('ok'))
         }
     })
     $dlg.Controls.AddRange(@($l1, $l2, $l3, $txtIp, $l4, $txtPort, $btnGo))
@@ -2419,7 +2530,17 @@ function Show-DeviceManager {
     $lv.Add_DoubleClick({ Invoke-MainFlow ({ & $rowDouble }) $dlg $script:dmFlow })
     $btnConnect.Add_Click({ Invoke-MainFlow ({ & $connectSelected }) $dlg $script:dmFlow })
     $btnCast.Add_Click({ Invoke-MainFlow ({ & $castSelected }) $dlg $script:dmFlow })
-    $btnStop.Add_Click({ Invoke-MainFlow ({ & $stopSelected }) $dlg $script:dmFlow })
+    $btnStop.Add_Click({
+        $oldStopText = $btnStop.Text
+        $btnStop.Text = '正在停止…'; $btnStop.Enabled = $false; $dlg.Refresh()
+        try { Invoke-MainFlow ({ & $stopSelected }) $dlg $script:dmFlow }
+        finally {
+            $btnStop.Text = $oldStopText
+            # 忙态直接 return / body 抛异常时 stopSelected 不会跑，必须自己把按钮状态算回来
+            try { & $updateButtons } catch { $btnStop.Enabled = $true }
+            $dlg.Refresh()
+        }
+    })
     $btnAll.Add_Click({ Invoke-MainFlow ({ & $castAll }) $dlg $script:dmFlow })
     $btnDisc.Add_Click({ Invoke-MainFlow ({
         $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
@@ -2607,7 +2728,7 @@ try {
     $rule2.BackColor = $cLine
     $form.Controls.Add($rule2)
 
-    # 底部：提示（左） + 设备/快捷键/设置/刷新 链接 + GitHub 图标（右，归入「工具/关于」这组安静的次要入口）
+    # 底部：提示（左） + 设备/快捷键/设置 链接 + GitHub 图标（右，归入「工具/关于」这组安静的次要入口）
     $lblHint = New-Caption '首次连接点「允许 USB 调试」' 28 338
     $form.Controls.Add($lblHint)
     # 底部非模态临时提示（录制提示 / 摄像头自动重连提示共用）：换文案几秒后自动恢复原提示。
@@ -2640,6 +2761,9 @@ try {
         $script:hintRestore.Stop()
         if ($null -ne $ms) { $script:hintRestore.Interval = $ms; $script:hintRestore.Start() }   # $null = 挂着不自动还原
     }
+    # 主流程收尾一律清掉忙提示；流程内确实要保留的提示（如「录制中」）用它豁免一次，
+    # 让提示自己的定时器负责还原——否则刚亮出来就被 Invoke-MainFlow 的 finally 抹掉。
+    $script:hintKeepAfterFlow = $false
     # 不再放「刷新」：状态会在窗口重新获得焦点时自动重测，「设备」管理打开也会重新扫描
     $btnDevices = New-LinkBtn '设备' 288 334 52
     $btnShortcuts = New-LinkBtn '快捷键' 344 334 62
@@ -2766,6 +2890,7 @@ try {
         $statusSnap = $null
         if ($isMain) {
             Set-BusyLook -On $true -Source $Source
+            $script:hintKeepAfterFlow = $false
             try { $form.ActiveControl = $null } catch {}   # 去掉刚点过那个链接留下的焦点框
             $statusSnap = @{ Text = $lblStatus.Text; Back = $lblStatus.BackColor; Fore = $lblStatus.ForeColor }
             $lblStatus.BackColor = $cTagBg; $lblStatus.ForeColor = $cMuted
@@ -2782,7 +2907,11 @@ try {
                     $lblStatus.Text = $statusSnap.Text; $lblStatus.BackColor = $statusSnap.Back; $lblStatus.ForeColor = $statusSnap.Fore
                 }
                 $script:hintHeld = $false
-                & $script:restoreHint
+                if ($script:hintKeepAfterFlow) {
+                    $script:hintKeepAfterFlow = $false
+                } else {
+                    & $script:restoreHint
+                }
             }
             $Flag.Busy = $false
         }
@@ -2790,7 +2919,7 @@ try {
 
     $btnWired.Add_Click({ Invoke-MainFlow -Source $btnWired ({
         $devs = @(Ensure-Devices $form)
-        if ($devs.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('没检测到手机。请用数据线连接并点「允许 USB 调试」，或点右上角的连接状态走无线连接。', '有线投屏') | Out-Null; return }
+        if ($devs.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show("没检测到手机。请用数据线连接并点「允许 USB 调试」，或点右上角的连接状态走无线连接。`n`n不会开 USB 调试？看同目录的「使用说明.txt」第一节。", '有线投屏') | Out-Null; return }
         $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
         $wl  = @($devs | Where-Object { Test-Wireless $_ })
         # 有线优先：只要有 USB 设备就在 USB 里选；没有 USB 才退回无线。
@@ -2847,7 +2976,7 @@ try {
                     # 用户看到的就是「点了继续什么都没发生」。
                     $devs = @(Get-DeviceList)
                     if ($devs.Count -gt 0) { break }
-                    $again = Show-ResultDialog $form '连接手机' '还是没检测到手机' '检查数据线是否插好、手机上是否点过「允许 USB 调试」。手机重启过也要重新插一次线；不想插线也可以直接输 IP。' '' @('retry', 'ip', 'cancel')
+                    $again = Show-ResultDialog $form '连接手机' '还是没检测到手机' "检查数据线是否插好、手机上是否点过「允许 USB 调试」。手机重启过也要重新插一次线；不想插线也可以直接输 IP。`n`n不会开 USB 调试？看同目录的「使用说明.txt」第一节。" '' @('retry', 'ip', 'cancel')
                     if ($again -eq 'ip') { $wantIp = $true; break }
                     if ($again -ne 'retry') { return }
                 }
@@ -3006,6 +3135,15 @@ try {
                 $a += '--camera-ar=16:9'
                 if ([int]$selVal -gt 0) { $a += @('-m', "$selVal") }
             }
+            # 采集尺寸可能大于屏幕工作区（如 1856x1392 落在 1080p 上）；只缩窗口，不改采集分辨率。
+            # 数字 fallback（1920/1280）按 16:9 推导 WxH 后再适配；0=原始最高，无法预知，不猜。
+            $fitSize = $selVal
+            if ($fitSize -match '^(\d+)$') {
+                $longEdge = [int]$fitSize
+                if ($longEdge -gt 0) { $fitSize = '{0}x{1}' -f $longEdge, [int][Math]::Round($longEdge * 9 / 16) }
+            }
+            if ($fitSize -match '^(\d+)x(\d+)$' -and $rbPort.Checked) { $fitSize = "$($matches[2])x$($matches[1])" }
+            $a += @(Get-FitWindowArgs $fitSize)
             # 竖屏旋转要分前后置：多数机型后置传感器方向 90°、前置 270°（差 180°），--capture-orientation 只叠加旋转、
             # 不自动补偿这个差异——前置若也用 90 会上下颠倒，需 270 才是正的。
             if ($rbPort.Checked) { $a += $(if ($rbFront.Checked) { '--capture-orientation=270' } else { '--capture-orientation=90' }) }
@@ -3051,10 +3189,22 @@ try {
             if ($settings.stayAwake) { $a += $(if (Test-Wireless $tgt.Serial) { '--keep-active' } else { '-w' }) }
             if ([int]$settings.recTimeLimit -gt 0) { $a += "--time-limit=$($settings.recTimeLimit)" }
             if ($settings.recBackground) { $a += @('--no-window', '--no-playback') }
+            $beforeRec = $scrcpyProcs.Count
             Start-Scrcpy $a -Recording
             # 非模态提示（不弹窗打断）：把底部提示行临时换成录制提示，几秒后自动恢复。文字保持短，避免压到右侧「设备/快捷键/设置」链接。
-            $recTip = if ($settings.recBackground) { '● 后台录制中 · 「设备」里停止投屏即保存' } else { '● 录制中 · 关掉投屏窗口即停止并保存' }
-            & $script:showTempHint $recTip $cGreen
+            # 只看本次新增的录制进程：旧录制还在时，新录制失败不能被误报成「录制中」。
+            $recStarted = $false
+            if ($scrcpyProcs.Count -gt $beforeRec) {
+                try {
+                    $newRec = $scrcpyProcs[$scrcpyProcs.Count - 1]
+                    $recStarted = ($newRec.Rec -and $newRec.Proc -and -not $newRec.Proc.HasExited)
+                } catch {}
+            }
+            if ($recStarted) {
+                $recTip = if ($settings.recBackground) { '● 后台录制中 · 「设备」里停止投屏即保存' } else { '● 录制中 · 关掉投屏窗口即停止并保存' }
+                & $script:showTempHint $recTip $cGreen
+                $script:hintKeepAfterFlow = $true
+            }
         }
     }) })
 
