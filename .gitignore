@@ -2,6 +2,9 @@
 投屏助手-设置.json
 settings.json
 
+# 用户运行时生成的错误日志（脚本旁，下一次未处理异常会追加）
+投屏助手-错误日志.txt
+
 # scrcpy 官方二进制 —— 不入库，发布时再放进 Release zip
 scrcpy.exe
 adb.exe
@@ -11,6 +14,7 @@ open_a_terminal_here.bat
 scrcpy-noconsole.vbs
 disconnected.png
 scrcpy.png
+LICENSE.txt   # scrcpy 官方包自带的 Apache-2.0 全文（随发行包转发，本仓库自己的许可是 LICENSE）
 
 # 打包产物
 *.zip
