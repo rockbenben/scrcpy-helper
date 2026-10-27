@@ -2,6 +2,26 @@
 
 欢迎 issue / PR。
 
+## 改界面时
+
+界面文案全部内嵌在 `scrcpy-helper.ps1`。改任何一段用户看得见的文字，同一轮里一起改：
+
+- `README.md`：概览与「能做什么」里逐字引用的说法
+- `使用说明.txt`：随包说明书，逐字引用必须对得上
+- 脚本里的悬停提示与按钮文案：同一件事在别处也要统一口径
+
+口径上有一条容易写错：数字输入框最小值是 0、留不下空值，所以要写「0=不限制」「0=用默认」；只有文本框才写「不填=…」（如「不填=投整屏」「不填=用自带的」）。
+
+改完做一次语法自检（不用起界面）：
+
+```powershell
+$err = $null; $tok = $null
+[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\scrcpy-helper.ps1), [ref]$tok, [ref]$err) | Out-Null
+$err | ForEach-Object { $_.Message }
+```
+
+没有输出就是没语法错。但语法过了不等于界面对了——改了控件坐标或文案，还得双击 `投屏助手-双击运行.bat` 起真程序看一遍。
+
 ## 打包发行版
 
 仓库不含 scrcpy 二进制，打包就是复制三个文件：把 `scrcpy-helper.ps1`、`投屏助手-双击运行.bat`、`使用说明.txt` 复制进 [scrcpy](https://github.com/Genymobile/scrcpy/releases) 的解压目录，整个文件夹压成 zip。用户解压后双击 `.bat` 即可使用。
