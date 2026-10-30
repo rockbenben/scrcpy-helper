@@ -257,6 +257,7 @@ $defaults = [ordered]@{
     camZoom = '1'
     # 摄像头面板上次的选择（全局偏好）：前后置 back/front、方向 land/port、补光灯、麦克风。分辨率另按设备+前后记在 camResByDevice。
     camFacing = 'back'; camOrientation = 'land'; camTorch = $false; camMic = $false
+    camRotate180 = $false
     # 窗口
     fullscreen = $false; onTop = $false; borderless = $false; minToTray = $false
     # 独立窗口
@@ -501,6 +502,13 @@ function Get-FitWindowArgs {
     $winW = [int]$winW; $winH = [int]$winH
     if ($winW -le 0 -or $winH -le 0) { return @() }
     return @("--window-width=$winW", "--window-height=$winH")
+}
+function Get-CamOrientationArgs {
+    param([string]$facing, [string]$orientation, [bool]$rotate180)
+    $rotation = if ($orientation -eq 'port') { if ($facing -eq 'front') { 270 } else { 90 } } else { 0 }
+    if ($rotate180) { $rotation = ($rotation + 180) % 360 }
+    if ($rotation -eq 0) { return @() }
+    return @("--capture-orientation=$rotation")
 }
 # 运行 scrcpy --list-camera-sizes，按朝向解析出本机真正支持的采集分辨率。
 # 不同机型差别很大，写死 1080p 之类会触发 “Camera configuration error”（录像支持 ≠ 投屏采集支持），
@@ -2785,7 +2793,7 @@ try {
 
     $tt.SetToolTip($btnWired, '用数据线连接，最稳定、延迟最低。若当前没有数据线设备，这个按钮投的是已连上的那台无线设备。')
     $tt.SetToolTip($btnWireless, '不用线。已连手机时直接开始；首次可选插一次线，或 Android 11+ 用配对码免插线。')
-    $tt.SetToolTip($btnCamera, '把手机摄像头当电脑摄像头用（需 Android 12+）。')
+    $tt.SetToolTip($btnCamera, '把手机摄像头当电脑摄像头用（需 Android 12+）；支持横屏、竖屏和「旋转 180°（倒置修正）」。')
     $tt.SetToolTip($btnRecord, '把手机屏幕录制成视频文件。')
     $tt.SetToolTip($btnNd, '在电脑上单开一块屏运行某个 App，不影响手机（需 Android 11+）。')
     $tt.SetToolTip($btnShortcuts, 'scrcpy 常用快捷键速查（全屏、息屏、旋转、复制粘贴、拖文件装 APK 等）。')
@@ -3020,7 +3028,7 @@ try {
         $camSizes = Get-CameraSizes $serial
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
         $camDetected = ((@($camSizes.back).Count + @($camSizes.front).Count) -gt 0)
-        $dlg = New-Dialog '手机当摄像头' 264 376 $form
+        $dlg = New-Dialog '手机当摄像头' 264 404 $form
 
         $gb1 = New-Object System.Windows.Forms.GroupBox
         $gb1.Text = '摄像头'; $gb1.Location = '16,12'; $gb1.Size = '232,52'
@@ -3029,17 +3037,19 @@ try {
         $gb1.Controls.AddRange(@($rbBack, $rbFront))
 
         $gb2 = New-Object System.Windows.Forms.GroupBox
-        $gb2.Text = '画面方向'; $gb2.Location = '16,74'; $gb2.Size = '232,52'
+        $gb2.Text = '画面方向'; $gb2.Location = '16,74'; $gb2.Size = '232,80'
         $rbLand = New-Object System.Windows.Forms.RadioButton; $rbLand.Text = '横屏'; $rbLand.Location = '16,20'; $rbLand.AutoSize = $true; $rbLand.Checked = ($settings.camOrientation -ne 'port')
         $rbPort = New-Object System.Windows.Forms.RadioButton; $rbPort.Text = '竖屏'; $rbPort.Location = '124,20'; $rbPort.AutoSize = $true; $rbPort.Checked = ($settings.camOrientation -eq 'port')
-        $gb2.Controls.AddRange(@($rbLand, $rbPort))
+        $chkRotate180 = New-Chk '旋转 180°（倒置修正）' $settings.camRotate180 16 48
+        $tt.SetToolTip($chkRotate180, '手机倒置时勾选，在横屏或竖屏基础上再旋转 180°，不是左右镜像。点「开始」后记住。')
+        $gb2.Controls.AddRange(@($rbLand, $rbPort, $chkRotate180))
 
         # 分辨率：优先用实测支持尺寸（精确 --camera-size，一定能开）；读不到时回退到「最大边长」通用档位。
         # 下拉内容随「后置/前置」切换重填——两个摄像头支持的尺寸常常不一样。
-        $lblRes = New-Lbl '分辨率' 16 140
-        $cbRes = New-Combo @('自动') @('auto') 'auto' 78 137 170
+        $lblRes = New-Lbl '分辨率' 16 168
+        $cbRes = New-Combo @('自动') @('auto') 'auto' 78 165 170
         # 说明文字顶格放、限宽自动换行：原先跟在下拉下方 x=78 起步，固定宽度的窗横向摆不下、尾巴被裁掉看不全
-        $capRes = New-Caption '' 16 168
+        $capRes = New-Caption '' 16 196
         $capRes.MaximumSize = New-Object System.Drawing.Size(230, 0)
         $fillRes = {
             param($facing)
@@ -3073,10 +3083,10 @@ try {
         $capRes.Text = if ($camDetected) { '✓ 已读取本机支持的尺寸；带不动会自动降一档重试' } else { '没读到支持列表，用通用档位；打不开会自动重试' }
         # 初始倍率：可填范围按这台设备实测的 zoom-range 定（读不到就 1~10 通用范围），倍率值让用户自己填并按设备+前后记住。
         # 控件摆在下面的复选框之后，但得赶在朝向事件之前定义好——前后置的变焦范围不一样，切朝向要跟着重填。
-        $lblZoom = New-Lbl '初始倍率' 16 268
+        $lblZoom = New-Lbl '初始倍率' 16 296
         $nudZoom = New-Object System.Windows.Forms.NumericUpDown
         $nudZoom.DecimalPlaces = 1; $nudZoom.Increment = [decimal]0.1
-        $nudZoom.Location = New-Object System.Drawing.Point(78, 265); $nudZoom.Size = New-Object System.Drawing.Size(90, 26)
+        $nudZoom.Location = New-Object System.Drawing.Point(78, 293); $nudZoom.Size = New-Object System.Drawing.Size(90, 26)
         $nudZoom.BorderStyle = 'FixedSingle'; $nudZoom.BackColor = $cWhite   # 扁平描边，同 New-Nud
         $fillZoom = {
             param($facing)
@@ -3098,13 +3108,13 @@ try {
         $rbBack.Add_CheckedChanged({ if ($rbBack.Checked) { & $fillRes 'back'; & $fillZoom 'back' } })
         $rbFront.Add_CheckedChanged({ if ($rbFront.Checked) { & $fillRes 'front'; & $fillZoom 'front' } })
 
-        $chkTorch = New-Chk '打开补光灯' $settings.camTorch 16 208
-        $chkMic = New-Chk '同时采集麦克风声音' $settings.camMic 16 236
+        $chkTorch = New-Chk '打开补光灯' $settings.camTorch 16 236
+        $chkMic = New-Chk '同时采集麦克风声音' $settings.camMic 16 264
 
-        $capZoom = New-Caption '投屏中还能按 左 Alt + ↑ / ↓ 实时变焦' 16 296
+        $capZoom = New-Caption '投屏中还能按 左 Alt + ↑ / ↓ 实时变焦' 16 324
         $capZoom.MaximumSize = New-Object System.Drawing.Size(230, 0)
 
-        $btnGo = New-PrimaryBtn '开始' 16 324 232 34 11
+        $btnGo = New-PrimaryBtn '开始' 16 352 232 34 11
         $btnGo.Add_Click({ $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close() })
 
         $dlg.Controls.AddRange(@($gb1, $gb2, $lblRes, $cbRes, $capRes, $chkTorch, $chkMic, $lblZoom, $nudZoom, $capZoom, $btnGo))
@@ -3119,6 +3129,7 @@ try {
             # 面板其余选择记成全局偏好，下次打开沿用：前后置 / 横竖屏 / 补光灯 / 麦克风
             $settings.camFacing = $facing
             $settings.camOrientation = if ($rbPort.Checked) { 'port' } else { 'land' }
+            $settings.camRotate180 = $chkRotate180.Checked
             $settings.camTorch = $chkTorch.Checked
             $settings.camMic = $chkMic.Checked
             Save-Settings
@@ -3146,7 +3157,7 @@ try {
             $a += @(Get-FitWindowArgs $fitSize)
             # 竖屏旋转要分前后置：多数机型后置传感器方向 90°、前置 270°（差 180°），--capture-orientation 只叠加旋转、
             # 不自动补偿这个差异——前置若也用 90 会上下颠倒，需 270 才是正的。
-            if ($rbPort.Checked) { $a += $(if ($rbFront.Checked) { '--capture-orientation=270' } else { '--capture-orientation=90' }) }
+            $a += @(Get-CamOrientationArgs $facing $settings.camOrientation $chkRotate180.Checked)
             if ($chkTorch.Checked) { $a += '--camera-torch' }
             if ($chkMic.Checked) { $a += '--audio-source=mic' } else { $a += '--no-audio' }
             $a += @(Get-HwDecArgs)
