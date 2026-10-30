@@ -241,7 +241,8 @@ $apps = [ordered]@{
 
 # ---------------- 设置（改完点「保存」才写进 投屏助手-设置.json） ----------------
 # 设置窗口里的改动只停在控件上：点「保存」才落盘，点「取消」丢弃。
-# 设置窗口之外的即时选择（设备重命名、常用 App、摄像头分辨率/倍率、独立窗口的比例与声音）当场就存。
+# 设置窗口之外的即时选择（设备重命名、常用 App、摄像头面板的分辨率/倍率/前后置/横竖屏/倒置修正/补光灯/麦克风、
+# 独立窗口的比例与声音）当场就存。
 # 用 [ordered] 有序表：保存出来的 JSON 键顺序就按下面的分组排（画面/声音/控制/…），不再是哈希随机序、看着乱。
 $defaults = [ordered]@{
     # 画面
@@ -255,7 +256,7 @@ $defaults = [ordered]@{
     camResMax = '1920'
     # 摄像头初始倍率的全局兜底（换设备、没记录时用）；具体倍率同样按设备+前后记在 camResByDevice（键带 |zoom 后缀）
     camZoom = '1'
-    # 摄像头面板上次的选择（全局偏好）：前后置 back/front、方向 land/port、补光灯、麦克风。分辨率另按设备+前后记在 camResByDevice。
+    # 摄像头面板上次的选择（全局偏好）：前后置 back/front、方向 land/port、倒置修正、补光灯、麦克风。分辨率另按设备+前后记在 camResByDevice。
     camFacing = 'back'; camOrientation = 'land'; camTorch = $false; camMic = $false
     camRotate180 = $false
     # 窗口
@@ -503,9 +504,20 @@ function Get-FitWindowArgs {
     if ($winW -le 0 -or $winH -le 0) { return @() }
     return @("--window-width=$winW", "--window-height=$winH")
 }
+# 摄像头画面方向的基准角。--capture-orientation 只在采集流上叠加旋转，不会替我们补偿前后置摄像头之间
+# 那 180° 的差异（前置镜头在机身另一面，传感器方向与后置相反），所以基准角必须自己算对：
+#   竖屏：后置 90°、前置 270°——真机实测过（「摄像头前置竖屏方向修正」那次改动）。
+#   横屏：手机转 90°，前后置的原始画面一起转 90°，两者之间那 180° 的差并不变 → 后置 0°、前置 180°。
+#     ← 这一格是按上面那条 180° 差推出来的，还没单独在真机上验过（以前横屏一律不传参数，等于漏了这半圈）。
+#       要确认的话：选前置 + 横屏，看画面是不是正的；不对就把这里的 180 改回 0。
+# $rotate180 = 面板上的「旋转 180°（倒置修正）」：手机整个倒过来放时画面跟着转半圈，在基准角上再叠 180°。
 function Get-CamOrientationArgs {
-    param([string]$facing, [string]$orientation, [bool]$rotate180)
-    $rotation = if ($orientation -eq 'port') { if ($facing -eq 'front') { 270 } else { 90 } } else { 0 }
+    param([string]$facing, [bool]$portrait, [bool]$rotate180)
+    $rotation = if ($portrait) {
+        if ($facing -eq 'front') { 270 } else { 90 }
+    } else {
+        if ($facing -eq 'front') { 180 } else { 0 }
+    }
     if ($rotate180) { $rotation = ($rotation + 180) % 360 }
     if ($rotation -eq 0) { return @() }
     return @("--capture-orientation=$rotation")
@@ -3126,7 +3138,7 @@ try {
             $zs = Format-Zoom $nudZoom.Value
             Set-CamRemembered $serial $facing $selVal                  # 分辨率按设备+前后记
             Set-CamZoom $serial $facing $zs                            # 初始倍率同理（看门狗重连沿用同一份参数，倍率不会丢）
-            # 面板其余选择记成全局偏好，下次打开沿用：前后置 / 横竖屏 / 补光灯 / 麦克风
+            # 面板其余选择记成全局偏好，下次打开沿用：前后置 / 横竖屏 / 倒置修正 / 补光灯 / 麦克风
             $settings.camFacing = $facing
             $settings.camOrientation = if ($rbPort.Checked) { 'port' } else { 'land' }
             $settings.camRotate180 = $chkRotate180.Checked
@@ -3155,9 +3167,9 @@ try {
             }
             if ($fitSize -match '^(\d+)x(\d+)$' -and $rbPort.Checked) { $fitSize = "$($matches[2])x$($matches[1])" }
             $a += @(Get-FitWindowArgs $fitSize)
-            # 竖屏旋转要分前后置：多数机型后置传感器方向 90°、前置 270°（差 180°），--capture-orientation 只叠加旋转、
-            # 不自动补偿这个差异——前置若也用 90 会上下颠倒，需 270 才是正的。
-            $a += @(Get-CamOrientationArgs $facing $settings.camOrientation $chkRotate180.Checked)
+            # 画面方向：横屏 / 竖屏 各有自己的基准角，再按「旋转 180°（倒置修正）」叠加半圈——手机整个倒过来放时，
+            # 画面正好转 180°，靠这个勾纠正。基准角怎么算见 Get-CamOrientationArgs。
+            $a += @(Get-CamOrientationArgs $facing $rbPort.Checked $chkRotate180.Checked)
             if ($chkTorch.Checked) { $a += '--camera-torch' }
             if ($chkMic.Checked) { $a += '--audio-source=mic' } else { $a += '--no-audio' }
             $a += @(Get-HwDecArgs)
