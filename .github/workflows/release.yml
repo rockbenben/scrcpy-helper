@@ -1,0 +1,204 @@
+name: Release
+
+# push 一个 v* 标签：自动打发行包、建 Release、传资产，并核对 releases/latest 指向它。
+#
+# 手工补发（标签已经推了、这个 workflow 当时还不存在）：Actions 页面 → 本 workflow →
+# Run workflow，填标签名。标签推上去的那一刻 GitHub 只认**那个提交里已有的** workflow，
+# 所以后加的 workflow 不会因为旧标签自动补跑一次，只能这样手动叫醒它。
+#
+# ⚠️ **为什么发布完还要显式核对 latest**：GitHub 在「草稿转成已发布」时**不会**重算
+# `releases/latest` 指向谁。字段全对（draft=false、published_at 有值）而指针没挪，
+# `releases/latest/download/...` 照样 404——已装的应用从此收不到更新（同族仓库踩过一次）。
+# 判据是**看 API 指到谁**，不是看 release 的字段；CDN 那层重定向再滞后几分钟属正常。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的标签（如 v1.6.2）'
+        required: true
+        type: string
+
+jobs:
+  # 标签指向的提交也得先过检查才准发版：复用 ci.yml（workflow 之间不能互相 needs，
+  # 所以把检查做成可复用工作流，由这里显式调用）。
+  preflight:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: preflight
+    runs-on: windows-latest
+    timeout-minutes: 20          # 卡住就快点红，别一路挂到 6 小时上限
+    permissions:
+      contents: write            # 建 Release / 传资产需要写权限
+      id-token: write            # attest 那步要 OIDC 令牌
+      attestations: write        # 同上：把构建来源证明写回 GitHub 侧
+    env:
+      # 打包基线（见 CONTRIBUTING「打包发行版」）。scrcpy 出新版本时，连同文档一起改这里。
+      SCRCPY_VERSION: '5.0.1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0           # 要拿上一个标签来列提交范围
+
+      - name: Derive version from tag
+        id: ver
+        shell: bash
+        run: |
+          
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "打包 $tag（版本号 ${tag#v}）"
+
+      - name: Download the official scrcpy package and check it against the official checksums
+        shell: pwsh
+        run: |
+          
+          $v = '${{ env.SCRCPY_VERSION }}'
+          $base = "https://github.com/Genymobile/scrcpy/releases/download/v$v"
+          $sums = "$env:RUNNER_TEMP/SHA256SUMS.txt"
+          Invoke-WebRequest -Uri "$base/SHA256SUMS.txt" -OutFile $sums -UseBasicParsing
+          $zip = "$env:RUNNER_TEMP/scrcpy-win64-v$v.zip"
+          Invoke-WebRequest -Uri "$base/scrcpy-win64-v$v.zip" -OutFile $zip -UseBasicParsing
+          # 用**官方**的校验和核对：自己在仓库里记一份哈希，只能证明「没变过」，证明不了「就是官方那一份」。
+          $expect = (((Get-Content $sums) | Where-Object { $_ -match "scrcpy-win64-v$v\.zip$" } | Select-Object -First 1) -split '\s+')[0].ToLower()
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($expect -ne $actual) { throw "官方包校验和不符：期望 $expect，实际 $actual" }
+          "✓ scrcpy-win64-v$v.zip 与官方 SHA256SUMS.txt 一致"
+
+      - name: Build the release package
+        shell: pwsh
+        run: |
+          
+          $v = '${{ env.SCRCPY_VERSION }}'
+          $stage = "$env:RUNNER_TEMP/stage"
+          $src = "$env:RUNNER_TEMP/scrcpy-win64-v$v.zip"
+          # 产物放工作区根目录：后面的 SHA256SUMS 与 attach 步骤都按相对路径引用，
+          # 和同族仓库的写法一致，少一层「这个绝对路径到底指到哪」的疑虑。
+          $out = "scrcpy-helper-${{ steps.ver.outputs.version }}-windows.zip"
+          Expand-Archive -LiteralPath $src -DestinationPath $stage -Force
+          # 官方包里带一层目录 scrcpy-win64-vX.Y.Z/，发行包要的是它的**内容**平铺在根目录。
+          $pkg = Get-ChildItem $stage -Directory
+          if ($pkg.Count -ne 1) { throw "官方包解出 $($pkg.Count) 个顶层目录，与预期不符" }
+          $root = $pkg[0].FullName
+          $before = @{}
+          foreach ($f in Get-ChildItem $root -File) { $before[$f.Name] = (Get-FileHash $f.FullName -Algorithm SHA256).Hash }
+          # 自己的三个文件放进去；万一和 scrcpy 的文件重名，必须停下——那会改坏转发给用户的文件。
+          foreach ($n in @('scrcpy-helper.ps1','投屏助手-双击运行.bat','使用说明.txt')) {
+            if (Test-Path (Join-Path $root $n)) { throw "官方包里已有同名文件 $n" }
+            Copy-Item $n (Join-Path $root $n)
+          }
+          # 转发文件必须逐字节没动：THIRD-PARTY-NOTICES 承诺「逐字节原样转发」，
+          # Apache-2.0 第 4(b) 条也要求改动必须显著标注——这里干脆一个字节都不改。
+          $changed = @()
+          foreach ($f in Get-ChildItem $root -File) {
+            if ($before.ContainsKey($f.Name) -and (Get-FileHash $f.FullName -Algorithm SHA256).Hash -ne $before[$f.Name]) { $changed += $f.Name }
+          }
+          if ($changed.Count) { throw "scrcpy 文件被改动：$($changed -join ', ')" }
+          if (-not (Test-Path (Join-Path $root 'LICENSE.txt'))) { throw 'LICENSE.txt 缺失（Apache-2.0 要求随包转发）' }
+          $count = (Get-ChildItem $root -File).Count
+          if ($count -ne 19) { throw "包内文件数应为 19（16 个 scrcpy + 3 个自己的），实为 $count" }
+          "✓ $count 个条目，scrcpy 的 $($before.Count) 个文件逐字节未改动，LICENSE.txt 在"
+          # 打包：用 .NET 的 API 不用 Compress-Archive——后者在 Windows PowerShell 5.1 上
+          # 对非 ASCII 文件名（使用说明.txt / 投屏助手-双击运行.bat）有编码坑。
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipOut = [System.IO.Compression.ZipFile]::Open($out, [System.IO.Compression.ZipArchiveMode]::Create)
+          try {
+            foreach ($f in Get-ChildItem $root -File | Sort-Object Name) {
+              [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zipOut, $f.FullName, $f.Name, [System.IO.Compression.CompressionLevel]::Optimal)
+            }
+          } finally { $zipOut.Dispose() }
+          "✓ $out"
+
+      # 编码写死 ascii：内容本来全是 ASCII，写死就不吃两代 PowerShell 的默认编码差异。
+      # 带 BOM 的 sums 文件，第一行摘要会被 sha256sum -c 当成 65 个字符而跳过——
+      # 那一条恰好是用户按 sha256sum -c 逐条验时先撞上的那条。
+      - name: SHA256 sums
+        shell: pwsh
+        run: |
+          
+          $zip = "scrcpy-helper-${{ steps.ver.outputs.version }}-windows.zip"
+          Get-FileHash $zip -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Set-Content SHA256SUMS.txt -Encoding ascii
+          Get-Content SHA256SUMS.txt
+
+      # 来源证明，比 SHA256SUMS 强一档：sums 和资产同在 release 页，能替换资产的攻击者同样能替换 sums；
+      # 证明存在 GitHub 侧，用户用 `gh attestation verify <文件> -R <owner>/<repo>` 验的是
+      # 「这个文件确实由本仓库这条 workflow 构建」，而不只是「文件没被改过」。官方 action，无第三方依赖。
+      #
+      # ⚠️ **资产清单只有这一处**：subject-checksums 读的就是上面那份 SHA256SUMS.txt，
+      # 别在这里再手抄一遍文件名——抄漏一个就有一个资产**静默地没有证明**。
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-checksums: SHA256SUMS.txt
+
+      # 手写说明放 .github/release-notes/<tag>.md（跟着代码走，推标签前写好）；
+      # 没有就用提交记录拼一版，别让 Release 空着。
+      - name: Compose the release notes
+        shell: pwsh
+        run: |
+          
+          $tag = '${{ steps.ver.outputs.tag }}'
+          $hand = ".github/release-notes/$tag.md"
+          if (Test-Path $hand) {
+            Copy-Item $hand release-body.md
+            "用仓库里的手写说明：$hand"
+          } else {
+            $prev = (git tag --sort=-v:refname | Where-Object { $_ -ne $tag } | Select-Object -First 1)
+            $range = if ($prev) { "$prev..$tag" } else { $tag }
+            $items = @(git log --pretty=format:'%s' $range)
+            $body = @('## 更新内容', '', '本版包含以下改动：', '')
+            $body += ($items | ForEach-Object { "- $_" })
+            $body += @('', '## 使用', '', '解压到任意文件夹，双击 **「投屏助手-双击运行.bat」** 即可，免安装。详见包内《使用说明.txt》。', '',
+                        '> 首次若弹蓝色「Windows 已保护你的电脑」，点「更多信息 > 仍要运行」放行一次即可。', '',
+                        '> 升级提示：设备记忆、常用 App 等都存在软件目录的《投屏助手-设置.json》里。**建议把新版解压进原文件夹覆盖**；若解压到了新文件夹，把旧文件夹的这份 JSON 拷过来即可保留全部记忆。')
+            Set-Content release-body.md -Value ($body -join "`n") -Encoding utf8
+            "没有手写说明，用提交记录拼了一版"
+          }
+          Get-Content release-body.md
+
+      # 用 softprops 而不是自带 gh：它对已存在的 release 是覆盖更新——上传中途失败重跑一次就好，
+      # gh release create 会直接撞「release already exists」。
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            scrcpy-helper-${{ steps.ver.outputs.version }}-windows.zip
+            SHA256SUMS.txt
+          body_path: release-body.md
+          generate_release_notes: false
+          # ⚠️ **fail_on_unmatched_files 默认是 false**：glob 一个都没匹配上时这一步照样成功，
+          # 结果是「Release 建好了、资产是空的」——绿灯骗人。显式打开，匹配不到就红。
+          fail_on_unmatched_files: true
+          # 正常路径下由这个输入把 releases/latest 指到本版；下面那步还会用 API 再核一遍
+          # （草稿转发布时 GitHub 不会重算 latest，那个坑只有显式 PATCH 能填）。
+          make_latest: 'true'
+
+      - name: Publish the release and point latest at it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          # ⚠️ **不能用 `releases/tags/<tag>` 找这条 release**：那个端点不返回草稿。
+          # 草稿只能从 release 列表里捞——列表按创建时间倒序，新建的总在第一页。
+          id="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+                 --jq "first(.[] | select(.tag_name == \"${tag}\") | .id)")"
+          if [ -z "$id" ]; then
+            echo "::error::没找到 tag ${tag} 对应的 release"
+            exit 1
+          fi
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${id}" \
+            -F draft=false -f make_latest=true > /dev/null
+          latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          if [ "$latest" != "$tag" ]; then
+            echo "::error::releases/latest 指着 ${latest}，不是 ${tag}"
+            exit 1
+          fi
+          echo "release ${tag} 已发布，releases/latest 指向它"

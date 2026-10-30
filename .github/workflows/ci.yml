@@ -1,0 +1,82 @@
+name: CI
+
+# 每次 push 到 main、提 PR，或被 release.yml 复用时：跑这台 Windows 机器上跑得动、又真能挡住事的三件事。
+#
+# 本项目没有单元测试：界面是一个单文件 WinForms 脚本，没有可隔离的单元可测，
+# 硬凑一套「测试通过」比没有更糟。所以这里只查「错了不会报错、但会静默坑用户」的那几类：
+#   ① 语法错——启动器调的是 Windows PowerShell 5.1，解析不过就整个起不来；
+#   ② .ps1 的 UTF-8 BOM 掉了——5.1 按 ANSI 读它，满屏中文变乱码，而脚本不会抛任何异常；
+#   ③ 仓库里混进了 CRLF 内容（应为 LF）——有人用 autocrlf=false 提交时会发生，检出后行尾不一致，
+#      下一次改动就会变成整个文件的 diff。
+#
+# 文案口径（脚本 / README / 说明书必须同名同说法）**不做自动检查**：措辞是否逐字一致是
+# 人的判断，自动比对太脆、误报一两次就没人再信这个绿灯了。清单见 AGENTS.md。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:          # release.yml 复用它：标签指向的提交也得先过检查才准发版
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 10          # 卡住就快点红，别一路挂到 6 小时上限
+    steps:
+      - uses: actions/checkout@v7
+
+      # 启动器（投屏助手-双击运行.bat）调的是 powershell.exe = Windows PowerShell 5.1，
+      # 所以必须用它解析一遍；pwsh 7 是开发时手边那台，也跑一遍防两头不一致。
+      # 这一步的输出用纯 ASCII：5.1 按 ANSI 读脚本文件，中文在日志里会变乱码（不影响判定，只影响可读性）。
+      - name: Parse with Windows PowerShell 5.1 (the launcher's shell)
+        shell: powershell
+        run: |
+          
+          $err = $null; $tok = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\scrcpy-helper.ps1), [ref]$tok, [ref]$err) | Out-Null
+          if ($err -and $err.Count) { $err | ForEach-Object { $_.Message }; exit 1 }
+          'Windows PowerShell 5.1 parse OK'
+
+      - name: Parse with PowerShell 7
+        shell: pwsh
+        run: |
+          
+          $err = $null; $tok = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\scrcpy-helper.ps1), [ref]$tok, [ref]$err) | Out-Null
+          if ($err -and $err.Count) { $err | ForEach-Object { $_.Message }; exit 1 }
+          'PowerShell 7 解析通过'
+
+      - name: Encoding, line endings and the three shipped files
+        shell: pwsh
+        run: |
+          
+          # ⚠️ **必须开 Stop**：这一步里全是「读了文件再判断」的动作，
+          # 默认的非终止错误会让步骤在出错后继续往下跑、最后还退出 0——
+          # 那样 CI 绿得毫无意义（检查失败 ≠ 检查通过）。
+          $ErrorActionPreference = 'Stop'
+          $problems = @()
+          # .ps1 必须带 UTF-8 BOM：Windows PowerShell 5.1 遇到没有 BOM 的文件按 ANSI 读，
+          # 脚本里每一句中文都会变乱码——而这不会抛任何异常，只会在用户屏幕上静默发生。
+          $bytes = [System.IO.File]::ReadAllBytes('scrcpy-helper.ps1')
+          if (-not ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)) {
+            $problems += 'scrcpy-helper.ps1 缺 UTF-8 BOM'
+          }
+          # 行尾统一：仓库里的内容一律存 LF（Windows 上 core.autocrlf=true，检出时才变 CRLF）。
+          # ⚠️ **查 blob、不查工作区**：runner 检出时 git 已经把行尾归一化过了，查工作区永远是绿的，
+          # 等于没查。真正会出事的是有人用 autocrlf=false 提交，把 CRLF 直接存进仓库。
+          # 用 git cat-file 导原始字节：PowerShell 的管道会改行尾，导出的字节才是仓库里的真内容。
+          foreach ($f in @('scrcpy-helper.ps1','投屏助手-双击运行.bat','使用说明.txt','.github/workflows/ci.yml','.github/workflows/release.yml')) {
+            $tmp = Join-Path ([System.IO.Path]::GetTempPath()) 'scrcpy-helper-blob.bin'
+            git cat-file blob "HEAD:$f" > $tmp
+            if ($LASTEXITCODE -ne 0) { throw "读不到仓库内容：$f" }
+            $b = [System.IO.File]::ReadAllBytes($tmp)
+            for ($i = 0; $i -lt $b.Length - 1; $i++) {
+              if ($b[$i] -eq 13 -and $b[$i+1] -eq 10) { $problems += "$f 的仓库内容里混进了 CRLF（应统一存 LF）"; break }
+            }
+          }
+          # 发行包就是这三个文件（见 CONTRIBUTING「打包发行版」），少一个用户就少一个功能。
+          foreach ($f in @('scrcpy-helper.ps1','投屏助手-双击运行.bat','使用说明.txt')) {
+            if (-not (Test-Path $f) -or (Get-Item $f).Length -eq 0) { $problems += "缺文件或为空：$f" }
+          }
+          if ($problems.Count) { $problems | ForEach-Object { Write-Host "::error::$_" }; exit 1 }
+          '编码、行尾与文件清单正常'

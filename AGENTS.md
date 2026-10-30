@@ -19,18 +19,19 @@ CONTRIBUTING.md              # 打包发行版、改界面时的同步清单、�
 THIRD-PARTY-NOTICES.md       # 第三方组件声明（许可证义务，别乱改）
 LICENSE                      # 本项目三个文件的 MIT
 assets/                      # README 引用的截图与图标
+.github/workflows/           # ci.yml（检查）+ release.yml（推 v* 标签即发版）
 ```
 
 - 仓库**不含** scrcpy 二进制：`.gitignore` 排掉了 `scrcpy.exe` / `adb.exe` / `*.dll` / `scrcpy-server` / scrcpy 官方包自带的 `LICENSE.txt` 等。
 - `docs/superpowers/`、`design-preview/`、`.qoder*`、`投屏助手-设置.json`、`投屏助手-错误日志.txt` 都是本地产物，**不入库**。
-- **没有 CI、没有测试框架、没有构建脚本。** 唯一的「构建」是复制三个文件压 zip。
+- **有 CI，没有测试框架，也没有本地构建脚本。** `ci.yml` 查语法（5.1 与 7 各一遍）、UTF-8 BOM、行尾与那三个文件在不在；`release.yml` 在推 `v*` 标签时自动打发行包、建 Release、传资产。唯一的「构建」是复制三个文件压 zip——现在由 CI 做，规则见 `CONTRIBUTING.md`。
 
 ## 2. 已确定的事（不要重新讨论）
 
 1. **保持单文件 PowerShell + WinForms。** 不编译 exe、不引外部运行库、不换 Electron/WPF、不做安装器。用户的路径是「解压 → 双击 `.bat`」。
 2. **界面全中文，刻意不提供英文 README。** 界面全中文时把英文读者引进来，只会让他多点一次再退出去。
 3. **像素写死布局 + 手动 DPI 缩放。** 进程声明 System-Aware DPI 感知（不是 Per-Monitor：宿主没有 app.config，WinForms 处理不了跨屏的 `WM_DPICHANGED`）；各窗体 Load 时 `Set-DpiScale` 用 `GetDpiForWindow` 读真实 DPI，再 `Control.Scale` 等比放大。**不要**改回 `AutoScaleMode=Dpi`，也不要改成自动布局。
-4. **打包基线是 scrcpy 5.0.1。** 助手用到 `--flex-display`、`--keep-active`、VP8/VP9、`--ignore-video-encoder-constraints`、`--hwdec`；5.0 的 H.265 硬件解码在部分显卡驱动上会花屏，所以下限卡 5.0.1。完整理由写在 `CONTRIBUTING.md`。
+4. **打包基线是 scrcpy 5.0.1。** 助手用到 `--flex-display`、`--keep-active`、VP8/VP9、`--ignore-video-encoder-constraints`、`--hwdec`；5.0 的 H.265 硬件解码在部分显卡驱动上会花屏，所以下限卡 5.0.1。完整理由写在 `CONTRIBUTING.md`。`release.yml` 里的 `SCRCPY_VERSION` 与这个下限是同一个数，改一处要同时改两处。
 5. **许可证分工固定**：助手三个文件 MIT；发行包里其余全部是 scrcpy 官方 win64 包**逐字节原样转发**，遵循 Apache-2.0。`LICENSE.txt` 不能删、任何 scrcpy 文件不能改、发行包里不放本项目的 MIT 全文。详见 `THIRD-PARTY-NOTICES.md`。
 6. **不做的事**：不 root 手机、不装手机端 App、不联网上报、不写开机自启项（只在 HKCU 写一个 AUMID 显示名，让任务栏图标和通知标题像自己的 App）、不采集遥测。
 
@@ -68,7 +69,7 @@ $err | ForEach-Object { $_.Message }
 ```
 
 - 语法过了**不等于**界面对了。改了控件坐标/文案/尺寸，双击 `投屏助手-双击运行.bat` 起真程序看。
-- 仓库里没有自动化测试，不要声称「测试通过」。能做的验证是：语法自检 + 起真程序点一遍 + 必要时用 `design-preview/` 下的截图脚本留证（UIAutomation + PrintWindow，产物不入库）。
+- 仓库里没有自动化测试，**CI 绿也不等于「测试通过」**——`ci.yml` 查的是语法、编码、行尾这类硬约束，不查行为。能做的验证是：语法自检 + 起真程序点一遍 + 必要时用 `design-preview/` 下的截图脚本留证（UIAutomation + PrintWindow，产物不入库）。
 - 改了界面却没重截 `assets/*.png`，README 就会展示旧界面——截图和代码要同轮更新。
 
 ## 6. 工作树与提交
@@ -85,3 +86,4 @@ $err | ForEach-Object { $_.Message }
 3. 脚本、`README.md`、`使用说明.txt` 三处文案口径一致。
 4. `git diff` 里没有顺手带上的无关改动。
 5. 报告时说清：哪些实际验证过、哪些没验证、有没有推送。
+6. 改了 `scrcpy-helper.ps1` 就等 `ci.yml` 绿；推了 `v*` 标签就核对 `release.yml` 出的包与 `releases/latest` 指向。

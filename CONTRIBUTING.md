@@ -30,11 +30,15 @@ $err | ForEach-Object { $_.Message }
 
 ## 打包发行版
 
-仓库不含 scrcpy 二进制，打包就是复制三个文件：把 `scrcpy-helper.ps1`、`投屏助手-双击运行.bat`、`使用说明.txt` 复制进 [scrcpy](https://github.com/Genymobile/scrcpy/releases) 的解压目录，整个文件夹压成 zip。用户解压后双击 `.bat` 即可使用。
+仓库不含 scrcpy 二进制，发行包的做法就是：把 `scrcpy-helper.ps1`、`投屏助手-双击运行.bat`、`使用说明.txt` 复制进 [scrcpy](https://github.com/Genymobile/scrcpy/releases) 的解压目录，整个文件夹压成 zip。用户解压后双击 `.bat` 即可使用。
 
-**scrcpy 的 `LICENSE.txt` 不要删**——原样保留它是 Apache-2.0 的要求。它只覆盖 scrcpy 自己那些文件；助手这三个文件的 MIT 许可放在仓库的 `LICENSE` 里，不再往发行包里塞一份副本（版权人就是本项目作者，不存在第三方授权约束）。
+**这一步现在由 CI 做**（`.github/workflows/release.yml`）：推一个 `v*` 标签，它会下载官方 win64 包、按官方 `SHA256SUMS.txt` 核对、把这三个文件放进去、确认 scrcpy 的 16 个文件逐字节没动且 `LICENSE.txt` 还在，压成 `scrcpy-helper-<版本>-windows.zip` 传到 Release 上，并把 `releases/latest` 指向它。
 
-**请用 scrcpy 5.0.1 及以上版本打包。** 助手用到了 `--flex-display`（独立窗口）、`--keep-active`（无线投屏保持唤醒，4.0 起）、VP8 / VP9 视频编码与 `--ignore-video-encoder-constraints`（编码器约束兜底，4.1 起），以及 `--hwdec`（「解码方式」选软件解码时才传，5.0 起）；用旧版打包会让这些功能因「未知参数」直接失败。
+发版说明建议提前写好放在 `.github/release-notes/<标签>.md`（例如 `.github/release-notes/v1.6.3.md`），CI 会拿它当 Release 正文；没有这个文件就用提交记录拼一版。标签推上去之后想补发（当时还没有这个 workflow），去 Actions 页面手动跑一次 `Release`、填标签名即可。
+
+**scrcpy 的 `LICENSE.txt` 不要删**——原样保留它是 Apache-2.0 的要求。它只覆盖 scrcpy 自己那些文件；助手这三个文件的 MIT 许可放在仓库的 `LICENSE` 里，不再往发行包里塞一份副本（版权人就是本项目作者，不存在第三方授权约束）。CI 会替你查这一条：少了或被改动就打不出包。
+
+**请用 scrcpy 5.0.1 及以上版本打包。** 助手用到了 `--flex-display`（独立窗口）、`--keep-active`（无线投屏保持唤醒，4.0 起）、VP8 / VP9 视频编码与 `--ignore-video-encoder-constraints`（编码器约束兜底，4.1 起），以及 `--hwdec`（「解码方式」选软件解码时才传，5.0 起）；用旧版打包会让这些功能因「未知参数」直接失败。`release.yml` 里的 `SCRCPY_VERSION` 钉的就是这个版本号，升 scrcpy 时连同这里的说明一起改。
 
 5.0 本身也白得一批好处：画面改由电脑显卡解码（`--hwdec` 默认 `auto`，助手不做任何事就生效，CPU 占用约降一个数量级、更省电，显卡解不了会自动回落软件解码）、部分键盘布局的丢键与 `AltGr` 组合键修好、`--time-limit` 的数据竞争修好，依赖升到 adb 37.0.1 / FFmpeg 9.0.2 / SDL 3.4.18。
 
