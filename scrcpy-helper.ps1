@@ -3153,16 +3153,13 @@ function Show-DeviceManager {
 #     关窗后 OnFinally 仍会复位。慢目录读不完就取消，界面不会冻住也不会留下「正在读取…」。
 #     首屏读目录挂在窗口的 Shown 上：ShowDialog 之前 Visible=false，任何拿 Visible 当「已关闭」
 #     的判断都会把第一次列目录误取消，症状是「打开就报打不开这个目录、点一下快捷入口却正常」。
-# 16) adb pull 的目标不再是目录：传目录时文件名由 adb 从手机路径里提取，Windows 上遇到中文 /
-#     多个扩展名会拼出「D:\Desktop\.」或把文件名截断，脚本却按自己算的 $local 判成功、算进度。
+# 16) adb pull 指定独立的目标临时名，便于验证本次产物，避免把原有同名文件误当作下载成功。
 #     参数统一用 Fm-WinArg 加引号，Windows 非法字符提前拦。中文目标路径的编码问题见 18)。
 # 17) 重命名只对「恰好选中一项」开放（按钮 + F2）：设备端 cd 到快照目录后 mv ./旧名 ./新名，
 #     和新建共用 $fmBadNameChars 校验。同名直接拒绝——重命名覆盖等于静默删掉目标文件；
 #     mv 后双向确认「新名在、旧名不在」才报成功，避免只读目录里误报。
-# 18) adb.exe 在 Windows 上用 ANSI CRT 建本地文件 / 目录，中文名会报 Illegal byte sequence，
-#     或者写出一个乱码文件名。下载先落到同盘的纯 ASCII 临时名 $stage，成功后由
-#     Move-FmPulledItem 用 .NET 的 Unicode API 改成 $local（同盘 rename 不复制大文件）；
-#     目标已存在时同名文件覆盖、文件夹合并内容，绝不整目录删掉旧文件，finally 里清掉中转残留。
+# 18) 下载用所选目录作为进程工作目录，adb 只接收 ASCII 相对暂存名，避免依赖盘符根目录权限。
+#     文件合并由后台任务执行，取消标志逐块检查；每个文件写完后才原子替换，保留取消时的原件。
 
 # 设备端 sh 的单引号字面量：内部的 ' 用 '\'' 表示（闭合 + 转义单引号 + 重开）。
 function Fm-ShQuote {
@@ -3281,15 +3278,19 @@ function Fm-ChildPath {
 # 出现单独一行 FM_SHELL_RAW_OK；被转义成一个命令名时不会。两种写法都试，取能执行的那种。
 $script:fmShellMode = $null
 function Get-FmShellArgs {
-    param($serial, [string]$Command)
+    param($serial, [string]$Command, $Control)
     if ($null -eq $script:fmShellMode) {
         $probe = 'echo FM_SHELL_RAW_OK; echo A B'
         $hit = { param($lines) return ([bool](@($lines | Where-Object { ([string]$_).Trim() -eq 'FM_SHELL_RAW_OK' }).Count -gt 0)) }
-        $r1 = @(Invoke-Hidden -FilePath $adb -ArgumentList @('-s', $serial, 'shell', $probe) -DiscardStderr)
+        $probeResult = Invoke-ShortCommand -FilePath $adb -ArgumentList @('-s', $serial, 'shell', $probe) -Control $Control
+        $r1 = @($probeResult.Stdout -split "`r?`n")
+        if ($Control -and $Control.Cancelled) { throw '操作已取消' }
         if (& $hit $r1) {
             $script:fmShellMode = 'raw'
         } else {
-            $r2 = @(Invoke-Hidden -FilePath $adb -ArgumentList @('-s', $serial, 'shell', 'sh', '-c', $probe) -DiscardStderr)
+            $probeResult = Invoke-ShortCommand -FilePath $adb -ArgumentList @('-s', $serial, 'shell', 'sh', '-c', $probe) -Control $Control
+            $r2 = @($probeResult.Stdout -split "`r?`n")
+            if (-not (& $hit $r2)) { throw '无法确认设备 shell' }
             $script:fmShellMode = if (& $hit $r2) { 'quoted' } else { 'raw' }
         }
     }
@@ -3305,23 +3306,12 @@ function Get-FmShellArgs {
 # 闪一下会盖掉「正在读取…」状态行。这里在同一套机制上用 DoEvents 泵消息等价等待；关窗由
 # Owner 的 FormClosed 调 Cancel-OwnerTasks，退出时 Stop-DeviceScans 兜底，OnFinally 无条件复位。
 # 等待循环绝不可用 Visible 判断关窗：ShowDialog 之前窗口本来就是 Hidden，首屏读目录会被自己取消。
-function Invoke-FmShell {
-    param($Owner, $serial, [string]$Command)
-    $argv = @(Get-FmShellArgs $serial $Command)
+function Invoke-FmTask {
+    param($Owner, [scriptblock]$Work, [hashtable]$Inputs, [string[]]$Functions = @())
     $box = @{ Done = $false; Result = $null }
     $received = { param($value) $box.Result = $value }.GetNewClosure()
     $finished = { $box.Done = $true }.GetNewClosure()
-    Start-UiTask -Owner $Owner -Kind 'operation' -Inputs @{ Adb = $adb; Argv = $argv; LimitMs = 15000 } -Work {
-        $r = Invoke-ShortCommand -FilePath $Inputs.Adb -ArgumentList $Inputs.Argv -TimeoutMs $Inputs.LimitMs -Control $Control
-        [pscustomobject]@{
-            # Receive-DeviceScan 会遍历 Info / Connected（设备扫描结果的字段），这里补齐空值。
-            Info = @{}; Connected = @()
-            Ok = ($r.Started -and $r.ExitCode -eq 0 -and -not $r.TimedOut -and -not $r.Cancelled)
-            Lines = $(if ($r.Stdout) { @($r.Stdout -split "`r?`n") } else { @() })
-            Err = $(if ($r.Stderr) { [string]$r.Stderr } else { '' })
-            Cancelled = [bool]$r.Cancelled; TimedOut = [bool]$r.TimedOut
-        }
-    } -OnDone $received -OnFinally $finished
+    Start-UiTask -Owner $Owner -Kind 'operation' -Inputs $Inputs -Work $Work -Functions $Functions -OnDone $received -OnFinally $finished
     $cancelled = $false
     $clock = [Diagnostics.Stopwatch]::StartNew()
     while (-not $box.Done) {
@@ -3335,14 +3325,30 @@ function Invoke-FmShell {
         }
         # 兜底：万一 Timer 没 tick、任务卡在队列里，也不让 UI 线程无限等下去。
         # 15s 是单条命令上限，前面还可能排着一个最多 15s 的设备扫描，35s 留足余量。
-        if (-not $cancelled -and $clock.ElapsedMilliseconds -gt 35000) {
+        if (-not $cancelled -and $Inputs.ContainsKey('LimitMs') -and $clock.ElapsedMilliseconds -gt 35000) {
             $cancelled = $true
             Cancel-OwnerTasks $Owner
         }
         Start-Sleep -Milliseconds 20
     }
     if ($box.Result) { return $box.Result }
-    return [pscustomobject]@{ Info = @{}; Connected = @(); Ok = $false; Lines = @(); Err = ''; Cancelled = $true; TimedOut = $false }
+    return [pscustomobject]@{ Ok = $false; Cancelled = $true; Error = '操作已取消' }
+}
+function Invoke-FmShell {
+    param($Owner, $serial, [string]$Command)
+    $r = Invoke-FmTask $Owner -Functions @('Get-FmShellArgs') -Inputs @{ Adb=$adb; Serial=$serial; Command=$Command; Mode=$script:fmShellMode; LimitMs=15000 } -Work {
+        $adb = $Inputs.Adb
+        $script:fmShellMode = $Inputs.Mode
+        try {
+            $argv = @(Get-FmShellArgs $Inputs.Serial $Inputs.Command $Control)
+            $r = Invoke-ShortCommand -FilePath $adb -ArgumentList $argv -TimeoutMs 15000 -Control $Control
+            [pscustomobject]@{ Info=@{}; Connected=@(); Mode=$script:fmShellMode
+                Ok=($r.Started -and $r.ExitCode -eq 0 -and -not $r.TimedOut -and -not $r.Cancelled)
+                Lines=@($r.Stdout -split "`r?`n"); Err=$r.Stderr; Cancelled=$r.Cancelled }
+        } catch { [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$false; Cancelled=[bool]$Control.Cancelled; Error=$_.Exception.Message } }
+    }
+    if ($r.Mode) { $script:fmShellMode=$r.Mode }
+    return $r
 }
 
 # 兼容既有调用方：只回文本行。失败 / 超时 / 取消一律回空数组——目录协议缺 FM_DONE 会判「读不到」，
@@ -3368,6 +3374,11 @@ function Fm-ShellLong {
     if ($dlg -and ($dlg.IsDisposed -or -not $dlg.Visible)) {
         return @{ Aborted = $true; Output = '' }
     }
+    if ($null -eq $script:fmShellMode) {
+        $probe = Invoke-FmShell $dlg $serial 'true'
+        if (-not $probe.Ok) { return @{ Code=-1; Aborted=$true; Output='' } }
+    }
+    if ($dlg -and ($dlg.IsDisposed -or -not $dlg.Visible)) { return @{ Code=-1; Aborted=$true; Output='' } }
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $adb
     $psi.Arguments = (@((Get-FmShellArgs $serial $Command) | ForEach-Object { Fm-WinArg $_ }) -join ' ')
@@ -3585,9 +3596,7 @@ function Fm-ConfirmOverwrite {
 # non-TTY 分支）只把进度行存进 info_line_，等传输结束才吐最后一行，重定向后根本拿不到实时百分比。
 # 所以下载改看「本地目标文件长了多少 ÷ 手机上的文件大小」，这是唯一稳的真实进度；上传没有这个信号，
 # 就按已完成的项数走步进条，单项时切成跑马灯——界面一直在动，但绝不编一个假的百分比出来。
-# adb.exe 在 Windows 上用 ANSI CRT 创建本地路径：中文名会报「Illegal byte sequence」，
-# 或者写出一个乱码文件名。下载一律先落到纯 ASCII 的临时名，再由 .NET 的 Unicode 文件 API
-# 改成真名；同盘 Move-Item 是瞬时 rename，不会复制大文件。
+# 下载先落到独立暂存项，避免失败或取消破坏已有文件；提交时用 Unicode API 精确处理目标名。
 # 目标已存在时保持 adb pull 原本的语义：同名文件覆盖，文件夹合并内容、绝不整目录删掉旧文件。
 # 写入前检查完整树，避免合并到一半才发现类型冲突或目录联接。
 function Assert-FmLocalPath {
@@ -3612,7 +3621,8 @@ function Assert-FmNames {
     }
 }
 function Assert-FmTree {
-    param([string]$From, [string]$To, [bool]$Overwrite)
+    param([string]$From, [string]$To, [bool]$Overwrite, $Control)
+    if ($Control -and $Control.Cancelled) { throw '操作已取消' }
     Assert-FmLocalPath $From
     Assert-FmLocalPath $To
     $a = Get-Item -LiteralPath $From -Force -ErrorAction Stop
@@ -3624,29 +3634,53 @@ function Assert-FmTree {
     if ($a.PSIsContainer) {
         $children = @(Get-ChildItem -LiteralPath $From -Force -ErrorAction Stop)
         Assert-FmNames @($children | ForEach-Object { $_.Name })
-        foreach ($child in $children) { Assert-FmTree $child.FullName (Join-Path $To $child.Name) $Overwrite }
+        foreach ($child in $children) { Assert-FmTree $child.FullName (Join-Path $To $child.Name) $Overwrite $Control }
+    }
+}
+function Copy-FmFile {
+    param([string]$From, [string]$To, [bool]$Overwrite, $Control)
+    Assert-FmLocalPath $To
+    $temp = Join-Path ([IO.Path]::GetDirectoryName($To)) ('.scrcpy-' + [guid]::NewGuid().ToString('N'))
+    $inputStream=$null; $outputStream=$null
+    try {
+        $inputStream=[IO.File]::OpenRead($From)
+        $outputStream=[IO.File]::Open($temp,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        $buffer=New-Object byte[] 1048576
+        while (($read=$inputStream.Read($buffer,0,$buffer.Length)) -gt 0) {
+            if ($Control -and $Control.Cancelled) { throw '操作已取消' }
+            $outputStream.Write($buffer,0,$read)
+        }
+        $outputStream.Dispose(); $outputStream=$null
+        if ($Control -and $Control.Cancelled) { throw '操作已取消' }
+        Assert-FmLocalPath $To
+        if ([IO.File]::Exists($To) -and $Overwrite) { [IO.File]::Replace($temp,$To,[System.Management.Automation.Language.NullString]::Value) }
+        else { [IO.File]::Move($temp,$To) }
+    } finally {
+        if ($inputStream) { $inputStream.Dispose() }
+        if ($outputStream) { $outputStream.Dispose() }
+        if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) }
     }
 }
 function Merge-FmDirectory {
-    param([string]$From, [string]$To, [bool]$Overwrite = $false)
-    Assert-FmTree $From $To $Overwrite
+    param([string]$From, [string]$To, [bool]$Overwrite = $false, $Control)
+    Assert-FmTree $From $To $Overwrite $Control
     if (-not (Test-Path -LiteralPath $To)) { [void][IO.Directory]::CreateDirectory($To) }
     foreach ($child in @(Get-ChildItem -LiteralPath $From -Force -ErrorAction Stop)) {
         $target = Join-Path $To $child.Name
-        if ($child.PSIsContainer) { Merge-FmDirectory $child.FullName $target $Overwrite }
+        if ($child.PSIsContainer) { Merge-FmDirectory $child.FullName $target $Overwrite $Control }
         else {
             Assert-FmLocalPath $target
-            [IO.File]::Copy($child.FullName, $target, $Overwrite)
+            Copy-FmFile $child.FullName $target $Overwrite $Control
         }
     }
 }
 function Move-FmPulledItem {
-    param([string]$From, [string]$To, [bool]$Overwrite = $false)
+    param([string]$From, [string]$To, [bool]$Overwrite = $false, $Control)
     try {
-        Assert-FmTree $From $To $Overwrite
+        Assert-FmTree $From $To $Overwrite $Control
         $a = Get-Item -LiteralPath $From -Force -ErrorAction Stop
-        if ($a.PSIsContainer) { Merge-FmDirectory $From $To $Overwrite }
-        else { [IO.File]::Copy($From, $To, $Overwrite) }
+        if ($a.PSIsContainer) { Merge-FmDirectory $From $To $Overwrite $Control }
+        else { Copy-FmFile $From $To $Overwrite $Control }
         return $true
     } catch { return $false }
 }
@@ -3662,7 +3696,7 @@ function Assert-FmRemoteTree {
 }
 
 function Fm-Transfer {
-    param([string[]]$Argv, $dlg, $status, [string]$tip, $prog)
+    param([string[]]$Argv, $dlg, $status, [string]$tip, $prog, [string]$WorkingDirectory)
     # 先挡一道：窗口关了就别再起 adb。传输本身可能 120ms 内就结束、一次都不进下面的等待循环，
     # 只靠循环里的关窗判断会漏掉，外层批量循环就接着发下一项了。
     if ($dlg -and ($dlg.IsDisposed -or -not $dlg.Visible)) {
@@ -3671,6 +3705,7 @@ function Fm-Transfer {
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $adb
     $psi.Arguments = (@($Argv | ForEach-Object { Fm-WinArg $_ }) -join ' ')
+    if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
@@ -4147,10 +4182,9 @@ function Show-FileManager {
                     continue
                 }
                 $local = Join-Path $dest $e.Name
-                # 纯 ASCII 中转名：adb 连要新建的中文目录 / 文件都创建不了，先让它写这里。
-                # 父目录本身含中文时退到该盘根目录（盘符 + ASCII 名），仍保证同盘、可瞬时改名。
-                $stageDir = if ($dest -match '[^\x00-\x7F]') { [System.IO.Path]::GetPathRoot($dest) } else { $dest }
-                $stage = Join-Path $stageDir ('__scrcpy_pull_' + [guid]::NewGuid().ToString('N'))
+                # Unicode 父目录由 Windows 设置，adb 只接收相对临时名，无需写盘符根目录。
+                $stageName = '__scrcpy_pull_' + [guid]::NewGuid().ToString('N')
+                $stage = Join-Path $dest $stageName
                 # 中转文件在电脑上边写边长，用「当前大小 ÷ 手机上列出的大小」得到真实百分比；
                 # 文件夹没有单一大小，退回按项数步进。
                 $sz = 0L
@@ -4161,9 +4195,17 @@ function Show-FileManager {
                 $r = $null
                 try {
                     # 只把纯 ASCII 路径交给 adb；成功后由 Move-FmPulledItem 改成真正的中文名。
-                    $r = Fm-Transfer (@('-s', $batchSerial, 'pull', $e.Path, $stage)) $dlg $lblInfo "正在下载 ($i/$($sel.Count))：$($e.Name)" $progState
+                    $r = Fm-Transfer (@('-s', $batchSerial, 'pull', $e.Path, $stageName)) $dlg $lblInfo "正在下载 ($i/$($sel.Count))：$($e.Name)" $progState $dest
                     if (-not $r.Aborted) {
-                        if ($r.Ok -and (Move-FmPulledItem $stage $local $allowOverwrite)) { $okN++ }
+                        $commit = $null
+                        if ($r.Ok) {
+                            $commit = Invoke-FmTask $dlg -Functions @('Fm-ValidName','Assert-FmNames','Assert-FmLocalPath','Assert-FmTree','Copy-FmFile','Merge-FmDirectory','Move-FmPulledItem') -Inputs @{ From=$stage; To=$local; Overwrite=$allowOverwrite } -Work {
+                                $ok=Move-FmPulledItem $Inputs.From $Inputs.To $Inputs.Overwrite $Control
+                                [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$ok; Cancelled=[bool]$Control.Cancelled }
+                            }
+                        }
+                        if ($dlg.IsDisposed -or -not $dlg.Visible -or ($commit -and $commit.Cancelled)) { $aborted=$true; break }
+                        if ($commit -and $commit.Ok) { $okN++ }
                         else {
                             $detail = if ($r.Detail) { ([string]$r.Detail).Replace($stage, $local) } else { '手机上的文件没保存到指定位置' }
                             $fail += "$($e.Name) → $detail"
@@ -4172,7 +4214,15 @@ function Show-FileManager {
                 } finally {
                     # 失败 / 取消后清掉中转残留，别在用户目录里留下 __scrcpy_pull_xxx。
                     if (Test-Path -LiteralPath $stage) {
-                        try { Remove-Item -LiteralPath $stage -Recurse -Force } catch {}
+                        $cleanup = Invoke-FmTask $null -Inputs @{ Path=$stage; Parent=$dest } -Work {
+                            try {
+                                $path=[IO.Path]::GetFullPath($Inputs.Path)
+                                if ([IO.Path]::GetDirectoryName($path).TrimEnd('\') -ne [IO.Path]::GetFullPath($Inputs.Parent).TrimEnd('\') -or [IO.Path]::GetFileName($path) -notmatch '^__scrcpy_pull_[a-f0-9]{32}$') { throw '无效暂存路径' }
+                                if ([IO.Directory]::Exists($path)) { [IO.Directory]::Delete($path,$true) }
+                                elseif ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
+                                [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$true }
+                            } catch { [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$false } }
+                        }
                     }
                 }
                 if ($r -and $r.Aborted) { $aborted = $true; break }
