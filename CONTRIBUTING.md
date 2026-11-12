@@ -45,6 +45,8 @@ pwsh -NoProfile -File tests/run-file-manager-regression.ps1
 
 子进程身份在实际 `Process.Start()` 返回后立即原子写入，不等待解释器就绪或关窗事件；测试只给载入的函数副本增加启动观察点，取消、等待和 `Kill()` 仍执行原有实现。另有延迟启动且父级在关窗前超时的回归：父级必须清理仍存活的子进程，外层测试持有该进程句柄，验证父级确实超时失败、未触发关窗、对应子进程已经退出。外层失败兜底另用子进程自己发布的就绪身份回收进程，避免登记逻辑损坏时连回归本身也留下进程。
 
+`tests/file-manager-cancellation-mutations.ps1` 还会分别在临时副本中禁用主动取消、`Fm-Transfer` 的 `Kill()`、启动身份登记和父级清理。四种故障都必须被相应用例检出：要求测试进程非零退出、报错原因符合预期，并在外层兜底清理前通过进程句柄以及 PID、启动时间确认没有残留子进程。故障副本意外通过、因无关错误退出或留下进程，都会使统一入口失败。该脚本不依赖 Python 或外部测试框架，CI 在 PowerShell 5.1 与 7 中均运行。
+
 ## 打包发行版
 
 仓库不含 scrcpy 二进制，发行包的做法就是：把 `scrcpy-helper.ps1`、`投屏助手-双击运行.bat`、`使用说明.txt` 复制进 [scrcpy](https://github.com/Genymobile/scrcpy/releases) 的解压目录，整个文件夹压成 zip。用户解压后双击 `.bat` 即可使用。

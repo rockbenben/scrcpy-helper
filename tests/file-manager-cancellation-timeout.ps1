@@ -1,6 +1,7 @@
+param([string]$EvidencePath = '')
 . (Join-Path $PSScriptRoot 'file-manager-test-support.ps1')
 . (Join-Path $PSScriptRoot 'file-manager-process-support.ps1')
-$evidence = Join-Path $root 'timeout-evidence.jsonl'
+$evidence = if ($EvidencePath) { $EvidencePath } else { Join-Path $root 'timeout-evidence.jsonl' }
 $psi = New-Object Diagnostics.ProcessStartInfo
 $psi.FileName = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 # Shorten only this watchdog; the child must start late and the parent must expire before close.
@@ -27,6 +28,7 @@ try {
     Check ($process.ExitCode -ne 0 -and $output.Contains('Negative cancellation fixture timed out')) 'Fixture did not fail at the parent watchdog'
     Check ($null -ne $child) 'Parent timed out before recording a running fixture child'
     Check ($identity.StartupElapsedMs -ge 3000) 'Fixture did not delay process startup'
+    Check (Test-Path -LiteralPath $evidence) 'Parent did not publish cleanup evidence'
     $records = @([IO.File]::ReadAllLines($evidence) | ForEach-Object { $_ | ConvertFrom-Json })
     Check (@($records | Where-Object { $_.Phase -eq 'closed' -or $_.Phase -eq 'cleaned' }).Count -eq 0) 'Fixture reached close or child-side cleanup before the parent watchdog'
     $cleaned = @($records | Where-Object { $_.Phase -eq 'parent-cleaned' -and $_.Mode -eq 'task' })
