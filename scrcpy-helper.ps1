@@ -13,7 +13,7 @@ Add-Type -AssemblyName Microsoft.VisualBasic
 
 # 高 DPI 清晰化：必须在创建任何窗口之前声明进程 DPI 感知，否则 Windows 会把 96DPI 画面整体位图放大 → 文字发虚。
 # 只声明感知还不够——本脚本布局全是写死像素坐标，声明后窗体会按原始像素在高分屏上显示（清晰但偏小），
-# 需配合各窗体的 Set-DpiScale（见 New-Dialog / 忙窗 / 主窗）在 Load 时按真实 DPI 等比放大。
+# 需配合各窗体的 Set-DpiScale（见 New-Dialog 弹窗 / 主窗 $form）在 Load 时按真实 DPI 等比放大。
 #
 # 特意选「系统级 DPI 感知（System-Aware）」而非 Per-Monitor：本脚本跑在 powershell 宿主、无 app.config，
 # WinForms 不会处理跨屏的 WM_DPICHANGED 重新布局。若用 Per-Monitor，把窗口从 150% 主屏拖到 125% 副屏时，
@@ -94,6 +94,7 @@ try {
 try {
     Add-Type -Namespace Native -Name ConIO -MemberDefinition @'
 [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern bool AttachConsole(uint dwProcessId);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern uint GetConsoleProcessList([System.Runtime.InteropServices.Out] uint[] processList, uint processCount);
 [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern bool FreeConsole();
 [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
 [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleCtrlHandler(System.IntPtr HandlerRoutine, bool Add);
@@ -175,59 +176,556 @@ $exe = Join-Path $PSScriptRoot 'scrcpy.exe'
 $adb = Join-Path $PSScriptRoot 'adb.exe'
 $cfgPath = Join-Path $PSScriptRoot '投屏助手-设置.json'
 
-# 刚从 Release zip 解压出来的 scrcpy.exe/dll 带「网络来源」标记(Mark-of-the-Web / Zone.Identifier)。
-# 普通投屏路径用 ShellExecute 启动 scrcpy.exe(见 Start-Scrcpy)，Windows 会弹 SmartScreen「已保护你的电脑」，
-# 用户一点取消就是 ERROR_CANCELLED「操作已被用户取消」——旧版没遇到只因当初点过「仍要运行」已解锁。
-# 启动时把自身目录里自带的 exe/dll 先解除锁定，多数用户从此看不到那道拦截。best-effort，失败无所谓(还有 Start-Scrcpy 兜底 + 使用说明手动指引)。
-try { Get-ChildItem -LiteralPath $PSScriptRoot -File -Include '*.exe', '*.dll' -Recurse -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue } catch {}
 $script:customApps = [ordered]@{}   # 用户自定义的常用 App（名称 => 包名），随设置一起存进 投屏助手-设置.json
-$script:knownDevices = [ordered]@{} # 记住的无线设备（地址 ip:port => 备注名），连接成功自动记下，供「设备管理」切换/重连
+$script:knownDevices = [ordered]@{} # 记住的无线设备（ip:port 或 mDNS 标识 => 备注名），连接成功自动记下，供「设备管理」切换/重连
 $script:deviceNames  = [ordered]@{} # 用户自定义的设备显示名（序列号/地址 => 名称），优先于型号显示，可在「设备管理」里重命名
 $script:autoConnectExclude = New-Object System.Collections.Generic.List[string]  # 不自动连接的无线地址（设备管理里可切换）
 $script:camResByDevice = [ordered]@{}   # 摄像头采集尺寸记忆，按「序列号|前后」分记（serial|back / serial|front => WxH 或档位）
 $script:camSizesCache  = @{}            # --list-camera-sizes 结果按设备会话缓存，同一台只读一次
 $scrcpyProcs = New-Object System.Collections.ArrayList   # 记录本助手启动的所有 scrcpy 进程，关助手时一并停止
-$script:camSessions = New-Object System.Collections.ArrayList   # 摄像头会话（看门狗自动重连/降档，见主窗 $script:camWatch）；Stop-* 先打 Stopped 标记免得被看门狗拉起来
+$script:camSessions = New-Object System.Collections.ArrayList   # 摄像头会话（看门狗自动重连，见主窗 $script:camWatch）；Stop-* 先打 Stopped 标记免得被看门狗拉起来
 $script:autoConnectStarted = $false                      # 启动自动连接每次只跑一次
-$script:bgTimers = New-Object System.Collections.ArrayList  # 钉住后台计时器防 GC（运行中的 Forms.Timer 仅靠自引用会被回收）
 
 # 注：$exe/$adb 的最终解析与「没找到 scrcpy.exe」守卫都挪到了 Load-Settings 之后（见下方 Resolve-Tools + 守卫），
 # 这样「设置 > 通用」里自定义的 adb/scrcpy 路径（存在 JSON 里）才能在守卫判断前生效；否则守卫用的是写死的自带路径。
 
-# 同步执行 adb/scrcpy 并取回输出（用于 devices/getprop/connect/--list-* 等一次性查询）。
-# 不用 `& $adb ...` 调用操作符：宿主虽是 conhost --headless 拉起的 powershell，但它的控制台仍然存在（只是没有窗口），
-# `&` 启动 adb.exe/scrcpy.exe 这类控制台子程序时仍可能瞬间闪出一个新控制台窗口。改用 ProcessStartInfo 显式
-# CreateNoWindow=true，从源头不创建窗口，而不是创建后再隐藏。顺带用 UTF8 直读输出，不再依赖宿主控制台编码。
-function Invoke-Hidden {
-    param([string]$FilePath, [string[]]$ArgumentList = @(), [switch]$DiscardStderr, [int]$TimeoutMs = 15000)
-    $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = $FilePath
-    # 不用 ProcessStartInfo.ArgumentList：本助手宿主是 Windows PowerShell 5.1（投屏助手-双击运行.bat 里调用的
-    # powershell.exe），实测该属性取出来是 $null、Add 直接报错（“cannot call a method on a null-valued expression”）。
-    # 改拼 Arguments 命令行串，和 Start-Scrcpy 给含空格参数补引号的写法保持一致。
-    $psi.Arguments = (@($ArgumentList | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    try { $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8 } catch {}
-    try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { return @() }
-    # 并发读 stdout/stderr 再 WaitForExit：先 ReadToEnd 一路再读另一路，输出量大时（如 --list-apps 装机多）
-    # 会把另一路的管道缓冲区写满，子进程卡在 write 上不退出，PowerShell 卡在 ReadToEnd 上——互相等死。
-    $outTask = $proc.StandardOutput.ReadToEndAsync()   # 先起并发读，下面 WaitForExit 不会被管道缓冲区顶死
-    $errTask = $proc.StandardError.ReadToEndAsync()
-    # 带超时：adb 有时会在半死的无线设备上卡死（如 `adb -s <addr> shell getprop` 连接半开、永不返回）。
-    # 本函数在 UI 线程被 8 秒轮询/按钮调用，若不设上限，一次卡死就把整个界面永久冻住。超时则杀掉子进程兜底。
-    if (-not $proc.WaitForExit($TimeoutMs)) {
-        try { $proc.Kill() } catch {}
-        try { [void]$proc.WaitForExit(2000) } catch {}
+# 同步执行外部命令并捕获标准输入/输出/错误，支持取消标志和超时熔断，从源头隐藏控制台窗口且不阻塞 UI。
+function Invoke-ShortCommand {
+    param([string]$FilePath, [string[]]$ArgumentList = @(),
+          [ValidateRange(1,15000)][int]$TimeoutMs = 15000, $Control)
+    $result = [pscustomobject]@{ Started = $false; ExitCode = $null; TimedOut = $false; Cancelled = $false; Stdout = ''; Stderr = ''; Error = '' }
+    $proc = $null
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        if ($Control -and $Control.Cancelled) { $result.Cancelled = $true; return $result }
+        $psi = [Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $FilePath
+        # 5.1 没有 ArgumentList；按 Windows argv 规则处理引号前和收尾的反斜杠。
+        $psi.Arguments = (@($ArgumentList | ForEach-Object {
+            '"' + ([regex]::Replace([regex]::Replace($_, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1')) + '"'
+        }) -join ' ')
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+        $proc = [Diagnostics.Process]::Start($psi)
+        if ($Control) { $Control.Process = $proc }
+        $result.Started = $true
+        $proc.StandardInput.Close()
+        $outTask = $proc.StandardOutput.ReadToEndAsync(); $errTask = $proc.StandardError.ReadToEndAsync()
+        while (-not $proc.HasExited -or -not $outTask.IsCompleted -or -not $errTask.IsCompleted) {
+            if ($Control -and $Control.Cancelled) { $result.Cancelled = $true; break }
+            if ($watch.ElapsedMilliseconds -ge $TimeoutMs) { $result.TimedOut = $true; break }
+            Start-Sleep -Milliseconds 25
+        }
+        if ($proc.HasExited) { $result.ExitCode = $proc.ExitCode }
+        if ($outTask.IsCompleted -and -not $outTask.IsFaulted) { $result.Stdout = $outTask.Result }
+        if ($errTask.IsCompleted -and -not $errTask.IsFaulted) { $result.Stderr = $errTask.Result }
+    } catch { $result.Error = $_.Exception.Message }
+    finally {
+        if ($proc) {
+            try { if (-not $proc.HasExited) { $proc.Kill(); [void]$proc.WaitForExit(200) } } catch {}
+            $proc.Dispose()
+        }
+        if ($Control) { $Control.Process = $null }
     }
-    try { [void][System.Threading.Tasks.Task]::WaitAll(@($outTask, $errTask), 3000) } catch {}
-    $stdout = if ($outTask.IsCompleted -and -not $outTask.IsFaulted) { $outTask.Result } else { '' }
-    $stderr = if ($DiscardStderr -or -not $errTask.IsCompleted -or $errTask.IsFaulted) { '' } else { $errTask.Result }
-    $combined = if ($stderr) { "$stdout`n$stderr" } else { $stdout }
+    return $result
+}
+
+# 兼容原有文本行调用方；新流程直接读取结构化结果，区分失败、超时与空列表。
+function Invoke-Hidden {
+    param([string]$FilePath, [string[]]$ArgumentList = @(), [switch]$DiscardStderr,
+          [ValidateRange(1,15000)][int]$TimeoutMs = 15000)
+    $result = Invoke-ShortCommand -FilePath $FilePath -ArgumentList $ArgumentList -TimeoutMs $TimeoutMs
+    $combined = $result.Stdout
+    if (-not $DiscardStderr -and $result.Stderr) { $combined += "`n" + $result.Stderr }
     if (-not $combined) { return @() }
     return @($combined -split "`r?`n")
+}
+
+# worker 只使用快照和取消标志，绝不读写控件或实时设置。
+function Invoke-DeviceScan {
+    param($AdbPath, [string[]]$Candidates, [bool]$ConnectAlways, $InfoCache, $Control, [int]$BudgetMs = 15000)
+    $scan = [pscustomobject]@{ Success = $false; Devices = @(); Connected = @(); Info = @{}; Error = '' }
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    function Run-Adb {
+        param([string[]]$Arguments, [int]$Limit = 3000)
+        $left = $BudgetMs - [int]$clock.ElapsedMilliseconds
+        if ($left -le 0) { return [pscustomobject]@{ Started = $false; ExitCode = $null; TimedOut = $true; Cancelled = $false; Stdout = ''; Stderr = ''; Error = '' } }
+        return (Invoke-ShortCommand -FilePath $AdbPath -ArgumentList $Arguments -TimeoutMs ([Math]::Min($Limit,$left)) -Control $Control)
+    }
+    function Read-Devices {
+        $r = Run-Adb @('devices')
+        if (-not $r.Started -or $r.ExitCode -ne 0 -or $r.TimedOut -or $r.Cancelled -or $r.Stdout -notmatch 'List of devices attached') {
+            $scan.Error = if ($r.Error) { $r.Error } elseif ($r.Stderr) { $r.Stderr } else { 'adb devices 未在时限内返回有效设备列表' }
+            return $false
+        }
+        $scan.Devices = @($r.Stdout -split "`r?`n" | Where-Object { $_ -match "`tdevice`r?$" } | ForEach-Object { ($_ -split "`t")[0] })
+        return $true
+    }
+    if (-not (Read-Devices)) { return $scan }
+    if ($ConnectAlways -or $scan.Devices.Count -eq 0) {
+        foreach ($addr in @(Get-ReachableAddrs $Candidates 700)) {
+            if ($Control.Cancelled -or $clock.ElapsedMilliseconds -ge $BudgetMs) { break }
+            [void](Run-Adb @('connect',$addr))
+        }
+        if ($Candidates.Count -gt 0 -and -not (Read-Devices)) { return $scan }
+        # 只记实际在线的地址，不把 connect 的提示文本当成授权成功。
+        $scan.Connected = @($Candidates | Where-Object { $scan.Devices -contains $_ })
+    }
+    $scan.Success = $true
+    foreach ($serial in $scan.Devices) {
+        if ($Control.Cancelled -or $clock.ElapsedMilliseconds -ge $BudgetMs) { break }
+        if ($InfoCache.ContainsKey($serial)) { $scan.Info[$serial] = $InfoCache[$serial]; continue }
+        $v = Run-Adb @('-s',$serial,'shell','getprop','ro.build.version.release') 1500
+        $m = Run-Adb @('-s',$serial,'shell','getprop','ro.product.model') 1500
+        $version = 0; $text = ''
+        if ($v.ExitCode -eq 0 -and -not $v.TimedOut -and $v.Stdout.Trim() -match '^(\d+)') {
+            $version = [int]$matches[1]; $text = "Android $($v.Stdout.Trim())"
+        }
+        if ($m.ExitCode -eq 0 -and -not $m.TimedOut -and $m.Stdout.Trim()) { $text = (@($text,$m.Stdout.Trim()) | Where-Object { $_ }) -join ' · ' }
+        if ($version -gt 0 -and $m.ExitCode -eq 0 -and -not $m.TimedOut -and $m.Stdout.Trim()) { $scan.Info[$serial] = @{ Ver = $version; Text = $text } }
+    }
+    return $scan
+}
+
+$script:deviceScanState = @{ Active = $null; Pending = (New-Object Collections.ArrayList); Closing = $false; Paused = $false }
+function Start-DeviceScan {
+    param($Owner, [string[]]$Candidates = @(), [bool]$ConnectAlways = $false,
+          [string]$Kind = 'status', [scriptblock]$OnDone, [scriptblock]$OnFinally)
+    Start-UiTask -Owner $Owner -Kind $Kind -OnDone $OnDone -OnFinally $OnFinally -Inputs @{
+        AdbPath = $adb; Candidates = $Candidates; ConnectAlways = $ConnectAlways
+    }
+}
+function Start-UiTask {
+    param($Owner, [string]$Kind = 'operation', [scriptblock]$Work, [hashtable]$Inputs = @{},
+          [string[]]$Functions = @(), [scriptblock]$OnDone, [scriptblock]$OnFinally)
+    $state = $script:deviceScanState
+    if ($state.Closing -or ($script:closeState.InProgress -and $Kind -ne 'shutdown')) { if ($OnFinally) { & $OnFinally }; return }
+    if ($Kind -eq 'status' -and ($state.Active -or $state.Pending.Count)) { return }
+    [void]$state.Pending.Add(@{
+        Owner = $Owner; Kind = $Kind; Work = $Work; Inputs = $Inputs; Functions = $Functions
+        OnDone = $OnDone; OnFinally = $OnFinally
+    })
+    Start-NextDeviceScan
+}
+function Start-NextDeviceScan {
+    $state = $script:deviceScanState
+    if ($state.Closing -or $state.Active -or $state.Pending.Count -eq 0) { return }
+    $job = $state.Pending[0]; $state.Pending.RemoveAt(0)
+    if ($job.Owner -and $job.Owner.IsDisposed) {
+        if ($job.OnFinally) { & $job.OnFinally }
+        Start-NextDeviceScan
+        return
+    }
+    $job.Control = [hashtable]::Synchronized(@{ Cancelled = $false; Process = $null })
+    $job.Ps = $null; $job.Rs = $null; $job.Timer = $null
+    $state.Active = $job
+    try {
+        $job.Rs = [runspacefactory]::CreateRunspace(); $job.Rs.Open()
+        $job.Ps = [powershell]::Create(); $job.Ps.Runspace = $job.Rs
+        $cache = @{}; foreach ($key in $script:devInfo.Keys) { $cache[$key] = $script:devInfo[$key] }
+        $job.Rs.SessionStateProxy.SetVariable('Inputs',$job.Inputs)
+        $job.Rs.SessionStateProxy.SetVariable('Control',$job.Control)
+        $job.Rs.SessionStateProxy.SetVariable('InfoCache',$cache)
+        $names = @('Invoke-ShortCommand','Test-TcpAddress','Test-MdnsSerial','Test-Wireless','Get-ReachableAddrs','Invoke-DeviceScan') + @($job.Functions)
+        $definitions = @($names | Select-Object -Unique | ForEach-Object { "function $_ { $((Get-Item "function:$_").Definition) }" })
+        $work = if ($job.Work) { $job.Work.ToString() } else {
+            'Invoke-DeviceScan -AdbPath $Inputs.AdbPath -Candidates $Inputs.Candidates -ConnectAlways $Inputs.ConnectAlways -InfoCache $InfoCache -Control $Control'
+        }
+        [void]$job.Ps.AddScript(($definitions -join "`n") + "`n" + $work)
+        $job.Async = $job.Ps.BeginInvoke()
+        $job.Timer = New-Object System.Windows.Forms.Timer
+        $job.Timer.Interval = 100
+        $job.Timer.Add_Tick({ Receive-DeviceScan })
+        $job.Timer.Start()
+    } catch { Receive-DeviceScan -Failed }
+}
+function Receive-DeviceScan {
+    param([switch]$Failed)
+    $state = $script:deviceScanState; $job = $state.Active
+    if (($state.Paused -and -not $Failed) -or -not $job -or (-not $Failed -and -not $job.Async.IsCompleted)) { return }
+    $result = [pscustomobject]@{ Success = $false; Devices = @(); Connected = @(); Info = @{}; Error = '后台操作失败' }
+    try {
+        if (-not $Failed) {
+            $items = @($job.Ps.EndInvoke($job.Async))
+            if ($items.Count -eq 1) { $result = $items[0] }
+        }
+    } catch { $result.Error = $_.Exception.Message }
+    finally {
+        if ($job.Timer) { $job.Timer.Stop(); $job.Timer.Dispose() }
+        if ($job.Ps) { $job.Ps.Dispose() }
+        if ($job.Rs) { $job.Rs.Dispose() }
+        $state.Active = $null
+    }
+    try {
+        if (-not $state.Closing -and -not $job.Control.Cancelled -and (-not $job.Owner -or -not $job.Owner.IsDisposed)) {
+            foreach ($key in $result.Info.Keys) { $script:devInfo[$key] = $result.Info[$key] }
+            foreach ($addr in $result.Connected) { Touch-KnownDevice $addr (Get-FriendlyName $addr -CachedOnly) }
+            if ($job.OnDone) { & $job.OnDone $result }
+        }
+    } finally {
+        try { if ($job.OnFinally) { & $job.OnFinally } }
+        finally { Start-NextDeviceScan }
+    }
+}
+function Stop-DeviceScans {
+    $state = $script:deviceScanState; $state.Closing = $true
+    $jobs = @($state.Pending); $state.Pending.Clear()
+    if ($state.Active) { $jobs+=$state.Active; $state.Active = $null }
+    foreach ($job in $jobs) {
+        if ($job.Control) {
+            $job.Control.Cancelled = $true
+            try { if ($job.Control.Process) { $job.Control.Process.Kill() } } catch {}
+        }
+        if ($job.Timer) { $job.Timer.Stop(); $job.Timer.Dispose() }
+        if ($job.Ps) { try { $job.Ps.Stop() } catch {}; $job.Ps.Dispose() }
+        if ($job.Rs) { $job.Rs.Dispose() }
+        if ($job.OnFinally) { & $job.OnFinally }
+    }
+}
+
+# 关闭局部对话框只取消它拥有的任务，不能停止其它设备的查询或共享 adb server。
+function Cancel-OwnerTasks {
+    param($Owner)
+    $state = $script:deviceScanState
+    foreach ($job in @($state.Pending)) {
+        if ([object]::ReferenceEquals($job.Owner,$Owner)) {
+            [void]$state.Pending.Remove($job)
+            if ($job.OnFinally) { & $job.OnFinally }
+        }
+    }
+    $job = $state.Active
+    if ($job -and [object]::ReferenceEquals($job.Owner,$Owner)) {
+        $job.Control.Cancelled = $true
+        try { if ($job.Control.Process) { $job.Control.Process.Kill() } } catch {}
+    }
+}
+function Wait-UiTask {
+    param($Owner, [scriptblock]$Work, [hashtable]$Inputs = @{}, [string[]]$Functions = @(), [string]$Kind='operation')
+    if ($script:deviceScanState.Closing -or ($Owner -and $Owner.IsDisposed)) {
+        return [pscustomobject]@{ Success = $false; Cancelled = $true; Error = '操作已取消' }
+    }
+    $box = @{ Completed = $false; InsideClosing=$false; Result = [pscustomobject]@{ Success = $false; Cancelled = $true; Error = '操作已取消' } }
+    $wait = New-Dialog '正在处理，请稍候…' 280 100 $Owner
+    $wait.Controls.Add((New-Lbl '正在处理，请稍候…' 16 14))
+    $cancel = New-SecondaryBtn '取消' 174 52 90 32
+    $cancel.Add_Click({ $wait.Close() }.GetNewClosure())
+    $wait.Controls.Add($cancel)
+    New-EscCancel $wait
+    $received = { param($value) $box.Result = $value }.GetNewClosure()
+    $finished = {
+        $box.Completed = $true
+        if (-not $box.InsideClosing -and -not $wait.IsDisposed -and $wait.Visible) { $wait.Close() }
+    }.GetNewClosure()
+    $wait.Add_FormClosing({
+        param($sender,$eventArgs)
+        if (-not $box.Completed) {
+            # 取消后等 worker 的 finally 真正结束，避免调用方提前 Dispose 它仍在使用的进程。
+            $box.InsideClosing=$true
+            try {
+                Cancel-OwnerTasks $sender
+                $eventArgs.Cancel=(-not $box.Completed)
+                $cancel.Enabled=$false
+            } finally { $box.InsideClosing=$false }
+        }
+    }.GetNewClosure())
+    $wait.Add_FormClosed({ param($sender) Cancel-OwnerTasks $sender })
+    try {
+        Start-UiTask -Owner $wait -Kind $Kind -Work $Work -Inputs $Inputs -Functions $Functions -OnDone $received -OnFinally $finished
+        # 回调直接捕获本函数的状态；避免在 Shown 的闭包里再捕获一次，丢失等待窗和结果引用。
+        if (-not $box.Completed) {
+            $modalOwner = if ($Owner -and $Owner.Visible) { $Owner } elseif ($form -and $form.Visible) { $form } else { $null }
+            if ($modalOwner) { [void]$wait.ShowDialog($modalOwner) } else { [void]$wait.ShowDialog() }
+        }
+        return $box.Result
+    } finally { $wait.Dispose() }
+}
+function Invoke-UiCommand {
+    param($Owner, [string]$FilePath, [string[]]$ArgumentList = @(), [int]$TimeoutMs = 15000)
+    return (Wait-UiTask -Owner $Owner -Inputs @{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMs = $TimeoutMs } -Work {
+        Invoke-ShortCommand -FilePath $Inputs.FilePath -ArgumentList $Inputs.ArgumentList -TimeoutMs $Inputs.TimeoutMs -Control $Control
+    })
+}
+function Test-CommandSuccess {
+    param($Result)
+    return ($Result.Started -and $Result.ExitCode -eq 0 -and -not $Result.TimedOut -and -not $Result.Cancelled)
+}
+function Get-CommandDetail {
+    param($Result)
+    if ($Result.TimedOut) { return '操作超时，请稍后重试。' }
+    if ($Result.Error) { return $Result.Error }
+    return (@($Result.Stdout,$Result.Stderr) -join "`n").Trim()
+}
+
+function Invoke-ConnectDevices {
+    param($Adb, [string[]]$Addresses, $Control, [int]$BudgetMs = 15000, [switch]$Probe)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    function Command {
+        param([string[]]$Arguments,[int]$Limit = 3000)
+        $left = $BudgetMs-[int]$clock.ElapsedMilliseconds
+        if ($left -le 0) { return [pscustomobject]@{ Started = $false; TimedOut = $true; Cancelled = $false; ExitCode = $null; Error = '操作超时，请稍后重试。'; Stdout = ''; Stderr = '' } }
+        Invoke-ShortCommand $Adb $Arguments -TimeoutMs ([Math]::Min($left,$Limit)) -Control $Control
+    }
+    $reachable = if ($Probe) { @(Get-ReachableAddrs $Addresses 3000) } else { @($Addresses) }
+    $records = @()
+    foreach ($addr in $Addresses) {
+        if ($Control.Cancelled) { break }
+        $record = [pscustomobject]@{ Address = $addr; Success = $false; State = $null; Error = '' }
+        if ($reachable -notcontains $addr) { $record.State = ''; $record.Error = "电脑上探测不到 $addr（IP 或端口没有响应）。"; $records+=$record; continue }
+        $connect = Command @('connect',$addr)
+        $record.Error = Get-CommandDetail $connect
+        $verify = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $devices = Command @('devices') 1000
+            if (Test-CommandSuccess $devices) {
+                if ($devices.Stdout -match 'List of devices attached') {
+                    $record.State = Get-AdbDeviceState $addr -DeviceText $devices.Stdout -FromText
+                } else { $record.State = $null }
+            } else { $record.State = $null }
+            if ($record.State -in @('device','unauthorized') -or $Control.Cancelled -or $clock.ElapsedMilliseconds -ge $BudgetMs) { break }
+            Start-Sleep -Milliseconds 100
+        } while ($verify.ElapsedMilliseconds -lt 3000)
+        $record.Success = ($record.State -eq 'device')
+        # 查询失败不能拆掉可能仍在录制的连接；只有明确的坏状态才清理本次地址。
+        if ($record.State -in @('offline','unauthorized') -and -not $Control.Cancelled) { [void](Command @('disconnect',$addr) 1000) }
+        if (-not $record.Success -and $clock.ElapsedMilliseconds -ge $BudgetMs) { $record.Error = '操作超时，请稍后重试。' }
+        $records+=$record
+    }
+    [pscustomobject]@{ Records = @($records); Cancelled = [bool]$Control.Cancelled }
+}
+function Connect-DevicesUi {
+    param($Owner,[string[]]$Addresses,[switch]$Probe)
+    Wait-UiTask -Owner $Owner -Functions @('Invoke-ConnectDevices','Test-CommandSuccess','Get-CommandDetail','Get-AdbDeviceState') -Inputs @{
+        Adb = $adb; Addresses = $Addresses; Probe = [bool]$Probe
+    } -Work {
+        Invoke-ConnectDevices -Adb $Inputs.Adb -Addresses $Inputs.Addresses -Probe:$Inputs.Probe -Control $Control
+    }
+}
+function Invoke-PairDiscovery {
+    param($Adb,$PairAddress,$Code,$Ip,$Control)
+    $pair = Invoke-ShortCommand $Adb @('pair',$PairAddress,$Code) -TimeoutMs 7000 -Control $Control
+    $result = [pscustomobject]@{ Paired = $false; Address = $null; Error = (Get-CommandDetail $pair); Cancelled = $pair.Cancelled }
+    if (-not (Test-CommandSuccess $pair) -or ($pair.Stdout+$pair.Stderr) -notmatch 'Successfully paired') { return $result }
+    $result.Paired = $true
+    for ($i = 0; $i -lt 5 -and -not $Control.Cancelled; $i++) {
+        $mdns = Invoke-ShortCommand $Adb @('mdns','services') -TimeoutMs 1000 -Control $Control
+        if (Test-CommandSuccess $mdns) {
+            foreach ($line in ($mdns.Stdout -split "`r?`n")) {
+                if ($line -match '_adb-tls-connect\._tcp\.?\s+' -and $line -match ('(?<![\d.])'+[regex]::Escape($Ip)+':(\d+)(?=\s|$)')) {
+                    $port = [int]$matches[1]
+                    if ($port -ge 1 -and $port -le 65535) { $result.Address = $Ip+':'+$port; return $result }
+                }
+            }
+        }
+        Start-Sleep -Milliseconds 300
+    }
+    $result.Cancelled = [bool]$Control.Cancelled
+    return $result
+}
+
+function Test-ProcessExited {
+    param($Process)
+    if (-not $Process) { return $true }
+    try { return $Process.HasExited } catch { return $false }
+}
+function Wait-ScrcpyExit {
+    param($Process,[int]$WaitMs,$Control)
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-ProcessExited $Process) -and $clock.ElapsedMilliseconds -lt $WaitMs) {
+        if ($Control -and $Control.Cancelled) { return $false }
+        try { [void]$Process.WaitForExit([Math]::Min(50,[Math]::Max(1,$WaitMs-[int]$clock.ElapsedMilliseconds))) }
+        catch { return $false }
+    }
+    return (Test-ProcessExited $Process)
+}
+function Invoke-StopItems {
+    param($Items,$Adb,[string[]]$Disconnect,$Control,[switch]$Force,[int]$WaitMs=5000)
+    $results=@()
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    foreach ($item in $Items) {
+        if ($Control.Cancelled) { break }
+        $outcome='Exited'; $errorText=''; $sent=[bool]$item.StopSignalSent
+        if (-not (Test-ProcessExited $item.Proc)) {
+            if ($Force) {
+                try {
+                    $item.Proc.Kill()
+                    $item.Forced=$true
+                    $outcome=if (Wait-ScrcpyExit $item.Proc 1000 $Control) { 'Killed' } else { 'TimedOut' }
+                } catch { $outcome='Failed'; $errorText=$_.Exception.Message }
+            } else {
+                $left=[Math]::Max(0,[Math]::Min($WaitMs,15000-[int]$clock.ElapsedMilliseconds))
+                if ($item.Rec) {
+                    $stopped=Stop-ScrcpyGraceful $item.Proc $left $Control -WaitOnly:$sent
+                    $sent=$sent -or $stopped.SignalSent
+                    $item.StopSignalSent=$sent
+                    $errorText=$stopped.Error
+                    $outcome=if ($stopped.Exited) { 'Stopped' } else { 'TimedOut' }
+                } else {
+                    try { [void]$item.Proc.CloseMainWindow() } catch { $errorText=$_.Exception.Message }
+                    $outcome=if (Wait-ScrcpyExit $item.Proc ([Math]::Min(1000,$left)) $Control) { 'Stopped' } else { 'TimedOut' }
+                }
+            }
+        }
+        if ($Control.Cancelled -and -not (Test-ProcessExited $item.Proc)) { $outcome='Cancelled' }
+        $exitCode=$null
+        if (Test-ProcessExited $item.Proc) { try { if ($item.Proc) { $exitCode=$item.Proc.ExitCode } } catch {} }
+        $results += [pscustomobject]@{ Item=$item; Outcome=$outcome; SignalSent=$sent; ExitCode=$exitCode; Error=$errorText }
+    }
+    $pending=@($Items | Where-Object { -not (Test-ProcessExited $_.Proc) })
+    $errorText=''
+    # 仍有活进程时不能 disconnect，否则会中断尚未写完的录制。
+    if ($pending.Count -eq 0 -and -not $Control.Cancelled) {
+        foreach ($addr in $Disconnect) {
+            if ($Control.Cancelled) { break }
+            $left=15000-[int]$clock.ElapsedMilliseconds
+            if ($left -le 0) { $errorText='操作超时，请稍后重试。'; break }
+            $command=Invoke-ShortCommand $Adb @('disconnect',$addr) -TimeoutMs ([Math]::Min(3000,$left)) -Control $Control
+            if (-not (Test-CommandSuccess $command)) { $errorText=Get-CommandDetail $command }
+        }
+    }
+    [pscustomobject]@{
+        Results=@($results); Pending=@($pending); Cancelled=[bool]$Control.Cancelled
+        Success=($pending.Count -eq 0 -and -not $errorText -and -not $Control.Cancelled); Error=$errorText
+    }
+}
+function Stop-DevicesUi {
+    param($Owner,[string[]]$Serials,[switch]$Disconnect,[object[]]$Items,[switch]$All,[switch]$ForExit)
+    if (-not $PSBoundParameters.ContainsKey('Items')) {
+        $Items=@($scrcpyProcs | Where-Object { $All -or $Serials -contains $_.Serial })
+    }
+    $Items=@($Items)
+    if ($Items.Count -eq 0 -and -not $Disconnect) {
+        Update-ProcessLifecycle
+        return [pscustomobject]@{ Success=$true; Cancelled=$false; Results=@(); Pending=@(); Error='' }
+    }
+    if (@($Items | Where-Object { $_.StopInProgress }).Count) {
+        return [pscustomobject]@{ Success=$false; Cancelled=$true; Error='正在停止，请稍候。' }
+    }
+    $sessions=@($script:camSessions | Where-Object {
+        $session=$_
+        @($Items | Where-Object { [object]::ReferenceEquals($_.Proc,$session.Proc) }).Count -gt 0
+    })
+    $previous=@($sessions | ForEach-Object { [pscustomobject]@{ Session=$_; Stopped=$_.Stopped } })
+    foreach ($session in $sessions) { $session.Stopped=$true }
+    foreach ($item in $Items) {
+        if (-not $item.PSObject.Properties['StopSignalSent']) { $item | Add-Member StopSignalSent $false }
+        if (-not $item.PSObject.Properties['StopInProgress']) { $item | Add-Member StopInProgress $false }
+        if (-not $item.PSObject.Properties['ExitReported']) { $item | Add-Member ExitReported $false }
+        if (-not $item.PSObject.Properties['Forced']) { $item | Add-Member Forced $false }
+        $item.StopInProgress=$true
+    }
+    $addresses=if ($Disconnect) { @($Serials | Where-Object { Test-Wireless $_ }) } else { @() }
+    $pending=@($Items); $force=$false
+    $forcedRecording=$false
+    $recordingError=$false
+    $result=[pscustomobject]@{ Success=$false; Cancelled=$true; Error='' }
+    try {
+        do {
+            $result=Wait-UiTask -Owner $Owner -Kind $(if ($ForExit) { 'shutdown' } else { 'operation' }) -Functions @(
+                'Invoke-StopItems','Stop-ScrcpyGraceful','Wait-ScrcpyExit','Test-ProcessExited','Test-CommandSuccess','Get-CommandDetail'
+            ) -Inputs @{ Items=$pending; Adb=$adb; Disconnect=$addresses; Force=$force } -Work {
+                Invoke-StopItems $Inputs.Items $Inputs.Adb $Inputs.Disconnect $Control -Force:$Inputs.Force
+            }
+            foreach ($stopped in $result.Results) {
+                $stopped.Item.StopSignalSent=$stopped.SignalSent
+                if ($stopped.Item.Rec -and $stopped.Outcome -ne 'Killed' -and $null -ne $stopped.ExitCode -and $stopped.ExitCode -ne 0) { $recordingError=$true }
+                if ($stopped.Outcome -eq 'Killed') {
+                    $stopped.Item.Forced=$true
+                    if ($stopped.Item.Rec) { $forcedRecording=$true }
+                    [void](Add-ErrorLog '强制结束进程' ("设备：{0}；退出码：{1}；录屏：{2}" -f $stopped.Item.Serial,$stopped.ExitCode,$stopped.Item.Rec))
+                }
+            }
+            if ($result.Cancelled) { break }
+            $pending=@($Items | Where-Object { -not (Test-ProcessExited $_.Proc) })
+            if ($pending.Count -eq 0) {
+                if (-not $result.Success) { [void](Show-ResultDialog $Owner '停止投屏' '操作未完成' '可以稍后重试。' $result.Error @('ok')) }
+                break
+            }
+            $detail=(@($pending | ForEach-Object { "设备：$($_.Serial)" }) -join "`n")
+            $errors=@($result.Results | Where-Object { $_.Error } | ForEach-Object { "{0}：{1}" -f $_.Item.Serial,$_.Error })
+            if ($errors.Count) { $detail += "`n" + ($errors -join "`n") }
+            $heading=if (@($result.Results | Where-Object { $_.Outcome -eq 'Failed' }).Count) { '强制结束失败' } else { '进程尚未正常结束' }
+            $choice=Show-ResultDialog $Owner '停止投屏' $heading '强制结束可能导致视频文件损坏或无法播放。可以继续等待，或取消本次停止。' $detail @('wait','force','cancel')
+            if ($choice -eq 'cancel' -or $choice -notin @('wait','force')) {
+                $result=[pscustomobject]@{ Success=$false; Cancelled=$true; Error='' }
+                break
+            }
+            $force=($choice -eq 'force')
+        } while ($pending.Count -gt 0)
+        $forcedRecording=(@($Items | Where-Object { $_.Rec -and $_.Forced }).Count -gt 0)
+        if ($forcedRecording) {
+            [void](Show-ResultDialog $Owner '录制屏幕' '已强制结束录屏，请检查视频文件。' '强制结束可能导致视频文件损坏或无法播放。' '' @('ok'))
+        }
+        if ($recordingError -and -not $forcedRecording) {
+            [void](Show-ResultDialog $Owner '录制屏幕' '录屏异常结束，请检查视频文件。' '请确认录屏文件能正常播放。' '' @('ok'))
+        }
+        if ($recordingError -or $forcedRecording) { foreach ($item in $Items) { $item.ExitReported=$true } }
+        return $result
+    } finally {
+        foreach ($item in $Items) { $item.StopInProgress=$false }
+        foreach ($entry in $previous) {
+            if (-not (Test-ProcessExited $entry.Session.Proc)) { $entry.Session.Stopped=$entry.Stopped }
+        }
+        Update-ProcessLifecycle
+    }
+}
+
+$script:closeState=@{ InProgress=$false }
+function Confirm-AppExit {
+    param($Owner)
+    return ([System.Windows.Forms.MessageBox]::Show($Owner,"正在录屏。关闭助手会先尝试正常停止录制。`n`n确定要关闭吗？`n（想继续录、只收起助手，点最小化即可）",'正在录屏','YesNo','Warning') -eq 'Yes')
+}
+function Request-AppClose {
+    param($Owner,$EventArgs,[scriptblock]$OnResume)
+    $EventArgs.Cancel=$true
+    if ($script:closeState.InProgress) { return }
+    $script:closeState.InProgress=$true
+    $script:deviceScanState.Paused=$true
+    $quiesced=$false
+    try {
+        Update-ProcessLifecycle
+        if ((Test-Recording) -and -not (Confirm-AppExit $Owner)) { return }
+        $addresses=@(@($script:knownDevices.Keys) + @($scrcpyProcs | ForEach-Object { $_.Serial }) |
+            Where-Object { Test-Wireless $_ } | Select-Object -Unique)
+        Stop-DeviceScans
+        $quiesced=$true
+        # 旧查询已取消；只允许 shutdown 任务运行，用户取消退出后可重新发起普通查询。
+        $script:deviceScanState.Closing=$false
+        $script:deviceScanState.Paused=$false
+        $stopped=Stop-AllScrcpy $Owner
+        if (-not $stopped.Success) { return }
+        if ($settings.disconnectOnClose -and $addresses.Count) {
+            $disconnected=Wait-UiTask -Owner $Owner -Kind 'shutdown' -Inputs @{ Adb=$adb; Addresses=$addresses } -Work {
+                $clock=[Diagnostics.Stopwatch]::StartNew()
+                foreach ($addr in $Inputs.Addresses) {
+                    if ($Control.Cancelled -or $clock.ElapsedMilliseconds -ge 15000) { break }
+                    [void](Invoke-ShortCommand $Inputs.Adb @('disconnect',$addr) -TimeoutMs ([Math]::Max(1,[Math]::Min(3000,15000-[int]$clock.ElapsedMilliseconds))) -Control $Control)
+                }
+                [pscustomobject]@{ Cancelled=[bool]$Control.Cancelled }
+            }
+            if ($disconnected.Cancelled) { return }
+        }
+        if ($Owner.WindowState -eq [System.Windows.Forms.FormWindowState]::Normal) {
+            if ($settings.winX -ne $Owner.Location.X -or $settings.winY -ne $Owner.Location.Y) {
+                $settings.winX=$Owner.Location.X; $settings.winY=$Owner.Location.Y; Save-Settings
+            }
+        }
+        Update-ProcessLifecycle
+        $EventArgs.Cancel=$false
+    } finally {
+        if ($EventArgs.Cancel) {
+            $script:closeState.InProgress=$false
+            $script:deviceScanState.Paused=$false
+            $script:deviceScanState.Closing=$false
+            if ($quiesced -and -not $Owner.IsDisposed) {
+                Set-BusyLook -On $false
+                $Owner.Cursor=[System.Windows.Forms.Cursors]::Default
+                $script:hintHeld=$false
+                if ($script:recHintColor) { & $script:restoreHint }
+                if ($OnResume) { & $OnResume }
+            }
+        }
+    }
 }
 
 # 「独立窗口」可一键打开的最常用 App（按使用度排，购物类靠后）；其余 App 用「更多应用…」从手机列表里挑
@@ -349,6 +847,7 @@ function Format-Json {
 }
 
 function Save-Settings {
+    $ErrorActionPreference = 'Stop'
     try {
         $o = [ordered]@{}
         foreach ($k in $settings.Keys) { $o[$k] = $settings[$k] }
@@ -371,7 +870,13 @@ function Save-Settings {
         (Format-Json ($o | ConvertTo-Json -Depth 5)) | Set-Content -LiteralPath $tmp -Encoding UTF8
         if (Test-Path -LiteralPath $cfgPath) { [System.IO.File]::Replace($tmp, $cfgPath, [NullString]::Value) }   # 原子替换（第三参给 $null 会被当空路径报错，须用 [NullString]::Value）
         else { Move-Item -LiteralPath $tmp -Destination $cfgPath -Force }
-    } catch { }
+    } catch {
+        $detail = $_.Exception.Message
+        try {
+            Add-Content -LiteralPath (Join-Path $PSScriptRoot '投屏助手-错误日志.txt') -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] 保存设置失败：$detail" -Encoding UTF8
+        } catch {}
+        [System.Windows.Forms.MessageBox]::Show("保存设置失败，本次修改仅在当前运行中生效。请确认软件目录可写。`n`n$detail", '保存设置失败') | Out-Null
+    }
 }
 
 # 「不自动连接」名单的查询/切换：仅对无线地址有意义；改动即时存盘。
@@ -449,13 +954,18 @@ function Get-AudioArgs {
     if ($settings.audioCodec)  { $a += "--audio-codec=$($settings.audioCodec)" }
     return $a
 }
+function Get-RecordingExtension {
+    # PCM 无法封装进 MP4；关闭音频时不应受此前保存的音频编码影响。
+    if ($settings.videoCodec -in @('vp8', 'vp9') -or ($settings.audioOn -and $settings.audioCodec -eq 'raw')) { return 'mkv' }
+    return [string]$settings.recFormat
+}
 function Get-ControlArgs {
     param([bool]$Wireless)
+    if ($settings.noControl) { return @('--no-control') }
     $a = @()
     if ($settings.keyboard)    { $a += "--keyboard=$($settings.keyboard)" }
     if ($settings.mouse)       { $a += "--mouse=$($settings.mouse)" }
     if ($settings.gamepad)     { $a += '--gamepad=uhid' }
-    if ($settings.noControl)   { $a += '--no-control' }
     if ($settings.screenOff)   { $a += '--turn-screen-off' }
     if ($settings.showTouches) { $a += '--show-touches' }
     if ($settings.stayAwake)   { $a += $(if ($Wireless) { '--keep-active' } else { '-w' }) }
@@ -524,7 +1034,7 @@ function Get-CamOrientationArgs {
 }
 # 运行 scrcpy --list-camera-sizes，按朝向解析出本机真正支持的采集分辨率。
 # 不同机型差别很大，写死 1080p 之类会触发 “Camera configuration error”（录像支持 ≠ 投屏采集支持），
-# 所以运行时按设备实拉，让用户只在“一定能开”的尺寸里选。任何失败都返回空表，调用方自行回退到通用档位。
+# 所以运行时按设备实拉，避免把其它镜头的尺寸放入选项。任何失败都返回空表，调用方自行回退到通用档位。
 # 摄像头采集尺寸记忆：按「序列号|前后」分记，读不到该设备该朝向的记录时回退到全局 camResMax。
 function Get-CamRemembered {
     param($serial, $facing)
@@ -553,31 +1063,37 @@ function Set-CamZoom {
 }
 
 function Get-CameraSizes {
-    param([string]$serial)
+    param([string]$serial, $Owner=$form)
     if ($serial -and $script:camSizesCache.ContainsKey($serial)) { return $script:camSizesCache[$serial] }   # 同一台设备本会话缓存
-    $result = @{ back = @(); front = @(); zoom = @{ back = $null; front = $null } }
+    $result = @{ back = @(); front = @(); zoom = @{ back = $null; front = $null }; ids = @{ back=$null; front=$null } }
     try {
         $argv = @(); if ($serial) { $argv += @('-s', $serial) }; $argv += '--list-camera-sizes'
-        $out = (Invoke-Hidden -FilePath $exe -ArgumentList $argv) -join "`n"
+        $command=Invoke-UiCommand $Owner $exe $argv
+        if ($command.Cancelled) { return $null }
+        $out=if (Test-CommandSuccess $command) { $command.Stdout + "`n" + $command.Stderr } else { '' }
     } catch { return $result }
     if (-not $out) { return $result }
-    $facing = $null
+    $facing=$null
+    $seen=@{ back=$false; front=$false }
     foreach ($line in ($out -split "`r?`n")) {
-        if ($line -match '--camera-id=\d') {
-            # 摄像头分组头，如：--camera-id=0  (back, 4000x3000, fps=[...])；括号内 WxH 是传感器最大值，不计为可选项
-            if     ($line -match '\bfront\b')    { $facing = 'front' }
-            elseif ($line -match '\bback\b')     { $facing = 'back' }
-            elseif ($line -match '\bexternal\b') { $facing = 'back' }
-            else   { $facing = $null }
-            # 顺手读走变焦范围 zoom-range=[0.6, 10]。只认该朝向第一颗镜头——--camera-facing=back 选中的就是第一颗 back，
-            # 同朝向别的镜头范围往往不同（本机 id=0 是 0.6~10、id=3 是 1~10），取并集会把这颗不支持的倍率放进面板，
-            # 投屏时被 Android 挡下（IllegalArgumentException），还会被看门狗误判成「分辨率带不动」。
-            # 另外只有端点可读——「几倍会切到长焦」是各家 HAL 的私有逻辑，Android 没有 API 暴露，所以面板只提供范围内自由填，不做镜头档位。
-            if ($facing -and $null -eq $result.zoom[$facing] -and $line -match 'zoom-range=\[\s*([\d.]+)\s*,\s*([\d.]+)\s*\]') {
-                $result.zoom[$facing] = @([double]$Matches[1], [double]$Matches[2])
+        if ($line -match '--camera-id=(?<id>.+?)\s*\(') {
+            $id=$matches['id'].Trim('"')
+            $facing=$null
+            # 同朝向的其它镜头与外接镜头不能补充当前镜头的尺寸或倍率。
+            if ($line -match '\(\s*(front|back)\b') {
+                $direction=$matches[1]
+                if (-not $seen[$direction]) {
+                    $seen[$direction]=$true
+                    $facing=$direction
+                    $result.ids[$facing]=$id
+                    if ($line -match 'zoom-range=\[\s*([\d.]+)\s*,\s*([\d.]+)\s*\]') {
+                        $result.zoom[$facing]=@([double]$matches[1],[double]$matches[2])
+                    }
+                }
             }
             continue
         }
+        if ($line -match '--camera-id=') { $facing=$null; continue }
         if ($facing -and $line -match '(\d{3,5})x(\d{3,5})') {
             $size = "$($Matches[1])x$($Matches[2])"
             if ($result[$facing] -notcontains $size) { $result[$facing] += $size }
@@ -588,6 +1104,13 @@ function Get-CameraSizes {
     }
     if ($serial -and ((@($result.back).Count + @($result.front).Count) -gt 0)) { $script:camSizesCache[$serial] = $result }   # 只缓存成功（非空）结果
     return $result
+}
+
+function Get-CameraSelectionArgs {
+    param($Sizes,[string]$Facing)
+    $id=if ($Sizes -and $Sizes.ids) { [string]$Sizes.ids[$Facing] } else { '' }
+    if ($id) { return @("--camera-id=$id") }
+    return @("--camera-facing=$Facing")
 }
 
 # 读设备真实分辨率与密度（adb shell wm size / wm density），供「独立窗口·手机版面」用真实尺寸而非写死值。
@@ -601,8 +1124,14 @@ function Get-DeviceDisplay {
     try {
         $szArgs = @(); if ($serial) { $szArgs += @('-s', $serial) }; $szArgs += @('shell', 'wm', 'size')
         $dnArgs = @(); if ($serial) { $dnArgs += @('-s', $serial) }; $dnArgs += @('shell', 'wm', 'density')
-        $szOut = (Invoke-Hidden -FilePath $adb -ArgumentList $szArgs -DiscardStderr) -join "`n"
-        $dnOut = (Invoke-Hidden -FilePath $adb -ArgumentList $dnArgs -DiscardStderr) -join "`n"
+        $outputs=Wait-UiTask -Owner $form -Inputs @{ Adb=$adb; Size=$szArgs; Density=$dnArgs } -Work {
+            $size=Invoke-ShortCommand $Inputs.Adb $Inputs.Size -TimeoutMs 7000 -Control $Control
+            $density=Invoke-ShortCommand $Inputs.Adb $Inputs.Density -TimeoutMs 7000 -Control $Control
+            [pscustomobject]@{ Size=$size; Density=$density }
+        }
+        if ($outputs.Cancelled) { return @{ Cancelled=$true } }
+        $szOut=if (Test-CommandSuccess $outputs.Size) { $outputs.Size.Stdout } else { '' }
+        $dnOut=if (Test-CommandSuccess $outputs.Density) { $outputs.Density.Stdout } else { '' }
         $w = 0; $h = 0; $dpi = 0
         if     ($szOut -match 'Override size:\s*(\d+)x(\d+)') { $w = [int]$matches[1]; $h = [int]$matches[2] }
         elseif ($szOut -match 'Physical size:\s*(\d+)x(\d+)') { $w = [int]$matches[1]; $h = [int]$matches[2] }
@@ -630,6 +1159,7 @@ function Start-Scrcpy {
     param(
         [string[]]$Options,
         [switch]$Recording,
+        [switch]$PassThru,
         [string]$StderrFile,
         [string]$StdoutFile,
         # 本窗口声音：Auto=同设备已有出声窗口时自动静音（默认）；On=强制出声；Off=强制静音
@@ -637,6 +1167,7 @@ function Start-Scrcpy {
     )
     $extra = @(); if ($settings.extraArgs) { $extra = @($settings.extraArgs -split '\s+' | Where-Object { $_ }) }
     $clean = @(($Options + $extra) | Where-Object { $_ -ne '' -and $null -ne $_ })
+    $Recording=[switch]($Recording -or @($clean | Where-Object { $_ -eq '-r' -or $_ -eq '--record' -or $_ -like '--record=*' }).Count -gt 0)
     $isCamera = @($clean | Where-Object { $_ -like '--video-source=camera*' }).Count -gt 0
     # 解析目标设备序列号（来自 -s），用于「投屏中」标记 / 「停止这台」，并据此给窗口起友好标题
     $serial = ''
@@ -690,7 +1221,7 @@ function Start-Scrcpy {
     # 两道一起下才干净：① -RedirectStandardInput 指到一个空文件 → scrcpy 那次 getchar 立刻读到 EOF，不等回车；
     # ② -WindowStyle Hidden → 不弹控制台窗。stderr 落文件由 OS 直接写（不占管道缓冲，避免 scrcpy 刷不动 stderr 卡死）。
     # 普通投屏路径(elseif/else 分支)是 ShellExecute：若 scrcpy.exe 还带「网络来源」标记、SmartScreen 弹窗被用户取消，
-    # Start-Process 会抛 ERROR_CANCELLED「操作已被用户取消」。启动时的 Unblock-File 已尽量消掉这道拦截，这里再兜一层：
+    # Start-Process 会抛 ERROR_CANCELLED「操作已被用户取消」。这里提示用户自行确认来源并放行：
     # 万一仍被拦下并取消，给句人话提示而不是让异常冒成崩溃窗/静默无反应。摄像头带 -RedirectStandardError 那支是 UseShellExecute=$false，不触发。
     $p = $null
     try {
@@ -708,15 +1239,19 @@ function Start-Scrcpy {
     }
     # Audio=本会话是否在电脑上出声（被自动静音的新会话记 false，供后续同设备会话判定「是否已有出声窗口」）
     if (-not $p) { return }
-    [void]$scrcpyProcs.Add([pscustomobject]@{ Proc = $p; Rec = [bool]$Recording; Serial = $serial; Audio = [bool]$playsAudio })
-    # 三类不在此等待：摄像头会话有看门狗负责反馈；后台录制本来就没有窗口；勾了「显示控制台」的用户已经在看输出
-    if ($StderrFile -and $StdoutFile) { return }
-    if (@($clean | Where-Object { $_ -eq '--no-playback' }).Count) { return }
-    if ($settings.showConsole) { return }
-    if ($script:showTempHint) { & $script:showTempHint '正在打开投屏窗口…' $cMuted $null; $script:hintHeld = $true }
-    if ((Wait-ScrcpyWindow $p $winTitle) -ne 'exited') { return }
-    $code = try { $p.ExitCode } catch { '未知' }
-    [void](Show-ResultDialog $form '投屏' '投屏窗口没能打开' '多半是数据线松了、手机刚锁屏，或这台正被别的地方占用。重新插一下、点亮屏幕再点一次；反复如此的话，到「设置 > 常用」勾「显示 scrcpy 控制台窗口」，就能看到具体原因。' ("命令：scrcpy.exe $cmd`r`n退出码：$code") @('ok'))
+    $entry=[pscustomobject]@{ Proc=$p; Rec=[bool]$Recording; Serial=$serial; Audio=[bool]$playsAudio; Starting=$true; StopInProgress=$false; StopSignalSent=$false; Forced=$false; ExitReported=$false }
+    [void]$scrcpyProcs.Add($entry)
+    try {
+        if ($PassThru) { $p }
+        # 三类不在此等待：摄像头会话有看门狗负责反馈；后台录制本来就没有窗口；勾了「显示控制台」的用户已经在看输出
+        if ($StderrFile -and $StdoutFile) { return }
+        if (@($clean | Where-Object { $_ -eq '--no-playback' }).Count) { return }
+        if ($settings.showConsole) { return }
+        if ($script:showTempHint) { & $script:showTempHint '正在打开投屏窗口…' $cMuted $null; $script:hintHeld = $true }
+        if ((Wait-ScrcpyWindow $p $winTitle) -ne 'exited') { return }
+        $code = try { $p.ExitCode } catch { '未知' }
+        [void](Show-ResultDialog $form '投屏' '投屏窗口没能打开' '多半是数据线松了、手机刚锁屏，或这台正被别的地方占用。重新插一下、点亮屏幕再点一次；反复如此的话，到「设置 > 常用」勾「显示 scrcpy 控制台窗口」，就能看到具体原因。' ("命令：scrcpy.exe $cmd`r`n退出码：$code") @('ok'))
+    } finally { $entry.Starting=$false }
 }
 
 # 进程起来 ≠ 画面出来：实测 scrcpy 从启动到窗口可见还要 0.9~1.5 秒（无线更慢），
@@ -762,17 +1297,31 @@ function Wait-ScrcpyWindow {
 }
 
 # 启动一个 scrcpy 并把 Process 对象拿回来（摄像头看门狗要盯它的退出码和 stderr）；启动失败返回 $null。
-# Start-Scrcpy 本身不返回进程（返回值会顺着事件处理器输出流漏出去），这里用「启动前后 $scrcpyProcs 数量」判断拿最后一个。
+# Start-Scrcpy 默认不输出进程对象，避免返回值漏入事件处理器输出流；显式传 -PassThru 获取进程。
 function Start-CamProc {
     param([string[]]$argv, [string]$errFile, [string]$outFile)
-    $before = $scrcpyProcs.Count
-    # 摄像头面板已显式决定声音：勾麦克风=强制有声（视频通话要用，不能被多开去重静音），否则强制静音。
-    # 看门狗重连也走这个入口，按 $argv 里既有的音频参数还原模式，重连后选择不丢。
-    $camMode = if ($argv -contains '--no-audio') { 'Off' } else { 'On' }
-    Start-Scrcpy $argv -StderrFile $errFile -StdoutFile $outFile -AudioMode $camMode
-    if ($scrcpyProcs.Count -gt $before) { return $scrcpyProcs[$scrcpyProcs.Count - 1].Proc }
-    return $null
+    $camMode=if ($argv -contains '--no-audio') { 'Off' } else { 'On' }
+    return (Start-Scrcpy $argv -StderrFile $errFile -StdoutFile $outFile -AudioMode $camMode -PassThru)
 }
+function Resume-CameraSession {
+    param($Session,$Snapshot)
+    if (-not $script:camSessions.Contains($Session) -or $Session.Stopped -or $script:closeState.InProgress -or $script:deviceScanState.Closing) { return }
+    if (-not $Snapshot.Success) { return }
+    if ($Snapshot.Devices -notcontains $Session.Serial) {
+        Remove-CamSession $Session
+        & $script:showTempHint '设备已断开，摄像头未自动重连' $cRed 12000
+        return
+    }
+    $zoom=Read-CamZoom $Session.OutFile
+    if ($null -ne $zoom) { $Session.LastZoom=$zoom }
+    $previous=$Session.Proc
+    $Session.Proc=$null
+    Release-ExitedProcess $previous
+    $Session.Proc=Start-CamProc $Session.Args $Session.ErrFile $Session.OutFile
+    $Session.StartedAt=Get-Date
+    if ($Session.Proc) { & $script:showTempHint '摄像头被亮屏打断，已自动重连；关窗即停' $cGreen }
+}
+
 # 从 scrcpy 的 stdout 日志里取「最后一次生效的倍率」：投屏中每按一下 MOD+↑/↓ 都会打一行 "Set camera zoom: 3.1640973"。
 # 按住不放会自动重复刷几十行、到端点后还会重复打同一个夹住值，所以只认最后一条。
 # 值是 3.1640973 这种脏浮点（每按一步约 +6%），四舍五入到 0.1 就够——面板的步进也是 0.1。
@@ -782,63 +1331,111 @@ function Read-CamZoom {
     try { $txt = [System.IO.File]::ReadAllText($file) } catch { return $null }
     $m = [regex]::Matches($txt, 'Set camera zoom:\s*([\d.]+)')
     if ($m.Count -eq 0) { return $null }
-    return [Math]::Round([double]$m[$m.Count - 1].Groups[1].Value, 1)
+    $zoom=0.0
+    if (-not [double]::TryParse($m[$m.Count - 1].Groups[1].Value,[Globalization.NumberStyles]::Float,[cultureinfo]::InvariantCulture,[ref]$zoom)) { return $null }
+    return [Math]::Round($zoom,1)
+}
+function Release-ExitedProcess {
+    param($Process)
+    if (-not $Process -or -not (Test-ProcessExited $Process)) { return }
+    if (@($script:camSessions | Where-Object { [object]::ReferenceEquals($_.Proc,$Process) }).Count) { return }
+    $entries=@($scrcpyProcs | Where-Object { [object]::ReferenceEquals($_.Proc,$Process) })
+    if (-not $entries.Count -or @($entries | Where-Object { $_.Starting -or $_.StopInProgress }).Count) { return }
+    $exitCode=$null; try { $exitCode=$Process.ExitCode } catch {}
+    foreach ($entry in $entries) {
+        if ($entry.Rec -and -not $entry.Forced -and -not $entry.ExitReported -and $null -ne $exitCode -and $exitCode -ne 0) {
+            [void](Add-ErrorLog '录屏异常结束' ("设备：{0}；退出码：{1}" -f $entry.Serial,$exitCode))
+            if ($script:showTempHint -and -not $script:closeState.InProgress) {
+                & $script:showTempHint '录屏异常结束，请检查视频文件。' $cRed 12000
+            }
+        }
+        [void]$scrcpyProcs.Remove($entry)
+    }
+    $Process.Dispose()
+}
+function Update-ProcessLifecycle {
+    # 看门狗尚未处理完退出码和日志时，会话引用仍需保留。
+    foreach ($session in @($script:camSessions)) {
+        if ($session.Stopped -and (Test-ProcessExited $session.Proc)) { Remove-CamSession $session }
+    }
+    foreach ($entry in @($scrcpyProcs)) {
+        if (Test-ProcessExited $entry.Proc) { Release-ExitedProcess $entry.Proc }
+    }
 }
 # 摘掉一个摄像头看门狗会话并清掉它的临时日志。所有结束路径（用户关窗 / 助手主动停 / 看门狗放弃）都过这里，
 # 所以倍率回传收在这一处：把用户在画面里按出来的倍率写回设置，下次打开面板就是这个值。
 function Remove-CamSession {
     param($cs)
-    [void]$script:camSessions.Remove($cs)
-    $z = Read-CamZoom $cs.OutFile
-    if ($null -eq $z) { $z = $cs.LastZoom }   # 被抢重连过：日志被新进程截断，用重连前存下的那次
-    # SkipZoom：用户从面板重开同一台时旧会话会被标停，那次不能回写——否则刚在面板里选好的倍率
-    # 会被上一场的运行时倍率盖掉，下次打开面板看到的不是自己选的值。
-    if ($null -ne $z -and $cs.Serial -and -not $cs.SkipZoom) { Set-CamZoom $cs.Serial $cs.Facing (Format-Zoom $z); Save-Settings }
-    if ($cs.ErrFile) { try { Remove-Item -LiteralPath $cs.ErrFile -Force } catch {} }
-    if ($cs.OutFile) { try { Remove-Item -LiteralPath $cs.OutFile -Force } catch {} }
+    if (-not $script:camSessions.Contains($cs)) { return }
+    # 活进程仍在写日志时只阻止重连；退出后才读取最后倍率并释放文件和句柄。
+    if (-not (Test-ProcessExited $cs.Proc)) { $cs.Stopped=$true; return }
+    $cs.Stopped=$true
+    if (-not $cs.PSObject.Properties['CleanupAttempts']) { $cs | Add-Member CleanupAttempts 0 }
+    if ($cs.CleanupAttempts -eq 0) {
+        $zoom=Read-CamZoom $cs.OutFile
+        if ($null -eq $zoom) { $zoom=$cs.LastZoom }
+        if ($null -ne $zoom -and $cs.Serial -and -not $cs.SkipZoom) {
+            Set-CamZoom $cs.Serial $cs.Facing (Format-Zoom $zoom)
+            Save-Settings
+        }
+        $previous=$cs.Proc
+        $cs.Proc=$null
+        Release-ExitedProcess $previous
+    }
+    $cs.CleanupAttempts++
+    $remaining=@()
+    foreach ($path in @($cs.ErrFile,$cs.OutFile)) {
+        if ($path -and (Test-Path -LiteralPath $path)) { try { Remove-Item -LiteralPath $path -Force -ErrorAction Stop } catch {
+            $remaining += $path
+        } }
+    }
+    # 杀毒软件可能暂时占用日志；只重试文件清理，不重复保存倍率或持有进程句柄。
+    if ($remaining.Count -eq 0 -or $cs.CleanupAttempts -ge 3) {
+        [void]$script:camSessions.Remove($cs)
+        if ($remaining.Count) { [void](Add-ErrorLog '摄像头日志清理失败' ($remaining -join "`n")) }
+    }
 }
 
-# 是否有正在进行的录屏（关助手时据此决定要不要提醒）
 function Test-Recording {
     foreach ($it in @($scrcpyProcs)) {
         if ($it.Rec -and $it.Proc -and -not $it.Proc.HasExited) { return $true }
     }
     return $false
 }
-# 优雅停止一个 scrcpy：给它的控制台发 Ctrl+C，让 scrcpy 正常收尾（录制时写好文件尾原子，否则 mp4 会损坏、打不开）。
-# 无窗口的「后台录制」没有窗口可关，只能靠这个信号。做法（Windows 标准套路）：先让本进程忽略 Ctrl+C（护住自己）→
-# 脱离自己的控制台 FreeConsole → AttachConsole 挂到目标进程的控制台 → 广播 CTRL_C_EVENT（只会打到该控制台里的 scrcpy）→
-# 等它退出 → FreeConsole 脱离 → 恢复自己的 Ctrl+C 处理。任何失败/超时都返回 $false，交调用方强杀兜底（退回原行为，无回归）。
+# 给录制进程发一次 Ctrl+C，再等待它自己退出；超时交由 UI 决定继续等待、强制结束或取消。
+# 本函数只在 worker 运行，控制台信号的保护和解除必须配对。
 function Stop-ScrcpyGraceful {
-    param($proc, [int]$WaitMs = 5000)
-    if (-not $proc -or $proc.HasExited) { return $true }
-    $ok = $false
+    param($proc,[int]$WaitMs=5000,$Control,[switch]$WaitOnly)
+    $result=[pscustomobject]@{ Exited=(Test-ProcessExited $proc); SignalSent=$false; Error='' }
+    if ($result.Exited) { return $result }
     try {
-        [void][Native.ConIO]::SetConsoleCtrlHandler([System.IntPtr]::Zero, $true)   # 先护住自己：忽略即将广播的 Ctrl+C
-        [void][Native.ConIO]::FreeConsole()
-        if ([Native.ConIO]::AttachConsole([uint32]$proc.Id)) {
-            [void][Native.ConIO]::GenerateConsoleCtrlEvent(0, 0)   # 0 = CTRL_C_EVENT；进程组 0 = 本控制台所有进程（即 scrcpy）
-            $ok = $proc.WaitForExit($WaitMs)
+        if (-not $WaitOnly) {
             [void][Native.ConIO]::FreeConsole()
+            if ([Native.ConIO]::AttachConsole([uint32]$proc.Id)) {
+                # AttachConsole 会重置处理器表，必须在挂接之后保护本进程。
+                [void][Native.ConIO]::SetConsoleCtrlHandler([IntPtr]::Zero,$true)
+                $ids=New-Object uint32[] 64
+                $count=[Native.ConIO]::GetConsoleProcessList($ids,64)
+                # Ctrl+C 会广播到整个控制台；有其它会话时保留进程，让用户决定是否定向强制结束。
+                $foreign=@($ids | Select-Object -First ([Math]::Min(64,[int]$count)) | Where-Object { $_ -ne $PID -and $_ -ne $proc.Id })
+                if ($count -gt 0 -and $count -le 64 -and $foreign.Count -eq 0) {
+                    $result.SignalSent=[Native.ConIO]::GenerateConsoleCtrlEvent(0,0)
+                } else { $result.Error='共享控制台，无法安全发送 Ctrl+C。' }
+            }
         }
-    } catch { $ok = $false }
-    try { [void][Native.ConIO]::SetConsoleCtrlHandler([System.IntPtr]::Zero, $false) } catch {}   # 恢复自己的 Ctrl+C 处理
-    return $ok
+        $result.Exited=Wait-ScrcpyExit $proc $WaitMs $Control
+    } catch { $result.Error=$_.Exception.Message }
+    finally {
+        if (-not $WaitOnly) {
+            try { [void][Native.ConIO]::FreeConsole() } catch {}
+            try { [void][Native.ConIO]::SetConsoleCtrlHandler([IntPtr]::Zero,$false) } catch {}
+        }
+    }
+    return $result
 }
-# 停止本助手启动的所有投屏：录制中的先发 Ctrl+C 优雅收尾（保住文件），再对其余优雅关窗，最后关不掉的强杀兜底
 function Stop-AllScrcpy {
-    foreach ($cs in @($script:camSessions)) { $cs.Stopped = $true }   # 主动停止：摄像头看门狗别再自动重连（Kill 的退出码≠0，不标记会被误判成异常断开）
-    foreach ($it in @($scrcpyProcs)) {   # 录制进程优先优雅停：后台录制无窗口，只能靠 Ctrl+C 收尾，否则强杀会损坏视频
-        if ($it.Rec -and $it.Proc -and -not $it.Proc.HasExited) { [void](Stop-ScrcpyGraceful $it.Proc) }
-    }
-    foreach ($it in @($scrcpyProcs)) {
-        try { if ($it.Proc -and -not $it.Proc.HasExited) { [void]$it.Proc.CloseMainWindow() } } catch {}
-    }
-    Start-Sleep -Milliseconds 500
-    foreach ($it in @($scrcpyProcs)) {
-        try { if ($it.Proc -and -not $it.Proc.HasExited) { $it.Proc.Kill() } } catch {}
-    }
-    $scrcpyProcs.Clear()
+    param($Owner=$form)
+    return (Stop-DevicesUi -Owner $Owner -All -ForExit)
 }
 # 当前正在投屏的设备序列号列表（进程还活着的）——「设备管理」据此标「▶ 投屏中」
 function Get-ActiveSerials {
@@ -848,63 +1445,70 @@ function Get-ActiveSerials {
     }
     return $res
 }
-# 只停某一台设备的投屏（不影响其它台）：先优雅关窗，关不掉再强杀，最后清理该设备的已结束记录
-function Stop-DeviceScrcpy {
-    param($serial)
-    if (-not $serial) { return }
-    foreach ($cs in @($script:camSessions)) { if ($cs.Serial -eq $serial) { $cs.Stopped = $true } }   # 主动停止这台：摄像头看门狗别再自动重连
-    foreach ($it in @($scrcpyProcs)) {   # 这台的录制进程先发 Ctrl+C 优雅收尾（后台录制无窗口，强杀会损坏视频）
-        if ($it.Serial -eq $serial -and $it.Rec -and $it.Proc -and -not $it.Proc.HasExited) { [void](Stop-ScrcpyGraceful $it.Proc) }
-    }
-    foreach ($it in @($scrcpyProcs)) {
-        if ($it.Serial -eq $serial -and $it.Proc -and -not $it.Proc.HasExited) { try { [void]$it.Proc.CloseMainWindow() } catch {} }
-    }
-    Start-Sleep -Milliseconds 300
-    foreach ($it in @($scrcpyProcs)) {
-        if ($it.Serial -eq $serial -and $it.Proc -and -not $it.Proc.HasExited) { try { $it.Proc.Kill() } catch {} }
-    }
-    $live = @($scrcpyProcs | Where-Object { $_.Serial -ne $serial -or ($_.Proc -and -not $_.Proc.HasExited) })
-    $scrcpyProcs.Clear(); foreach ($x in $live) { [void]$scrcpyProcs.Add($x) }
-}
-
 # 读取已连接设备序列号列表（state=device）
 function Get-DeviceList {
     try {
-        $out = Invoke-Hidden -FilePath $adb -ArgumentList @('devices') -DiscardStderr
+        $command=Invoke-UiCommand $form $adb @('devices') -TimeoutMs 3000
+        if (-not (Test-CommandSuccess $command)) { return @() }
+        $out=@($command.Stdout -split "`r?`n")
         $lines = $out | Select-Object -Skip 1 | Where-Object { $_ -match "`tdevice$" }
         return @($lines | ForEach-Object { ($_ -split "`t")[0] })
     } catch { return @() }
 }
 # 读取单个地址的 adb 状态：device / offline / unauthorized。查询本身失败返回 $null，地址不在列表返回空串。
 function Get-AdbDeviceState {
-    param($addr)
+    param($addr, [string]$DeviceText, [switch]$FromText)
     if (-not $addr) { return $null }
-    try { $out = @(Invoke-Hidden -FilePath $adb -ArgumentList @('devices') -DiscardStderr) } catch { return $null }
-    $text = ($out -join "`n")
-    if ($text -notmatch 'List of devices attached') { return $null }
-    $m = [regex]::Match($text, '(?m)^' + [regex]::Escape([string]$addr) + '\s+(\S+)')
-    if ($m.Success) { return [string]$m.Groups[1].Value }
+    if (-not $FromText) {
+        $command=Invoke-UiCommand $form $adb @('devices') -TimeoutMs 3000
+        if (-not (Test-CommandSuccess $command)) { return $null }
+        $DeviceText=$command.Stdout
+    }
+    if ($DeviceText -notmatch 'List of devices attached') { return $null }
+    $match=[regex]::Match($DeviceText,'(?m)^'+[regex]::Escape([string]$addr)+'\s+(\S+)')
+    if ($match.Success) { return [string]$match.Groups[1].Value }
     return ''
 }
-# 是否为无线地址（ip:port）
-function Test-Wireless { param($s) return ($s -match '^\d{1,3}(\.\d{1,3}){3}:') }
+# 传输类型与可直接 TCP 探测的地址不同，mDNS 服务名由 adb 自己解析。
+function Test-TcpAddress {
+    param([string]$Address)
+    $match=[regex]::Match($Address,'^(?<ip>[0-9]{1,3}(\.[0-9]{1,3}){3}):(?<port>[0-9]{1,5})$')
+    if (-not $match.Success) { return $false }
+    $ip=$null
+    return ([Net.IPAddress]::TryParse($match.Groups['ip'].Value,[ref]$ip) -and
+        [int]$match.Groups['port'].Value -ge 1 -and [int]$match.Groups['port'].Value -le 65535)
+}
+function Test-MdnsSerial {
+    param([string]$Serial)
+    return ($Serial -match '^[^\s]+\._adb(?:-tls-connect)?\._tcp\.?$')
+}
+function Test-Wireless {
+    param([string]$s)
+    return ((Test-TcpAddress $s) -or (Test-MdnsSerial $s))
+}
 
 # 设备信息（安卓大版本 + 型号），按序列号缓存：同一台只读一次 adb，状态栏显示和版本门控共用
 $script:devInfo = @{}
 function Get-DevInfo {
-    param($serial)
+    param($serial, [switch]$CachedOnly)
     if (-not $serial) { return @{ Ver = 0; Text = '' } }
     if ($script:devInfo.ContainsKey($serial)) { return $script:devInfo[$serial] }
+    if ($CachedOnly) { return @{ Ver=0; Text='' } }
     $ver = 0; $txt = ''
     try {
-        $vraw  = ((Invoke-Hidden -FilePath $adb -ArgumentList @('-s', $serial, 'shell', 'getprop', 'ro.build.version.release') -DiscardStderr | Select-Object -First 1) | Out-String).Trim()
-        $model = ((Invoke-Hidden -FilePath $adb -ArgumentList @('-s', $serial, 'shell', 'getprop', 'ro.product.model') -DiscardStderr | Select-Object -First 1) | Out-String).Trim()
+        $props=Wait-UiTask -Owner $form -Inputs @{ Adb=$adb; Serial=$serial } -Work {
+            $version=Invoke-ShortCommand $Inputs.Adb @('-s',$Inputs.Serial,'shell','getprop','ro.build.version.release') -TimeoutMs 7000 -Control $Control
+            $model=Invoke-ShortCommand $Inputs.Adb @('-s',$Inputs.Serial,'shell','getprop','ro.product.model') -TimeoutMs 7000 -Control $Control
+            [pscustomobject]@{ Version=$version; Model=$model }
+        }
+        $vraw=if (Test-CommandSuccess $props.Version) { $props.Version.Stdout.Trim() } else { '' }
+        $model=if (Test-CommandSuccess $props.Model) { $props.Model.Stdout.Trim() } else { '' }
         if ($vraw -match '^(\d+)') { $ver = [int]$matches[1] }
         if ($vraw)  { $txt = "Android $vraw" }
         if ($model) { $txt = if ($txt) { "$txt · $model" } else { $model } }
     } catch {}
     $info = @{ Ver = $ver; Text = $txt }
-    $script:devInfo[$serial] = $info
+    if ($ver -gt 0 -and $model) { $script:devInfo[$serial] = $info }
     return $info
 }
 
@@ -1276,7 +1880,7 @@ function Show-Settings {
     $tt.SetToolTip($chkStay, '保持手机不锁屏，避免无线投屏中途断开。想更省电可关掉，让手机自然休眠。')
     $tt.SetToolTip($chkScreenOff, '投屏时关掉手机屏幕，明显省电、还能防偷看（投屏照常进行）。无线投屏想省电首选它。')
     $tt.SetToolTip($chkReconnect, '开机自动连上附近记住的无线设备；掉线后也会自动连回。会略增耗电，按需开启。')
-    $tt.SetToolTip($chkDisconnect, '不勾（默认）：关掉助手后仍保持手机连接，重开即用、几乎不耗电。勾上：关助手时一并断开无线连接，重开需重新连（可能要再插一次线）。')
+    $tt.SetToolTip($chkDisconnect, '不勾（默认）：关掉助手后仍保持手机连接，重开即用、几乎不耗电。勾上：关助手时定向断开助手记住或启动过的无线设备，重开需重新连。')
     $tt.SetToolTip($chkShowConsole, '勾上后投屏时会弹出一个黑色控制台窗口，里面显示 scrcpy 的运行日志。默认关闭，不影响正常使用。')
     $tabCommon.Controls.AddRange(@(
         (New-Lbl '清晰度：' 14 16), $nudSize, (New-Caption '越大越清晰，0=不限制' 210 19),
@@ -1295,7 +1899,7 @@ function Show-Settings {
     $tt.SetToolTip($cbHwDec, '电脑怎么把收到的画面还原出来。自动=优先让显卡干活，CPU 占用能低一个数量级、笔记本更省电，显卡干不了会自动改用 CPU。要是投屏出现花屏、偏色或整块变黑，改成「软件解码」再投，就能排除显卡的兼容问题；它更吃 CPU，平时不用选。')
     $tt.SetToolTip($nudFps, '每秒帧数上限。0=用默认；填 60 更顺滑、填 30 更省资源。')
     $tt.SetToolTip($nudBit, '视频码率（Mbps）。越高越清晰越占带宽；0=用默认（约 8M）。无线卡顿可调小。')
-    $tt.SetToolTip($cbVCodec, 'H.265/AV1 同等清晰度更省带宽，但老机型/老电脑可能不支持，卡顿就换回 H.264。VP8/VP9 仅当机型这几种都不支持时才用作兜底；它们装不进 mp4，录屏会自动转存 mkv。')
+    $tt.SetToolTip($cbVCodec, 'H.265/AV1 同等清晰度更省带宽，但老机型/老电脑可能不支持，卡顿就换回 H.264。VP8/VP9 仅当机型这几种都不支持时才用作兜底；选 VP8 / VP9 编码，或开启音频并选原始 PCM 时，录屏使用 mkv。')
     $tt.SetToolTip($txtCrop, '只投屏幕的一块区域。格式 宽:高:左:上（像素），例如 1080:1080:0:300。不填=投整屏。')
     $tabVideo.Controls.AddRange(@(
         (New-Lbl '帧率：' 14 19), $nudFps, (New-Caption '越高越流畅，0=默认' 210 21),
@@ -1335,7 +1939,7 @@ function Show-Settings {
     $chkGamepad = New-Chk '启用手柄（把电脑手柄映射到手机）' $settings.gamepad 14 210
     $tt.SetToolTip($chkTouches, '手机画面上触点处显示小白点，演示时让别人看清你点了哪里。')
     $tt.SetToolTip($cbKb, '绝大多数人选「默认」即可，能正常用电脑上的中文输入法。「游戏模式」让电脑键盘像真键盘一样直接控制游戏，但用不了电脑输入法——想打字就改用手机屏幕上的输入法。装过 ADBKeyboard 这类输入法时可在手机上正常打字。')
-    $tt.SetToolTip($chkNoCtrl, '只看画面、禁止鼠标键盘操作手机，适合演示/防误触。')
+    $tt.SetToolTip($chkNoCtrl, '只看画面、禁止鼠标键盘操作手机；保持唤醒、投屏关屏、显示触摸点和关窗息屏暂不生效。')
     $tt.SetToolTip($chkPowerOff, '结束投屏（关掉投屏窗口）时，顺手把手机屏幕熄灭，省电、防亮屏。')
     $tt.SetToolTip($chkGamepad, '把连在电脑上的游戏手柄映射给手机，适合手游。')
     # 说明紧跟「键盘模式」，两行封顶：离得远用户不知道它讲的是哪一项，长段落还会折出孤儿字
@@ -1365,10 +1969,18 @@ function Show-Settings {
     $cbNdSize.Location = New-Object System.Drawing.Point(110, 15); $cbNdSize.Size = New-Object System.Drawing.Size(200, 26)
     @('跟手机一致', '1280x720', '1600x900', '1920x1080') | ForEach-Object { [void]$cbNdSize.Items.Add($_) }
     $cbNdSize.Text = if ($settings.ndSize) { $settings.ndSize } else { '跟手机一致' }
-    $cbNdDpi = New-Combo @('自动', '小', '中', '大') @('', '160', '240', '320') $settings.ndDpi 110 73 110
+    $ndDpiLabels = @('自动', '小', '中', '大')
+    $ndDpiValues = @('', '160', '240', '320')
+    $ndDpiCurrent = [string]$settings.ndDpi
+    # 自定义尺寸面板允许任意数字 DPI，保存其它设置时不能把它静默重置为预设的「自动」。
+    if ($ndDpiCurrent -match '^\d+$' -and $ndDpiValues -notcontains $ndDpiCurrent) {
+        $ndDpiLabels += "自定义 $ndDpiCurrent"
+        $ndDpiValues += $ndDpiCurrent
+    }
+    $cbNdDpi = New-Combo $ndDpiLabels $ndDpiValues $ndDpiCurrent 110 73 110
     $chkNoDecor = New-Chk '隐藏独立窗口顶部的手机状态栏' $settings.ndNoDecor 14 110
     $tt.SetToolTip($cbNdSize, '独立窗口（虚拟显示器）的分辨率。可直接输入自定义值，如 2560x1440。')
-    $tt.SetToolTip($cbNdDpi, '虚拟屏里界面元素的大小。手机 App 显示太大就选「小」。')
+    $tt.SetToolTip($cbNdDpi, '虚拟屏里界面元素的大小。手机 App 显示太大就选「小」。已保存的自定义 DPI 会保留在选项中。')
     $tt.SetToolTip($chkNoDecor, '独立窗口顶部不再显示时间/电量那一条，App 内容顶到边；隐藏后通知栏也拉不出来。')
     $tabNd.Controls.AddRange(@(
         (New-Lbl '分辨率：' 14 18), $cbNdSize,
@@ -1529,7 +2141,9 @@ function Show-AppPicker {
     $owner.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     # 必须带 -s 指定设备：多设备连接时 scrcpy --list-apps 不指定设备会因「有多台设备」直接失败、列不出 App
     $listArgs = if ($serial) { @('-s', $serial, '--list-apps') } else { @('--list-apps') }
-    try { $raw = (Invoke-Hidden -FilePath $exe -ArgumentList $listArgs) -join "`n" } catch { $raw = '' }
+    $command=Invoke-UiCommand $owner $exe $listArgs
+    if ($command.Cancelled) { $owner.Cursor=[System.Windows.Forms.Cursors]::Default; return $null }
+    $raw=if (Test-CommandSuccess $command) { $command.Stdout + "`n" + $command.Stderr } else { '' }
     $owner.Cursor = [System.Windows.Forms.Cursors]::Default
     $list = @()
     foreach ($line in ($raw -split "`n")) {
@@ -1696,8 +2310,8 @@ function Add-ErrorLog {
 # $Buttons 按主次顺序传（第一个是深色主按钮，最后一个兼作 Esc/取消），返回被点按钮的键。
 function Show-ResultDialog {
     param($owner, $Title, $Heading, $Body, $Detail = '', $Buttons = @('ok'))
-    $labels = @{ ok = '确定'; continue = '继续'; retry = '重试'; ip = '输入 IP 连接'; cancel = '取消' }
-    $widths = @{ ok = 96; continue = 96; retry = 96; ip = 112; cancel = 84 }
+    $labels = @{ wait='继续等待'; force='强制结束'; ok = '确定'; continue = '继续'; retry = '重试'; ip = '输入 IP 连接'; cancel = '取消' }
+    $widths = @{ wait=96; force=96; ok = 96; continue = 96; retry = 96; ip = 112; cancel = 84 }
     # 正文按限宽量一次真实高度再定窗高：写死高度会在长文案时把最后一行裁掉
     $capFont = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
     $sz = [System.Windows.Forms.TextRenderer]::MeasureText([string]$Body, $capFont, (New-Object System.Drawing.Size(388, 0)), [System.Windows.Forms.TextFormatFlags]::WordBreak)
@@ -1802,7 +2416,8 @@ function Show-NewDisplay {
     if ($tt) { $tt.SetToolTip($cbAudio, $audioTt); $tt.SetToolTip($lblAudio, $audioTt) }   # $tt 是主窗体作用域的，动态查找；空值守卫
 
     $btnGo = New-PrimaryBtn '打开' 16 274 288 38 11
-    $state = @{ Target = $null; Label = $null; CustomSize = $null; CustomDpi = $null }
+    # 空字符串是用户明确清空后的值，不能再用值的真假来判断是否确认过。
+    $state = @{ Target = $null; Label = $null; CustomSize = $null; CustomDpi = $null; CustomConfirmed=$false }
     $ndBusy = $false
     $btnGo.Add_Click({
         if ($ndBusy) { return }
@@ -1816,12 +2431,13 @@ function Show-NewDisplay {
         }
         $ndModeSel = [string]$cbMode.Vals[$cbMode.SelectedIndex]
         if ($ndModeSel -eq 'custom') {
-            $askSize = if ($state.CustomSize) { [string]$state.CustomSize } else { [string]$settings.ndSize }
-            $askDpi = if ($state.CustomDpi) { [string]$state.CustomDpi } else { [string]$settings.ndDpi }
+            $askSize = if ($state.CustomConfirmed) { [string]$state.CustomSize } else { [string]$settings.ndSize }
+            $askDpi = if ($state.CustomConfirmed) { [string]$state.CustomDpi } else { [string]$settings.ndDpi }
             $ask = Show-CustomDisplaySize $dlg $askSize $askDpi
             if (-not $ask) { return }   # 取消：留在独立窗口面板，比例/声音不丢
             # 先记在本次面板的 pending 里，真正选定 App 后再写入 settings——取消选 App 不应改已存尺寸
             $state.CustomSize = [string]$ask.Size; $state.CustomDpi = [string]$ask.Dpi
+            $state.CustomConfirmed=$true
             $i = $cbMode.SelectedIndex
             $cbMode.Items[3] = $(if ($ask.Size) { "自定义 $($ask.Size)" } else { '自定义…' })
             $cbMode.SelectedIndex = $i
@@ -1869,6 +2485,7 @@ function Show-NewDisplay {
                 # 手机版面：虚拟屏用设备真实分辨率/密度，比例、密度都跟手机一致（App 不拉伸、走手机版面）；
                 # 窗口再按比例缩进屏幕、避免超出被切。读不到设备尺寸才兜底通用竖屏值。
                 $disp = Get-DeviceDisplay $serial
+                if ($disp.Cancelled) { return }
                 if ($disp) {
                     $w = [Math]::Min($disp.W, $disp.H); $h = [Math]::Max($disp.W, $disp.H)   # 保证竖屏 W<H
                     $d = if ($disp.Dpi -gt 0) { $disp.Dpi } else { 420 }
@@ -1878,14 +2495,14 @@ function Show-NewDisplay {
             'landscape' { $ndSz = '1920x1080'; $ndDpi = '240'; $autoFit = $true }
             # custom 的 pending 尺寸在“打开”时由 Show-CustomDisplaySize 确认，选定 App 后才落盘
             'custom'    {
-                if ($state.CustomSize) { $ndSz = [string]$state.CustomSize; $ndDpi = [string]$state.CustomDpi }
+                if ($state.CustomConfirmed) { $ndSz = [string]$state.CustomSize; $ndDpi = [string]$state.CustomDpi }
             }
         }
         $audioSel = [string]$cbAudio.Vals[$cbAudio.SelectedIndex]
         # 「自动」要服从设置里的总开关「把手机声音传到电脑」：总开关关了就不出声（独立窗口不带 Get-AudioArgs，否则总开关管不到它）；
         # 用户显式选的「播放/静音」以当次选择为准，不被总开关覆盖。
         $effAudio = if (-not $settings.audioOn -and $audioSel -eq 'auto') { 'off' } else { $audioSel }
-        if ($ndModeSel -eq 'custom' -and $state.CustomSize) {
+        if ($ndModeSel -eq 'custom' -and $state.CustomConfirmed) {
             $settings.ndSize = [string]$state.CustomSize; $settings.ndDpi = [string]$state.CustomDpi
         }
         $settings.ndMode = $ndModeSel; $settings.ndFixed = $chkFixed.Checked; $settings.ndAudio = $audioSel; Save-Settings
@@ -1926,26 +2543,22 @@ function Show-WirelessPair {
 
     $btnGo = New-PrimaryBtn '配对并连接' 16 206 328 38 11
     $result = @{ addr = $null }
-    $btnGo.Add_Click({
+    $connectionFlow=@{ Busy=$false }
+    $btnGo.Add_Click({ Invoke-MainFlow ({
         $pairAddr = $txtPair.Text.Trim()
         $code = $txtCode.Text.Trim()
         if ($pairAddr -notmatch '^(\d{1,3}(\.\d{1,3}){3}):\d+$') { [System.Windows.Forms.MessageBox]::Show('配对地址格式应为 IP:端口，例如 192.168.1.5:37123。', '配对') | Out-Null; return }
         $ip = $matches[1]
         if ($code -notmatch '^\d{6}$') { [System.Windows.Forms.MessageBox]::Show('配对码应为 6 位数字。', '配对') | Out-Null; return }
-        try { $pairOut = (Invoke-Hidden -FilePath $adb -ArgumentList @('pair', $pairAddr, $code)) -join "`n" } catch { $pairOut = $_.Exception.Message }
-        if ($pairOut -notmatch 'Successfully paired') {
-            [void](Show-ResultDialog $owner '用配对码连接' '配对失败' '多半是配对码过期或地址抄错。请在手机上重新生成配对码，把弹窗里的地址和 6 位数字一起照抄再试。' $pairOut @('ok'))
+        $discovery=Wait-UiTask -Owner $dlg -Functions @('Invoke-PairDiscovery','Test-CommandSuccess','Get-CommandDetail') -Inputs @{
+            Adb=$adb; PairAddress=$pairAddr; Code=$code; Ip=$ip
+        } -Work { Invoke-PairDiscovery $Inputs.Adb $Inputs.PairAddress $Inputs.Code $Inputs.Ip $Control }
+        if ($discovery.Cancelled) { return }
+        if (-not $discovery.Paired) {
+            [void](Show-ResultDialog $dlg '用配对码连接' '配对失败' '多半是配对码过期或地址抄错。请在手机上重新生成配对码，把弹窗里的地址和 6 位数字一起照抄再试。' $discovery.Error @('ok'))
             return
         }
-        # 配对成功：用 mdns 自动发现连接端口（同一 IP，端口不同），轮询几次等服务出现
-        $connAddr = $null
-        for ($i = 0; $i -lt 5 -and -not $connAddr; $i++) {
-            try { $mdns = (Invoke-Hidden -FilePath $adb -ArgumentList @('mdns', 'services')) -join "`n" } catch { $mdns = '' }
-            foreach ($line in ($mdns -split "`n")) {
-                if ($line -match '_adb-tls-connect\._tcp' -and $line -match "($([regex]::Escape($ip)):\d+)") { $connAddr = $matches[1]; break }
-            }
-            if (-not $connAddr) { Start-Sleep -Milliseconds 500 }
-        }
+        $connAddr=$discovery.Address
         # 自动没找到（mdns 不可用等）：退一步问端口号
         if (-not $connAddr) {
             $port = [Microsoft.VisualBasic.Interaction]::InputBox("已配对成功！但没能自动识别连接端口。`n请在手机「无线调试」主界面看「IP 地址和端口」，把冒号后面的端口号填这里：", '用配对码连接', '')
@@ -1954,14 +2567,17 @@ function Show-WirelessPair {
             if ($port -notmatch '^\d+$') { [System.Windows.Forms.MessageBox]::Show('端口应为纯数字。', '配对') | Out-Null; return }
             $connAddr = "${ip}:$port"
         }
-        try { $connOut = (Invoke-Hidden -FilePath $adb -ArgumentList @('connect', $connAddr)) -join "`n" } catch { $connOut = $_.Exception.Message }
-        if ($connOut -match 'connected to') {
-            $result.addr = $connAddr
+        $connection=Connect-DevicesUi $dlg @($connAddr)
+        if ($connection.Cancelled) { return }
+        $record=@($connection.Records)[0]
+        if ($record -and $record.Success) {
+            $result.addr=$connAddr
+            Touch-KnownDevice $connAddr (Get-FriendlyName $connAddr -CachedOnly)
             $dlg.Close()
         } else {
-            [void](Show-ResultDialog $owner '用配对码连接' "已配对成功，但连接 $connAddr 失败" '可在手机「无线调试」主界面核对端口后重试。' $connOut @('ok'))
+            [void](Show-ResultDialog $dlg '用配对码连接' "已配对成功，但连接 $connAddr 失败" '可在手机「无线调试」主界面核对端口后重试。' $(if ($record) { $record.Error } else { $connection.Error }) @('ok'))
         }
-    })
+    }) $dlg $connectionFlow })
     $dlg.Controls.AddRange(@($l1, $l2, $l3, $txtPair, $l4, $txtCode, $lblNote, $btnGo))
     $dlg.AcceptButton = $btnGo
     New-EscCancel $dlg
@@ -2024,11 +2640,11 @@ function Show-Shortcuts {
 # ---------------- 设备：记住 / 友好名 / 选择 / 解析目标 ----------------
 # 给设备起个一眼能认的名字：优先用户记住的备注名，否则取型号，再不行用序列号兜底。
 function Get-FriendlyName {
-    param($serial)
+    param($serial, [switch]$CachedOnly)
     if (-not $serial) { return '' }
     if ($script:deviceNames.Contains($serial))  { return $script:deviceNames[$serial] }   # 用户自定义名优先
     if ($script:knownDevices.Contains($serial)) { return $script:knownDevices[$serial] }
-    $info = Get-DevInfo $serial
+    $info = Get-DevInfo $serial -CachedOnly:$CachedOnly
     if ($info.Text) { return ($info.Text -split ' · ')[-1] }   # 取「Android 13 · Pixel 6」里的型号
     return $serial
 }
@@ -2046,7 +2662,7 @@ function Add-KnownDevice {
 # 否则会每 8s 写盘、多台同连时反复顶来顶去。Add-KnownDevice 仍只管「第一次记住新设备」。
 function Touch-KnownDevice {
     param($addr, $name)
-    if (-not $addr) { return }
+    if ($addr -isnot [string] -or [string]::IsNullOrWhiteSpace($addr)) { return }
     if (-not $name) { $name = if ($script:knownDevices.Contains($addr)) { $script:knownDevices[$addr] } else { Get-FriendlyName $addr } }
     $keys = @($script:knownDevices.Keys)
     if ($keys.Count -gt 0 -and $keys[0] -eq $addr -and $script:knownDevices[$addr] -eq $name) { return }
@@ -2070,125 +2686,25 @@ function Get-AutoConnectCandidates {
     return $ordered
 }
 
-# 启动时后台连接所有可达的记住设备：runspace 里并行 TCP 探测(轮询、不用 WaitAll) + 对可达者 CreateNoWindow 跑 adb connect。
-# UI 线程零阻塞；完成后一次性 Timer 在 UI 线程回收 runspace、Touch 连上的设备、回调刷新状态。
+# 重连共用扫描队列；finally 无论成功、失败还是关闭窗口都释放守卫。
 function Connect-RememberedAsync {
     param($OnDone)
-    if ($script:autoConnectStarted) { return }
-    if (-not $settings.autoConnect) { return }
+    if ($script:autoConnectStarted -or -not $settings.autoConnect) { return }
     $cands = @(Get-AutoConnectCandidates 16)
     if ($cands.Count -eq 0) { return }
     $script:autoConnectStarted = $true
-
-    $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
-    $rs.SessionStateProxy.SetVariable('adbPath', $adb)
-    $rs.SessionStateProxy.SetVariable('cands', $cands)
-    $rs.SessionStateProxy.SetVariable('probeTimeoutMs', 600)
-    $ps = [powershell]::Create(); $ps.Runspace = $rs
-    [void]$ps.AddScript({
-        $clients=@(); $iars=@()
-        foreach ($addr in $cands) {
-            $parts = $addr -split ':'; $ip=$parts[0]
-            $port = if ($parts.Count -gt 1 -and $parts[1]) { [int]$parts[1] } else { 5555 }
-            $c = New-Object System.Net.Sockets.TcpClient
-            try { $iar = $c.BeginConnect($ip,$port,$null,$null) } catch { $iar=$null }
-            $clients += $c; $iars += $iar
-        }
-        $sw=[System.Diagnostics.Stopwatch]::StartNew()
-        while ($sw.ElapsedMilliseconds -lt $probeTimeoutMs) {
-            $allDone=$true
-            for ($i=0;$i -lt $iars.Count;$i++){ if ($iars[$i] -and -not $iars[$i].IsCompleted){ $allDone=$false; break } }
-            if ($allDone){ break }
-            Start-Sleep -Milliseconds 30
-        }
-        $reachable=@()
-        for ($i=0;$i -lt $cands.Count;$i++){
-            $ok=$false
-            try { if ($iars[$i] -and $iars[$i].IsCompleted){ $clients[$i].EndConnect($iars[$i]); $ok=$clients[$i].Connected } } catch { $ok=$false }
-            try { $clients[$i].Close() } catch {}
-            if ($ok){ $reachable += $cands[$i] }
-        }
-        $connected=@()
-        foreach ($addr in $reachable) {
-            try {
-                $psi = [System.Diagnostics.ProcessStartInfo]::new()
-                $psi.FileName=$adbPath; $psi.Arguments="connect $addr"
-                $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
-                $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true
-                $p=[System.Diagnostics.Process]::Start($psi)
-                $out=$p.StandardOutput.ReadToEnd(); [void]$p.StandardError.ReadToEnd(); $p.WaitForExit()
-                if ($out -match 'connected to' -or $out -match 'already connected') { $connected += $addr }
-            } catch {}
-        }
-        return ,$connected
-    })
-    $async = $ps.BeginInvoke()
-    $bag = $script:bgTimers
-    $t = New-Object System.Windows.Forms.Timer; $t.Interval = 400; [void]$bag.Add($t)
-    $t.Add_Tick({
-        if ($async.IsCompleted) {
-            $t.Stop()
-            $connected=@()
-            try { $connected = @($ps.EndInvoke($async)) } catch {}
-            try { $rs.Dispose() } catch {}
-            $ps.Dispose(); $t.Dispose(); [void]$bag.Remove($t)
-            foreach ($a in $connected) { if ($a) { Touch-KnownDevice $a } }
-            if ($OnDone) { & $OnDone $connected }
-        }
+    Start-DeviceScan -Owner $form -Candidates $cands -ConnectAlways $true -Kind 'startup' -OnDone ({
+        param($result)
+        if ($OnDone) { & $OnDone @($result.Connected) }
     }.GetNewClosure())
-    $t.Start()
 }
-
-# 掉线后台重连单台无线地址（8s 轮询发现掉线时用）：先 TCP 探测可达再 CreateNoWindow adb connect，
-# 全程在后台 runspace 跑——不阻塞 UI、不闪控制台（与全脚本一致，不再用 Start-Process -WindowStyle Hidden）。
-# in-flight 守卫避免每 8s 轮询叠加多个探测/连接；被「不自动连」排除的地址直接跳过（与启动自动连接口径一致）。
-# 守卫放在哈希表里而不是布尔标量：完成回调是 GetNewClosure 闭包，里面写 $script:xxx 只会写进闭包模块的副本、
-# 真标志永远卡在 $true，掉线自动重连从第一次之后就全被这里 return 掉——只能靠「捕获引用 + 写属性」穿透闭包。
 $script:reconnectState = @{ InFlight = $false }
 function Reconnect-LastAsync {
     param($addr)
-    if (-not $addr) { return }
-    if ($script:reconnectState.InFlight) { return }
-    if (Test-AutoConnectExcluded $addr) { return }
-    $script:reconnectState.InFlight = $true
-    $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
-    $rs.SessionStateProxy.SetVariable('adbPath', $adb)
-    $rs.SessionStateProxy.SetVariable('addr', $addr)
-    $rs.SessionStateProxy.SetVariable('probeTimeoutMs', 700)
-    $ps = [powershell]::Create(); $ps.Runspace = $rs
-    [void]$ps.AddScript({
-        $parts = $addr -split ':'; $ip = $parts[0]
-        $port = if ($parts.Count -gt 1 -and $parts[1]) { [int]$parts[1] } else { 5555 }
-        $c = New-Object System.Net.Sockets.TcpClient
-        $ok = $false
-        try {
-            $iar = $c.BeginConnect($ip, $port, $null, $null)
-            if ($iar.AsyncWaitHandle.WaitOne($probeTimeoutMs)) { $c.EndConnect($iar); $ok = $c.Connected }
-        } catch { $ok = $false } finally { try { $c.Close() } catch {} }
-        if (-not $ok) { return }   # 死地址：探测即止，不发 adb connect，避免堆 ~21s 卡死的隐藏 adb
-        try {
-            $psi = [System.Diagnostics.ProcessStartInfo]::new()
-            $psi.FileName = $adbPath; $psi.Arguments = "connect $addr"
-            $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
-            $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
-            $p = [System.Diagnostics.Process]::Start($psi)
-            [void]$p.StandardOutput.ReadToEnd(); [void]$p.StandardError.ReadToEnd(); $p.WaitForExit()
-        } catch {}
-    })
-    $async = $ps.BeginInvoke()
-    $bag = $script:bgTimers
-    $flag = $script:reconnectState   # 捕获引用：闭包里写 $flag.InFlight 才真正改到脚本级状态（写 $script: 无效，见上）
-    $t = New-Object System.Windows.Forms.Timer; $t.Interval = 400; [void]$bag.Add($t)
-    $t.Add_Tick({
-        if ($async.IsCompleted) {
-            $t.Stop()
-            try { $ps.EndInvoke($async) } catch {}
-            try { $rs.Dispose() } catch {}
-            $ps.Dispose(); $t.Dispose(); [void]$bag.Remove($t)
-            $flag.InFlight = $false
-        }
-    }.GetNewClosure())
-    $t.Start()
+    if (-not $addr -or $script:reconnectState.InFlight -or (Test-AutoConnectExcluded $addr)) { return }
+    $flag = $script:reconnectState
+    $flag.InFlight = $true
+    Start-DeviceScan -Owner $form -Candidates @($addr) -Kind 'reconnect' -OnFinally ({ $flag.InFlight = $false }.GetNewClosure())
 }
 
 # 多设备时让用户挑一台投屏，返回序列号 / 地址，取消返回 $null。
@@ -2222,76 +2738,50 @@ function Select-Device {
 # 轮询而非 WaitHandle.WaitAll：Windows 上 WaitAll 句柄数上限 64，且这里在 UI 线程只需 ≤timeout 的短阻塞。
 function Get-ReachableAddrs {
     param([string[]]$addrs, [int]$timeoutMs = 700)
-    if (-not $addrs -or $addrs.Count -eq 0) { return @() }
-    $clients = @(); $iars = @()
-    foreach ($addr in $addrs) {
-        $parts = $addr -split ':'; $ip = $parts[0]
-        $port = if ($parts.Count -gt 1 -and $parts[1]) { [int]$parts[1] } else { 5555 }
-        $c = New-Object System.Net.Sockets.TcpClient
-        try { $iar = $c.BeginConnect($ip, $port, $null, $null) } catch { $iar = $null }
-        $clients += $c; $iars += $iar
+    if (-not $addrs) { return @() }
+    $requested=@($addrs)
+    $services=@($requested | Where-Object { Test-MdnsSerial $_ })
+    $addrs=@($requested | Where-Object { Test-TcpAddress $_ })
+    $clients = @(); $iars = @(); $reachable = @()
+    try {
+        foreach ($addr in $addrs) {
+            $c = New-Object Net.Sockets.TcpClient
+            $clients += $c
+            try {
+                $parts = $addr -split ':'
+                $port = if ($parts.Count -gt 1 -and $parts[1]) { [int]$parts[1] } else { 5555 }
+                $iars += $c.BeginConnect($parts[0],$port,$null,$null)
+            } catch { $iars += $null }
+        }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
+            if (@($iars | Where-Object { $_ -and -not $_.IsCompleted }).Count -eq 0) { break }
+            Start-Sleep -Milliseconds 25
+        }
+        for ($i = 0; $i -lt $addrs.Count; $i++) {
+            try {
+                if ($iars[$i] -and $iars[$i].IsCompleted) {
+                    $clients[$i].EndConnect($iars[$i])
+                    if ($clients[$i].Connected) { $reachable += $addrs[$i] }
+                }
+            } catch {}
+        }
+        # 不让 Winsock 把服务名当主机名或 IP:port；adb connect 支持完整的服务名。
+        return @($requested | Where-Object { $services -contains $_ -or $reachable -contains $_ })
+    } finally {
+        foreach ($c in $clients) { $c.Close() }
     }
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
-        $allDone = $true
-        for ($i = 0; $i -lt $iars.Count; $i++) { if ($iars[$i] -and -not $iars[$i].IsCompleted) { $allDone = $false; break } }
-        if ($allDone) { break }
-        Start-Sleep -Milliseconds 30
-    }
-    $reachable = @()
-    for ($i = 0; $i -lt $addrs.Count; $i++) {
-        $ok = $false
-        try { if ($iars[$i] -and $iars[$i].IsCompleted) { $clients[$i].EndConnect($iars[$i]); $ok = $clients[$i].Connected } } catch { $ok = $false }
-        try { $clients[$i].Close() } catch {}
-        if ($ok) { $reachable += $addrs[$i] }
-    }
-    return $reachable
 }
 
-# 没检测到设备、但有「记住的无线设备」时，先尝试连回来，再返回刷新后的设备列表。
-# 先 TCP 探测筛掉离线地址（只对在线的 adb connect），期间弹「正在连接…」小提示而非干转圈；
-# 连不上不弹错，交给调用方走原有兜底（选连接方式 / 没检测到手机）。
+# 查询完成后继续原功能；等待只发生在 worker，主流程的 Busy 直到回调完成才释放。
 function Ensure-Devices {
-    param($owner)
-    $devs = @(Get-DeviceList)
-    if ($devs.Count -gt 0 -or $script:knownDevices.Count -eq 0) { return $devs }
-
-    # 先并行探测哪些记住的设备此刻在线，不可达的直接跳过，避免对死地址 adb connect 卡很久
-    $reachable = @(Get-ReachableAddrs @($script:knownDevices.Keys) 700)
-    if ($reachable.Count -eq 0) { return @(Get-DeviceList) }
-
-    # 非阻塞小提示，避免用户只看到光标转圈以为卡死
-    $busy = $null
-    try {
-        $busy = New-Object System.Windows.Forms.Form
-        Set-DpiScale $busy   # 高 DPI 清晰化：Load 时按真实 DPI 等比放大
-        $busy.FormBorderStyle = 'None'; $busy.BackColor = $cPaper; $busy.ShowInTaskbar = $false
-        $busy.Size = New-Object System.Drawing.Size(260, 64)
-        $bl = New-Object System.Windows.Forms.Label
-        $bl.Text = '正在连接已记住的设备…'; $bl.Dock = 'Fill'; $bl.TextAlign = 'MiddleCenter'
-        $bl.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
-        $busy.Controls.Add($bl)
-        if ($owner) {
-            $ob = $owner.Bounds; $busy.StartPosition = 'Manual'
-            $busy.Location = New-Object System.Drawing.Point(($ob.Left + [int](($ob.Width - 260) / 2)), ($ob.Top + [int](($ob.Height - 64) / 2)))
-            $busy.Show($owner)
-        } else { $busy.StartPosition = 'CenterScreen'; $busy.Show() }
-        # 同步重绘忙提示（父窗 + 子标签各自 Update）。不用 Application::DoEvents——它会把整个输入队列也泵掉：
-        # 断连+有可达记住设备时，用户快速双击「有线/无线投屏」，第二次点击会在这里被重入派发，最终开出两个 scrcpy 窗口。
-        $busy.Refresh(); $bl.Refresh()
-    } catch { $busy = $null }
-
-    foreach ($addr in $reachable) {
-        try { Invoke-Hidden -FilePath $adb -ArgumentList @('connect', $addr) | Out-Null } catch {}
-    }
-
-    if ($busy) { try { $busy.Close(); $busy.Dispose() } catch {} }
-    return @(Get-DeviceList)
+    param($owner, [scriptblock]$OnDone, [scriptblock]$OnFinally)
+    Start-DeviceScan -Owner $owner -Candidates @($script:knownDevices.Keys) -Kind 'ensure' -OnDone $OnDone -OnFinally $OnFinally
 }
 
 function Resolve-Target {
-    param($owner, [string]$Prefer = '')
-    $devs = @(Ensure-Devices $owner)
+    param($owner, [string]$Prefer = '', [string[]]$Devices=@())
+    $devs=@($Devices)
     if ($devs.Count -eq 0) { return @{ Ok = $false; Reason = 'none'; Serial = $null } }
     if ($devs.Count -eq 1) { return @{ Ok = $true; Serial = $devs[0] } }
     if ($settings.defaultDevice -and ($devs -contains $settings.defaultDevice)) { return @{ Ok = $true; Serial = $settings.defaultDevice } }
@@ -2304,12 +2794,12 @@ function Resolve-Target {
 # 对「有版本要求」的功能（摄像头需 12+、独立窗口需 11+）：点一下就先定目标设备、查它的实际版本，
 # 不够直接弹提示并返回 $null（调用方据此中止，连功能弹窗都不会打开）。够了/读不到版本则返回目标序列号。
 function Resolve-TargetForFeature {
-    param($owner, [int]$Need, [string]$Feature)
-    $devs = @(Ensure-Devices $owner)
+    param($owner, [int]$Need, [string]$Feature, [string[]]$Devices=@())
+    $devs=@($Devices)
     if ($devs.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show("没检测到手机，请先连接手机再使用「$Feature」。", $Feature) | Out-Null; return $null }
     # 先把版本不够的设备排除在候选之外，再在「合格设备」里定目标：
     # 2 台里排掉 1 台后只剩 1 台就直接用，不必再弹窗问。读不到版本的当「未知」、不排除（交给 scrcpy 兜底）。
-    $eligible = @($devs | Where-Object { $v = (Get-DevInfo $_).Ver; ($v -eq 0) -or ($v -ge $Need) })
+    $eligible = @($devs | Where-Object { $v = (Get-DevInfo $_ -CachedOnly).Ver; ($v -eq 0) -or ($v -ge $Need) })
     if ($eligible.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("「$Feature」需要手机系统为 Android $Need 及以上。`n当前连接的设备都不满足，换一台或升级系统后再试。", $Feature) | Out-Null
         return $null
@@ -2333,34 +2823,21 @@ function Connect-ByIp {
     $txtPort = New-Txt 240 88 104; $txtPort.Text = '5555'
     $btnGo = New-PrimaryBtn '连接' 16 128 328 38 11
     $result = @{ addr = $null }
-    $btnGo.Add_Click({
+    $connectionFlow=@{ Busy=$false }
+    $btnGo.Add_Click({ Invoke-MainFlow ({
         $ip = $txtIp.Text.Trim(); $port = $txtPort.Text.Trim()
         if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { [System.Windows.Forms.MessageBox]::Show('IP 地址格式应为 4 段数字，例如 192.168.1.7。', '输入 IP 连接') | Out-Null; return }
         if (-not $port) { $port = '5555' }
         if ($port -notmatch '^\d+$') { [System.Windows.Forms.MessageBox]::Show('端口应为纯数字，常见是 5555。', '输入 IP 连接') | Out-Null; return }
         $addr = "${ip}:$port"
-        # 先短探一下地址是否可达：不可达时 adb connect 在 Windows 上会卡 10~40 秒，
-        # 输入框看着像死机；探测失败直接给人话，不进入那次长阻塞。
-        # 手动输入给 3 秒：弱 Wi-Fi/手机休眠时 TCP 握手可能超过 1.2 秒，太短会误拒可达设备。
-        $reach = @(Get-ReachableAddrs @($addr) 3000)
-        if ($reach.Count -eq 0) {
-            [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '手机没开「无线调试」或与电脑不在同一 WiFi：Android 11+ 去开发者选项里打开；更早的手机先插一次线，点「无线投屏 → 插数据线连接」切换。' "电脑上探测不到 $addr（IP 或端口没有响应）。" @('ok'))
-            return
-        }
-        try { $out = (Invoke-Hidden -FilePath $adb -ArgumentList @('connect', $addr)) -join "`n" } catch { $out = $_.Exception.Message }
-        # 刚连上的设备可能短暂 offline；轮询 3 秒再判定。只有明确 offline/unauthorized 才 disconnect，
-        # 查询本身失败或地址没出现时绝不 disconnect，避免拆掉可能正在工作的无线会话（录制中会丢文件）。
-        $state = $null
-        $deadline = (Get-Date).AddSeconds(3)
-        do {
-            $state = Get-AdbDeviceState $addr
-            if ($state -eq 'device' -or $state -eq 'unauthorized') { break }
-            Start-Sleep -Milliseconds 250
-        } while ((Get-Date) -lt $deadline)
+        $connection=Connect-DevicesUi $dlg @($addr) -Probe
+        if ($connection.Cancelled) { return }
+        $record=@($connection.Records)[0]
+        $state=if ($record) { $record.State } else { $null }
+        $out=if ($record) { $record.Error } else { $connection.Error }
         if ($state -eq 'device') {
             $result.addr = $addr; $dlg.Close()
         } elseif ($state -eq 'offline' -or $state -eq 'unauthorized') {
-            try { Invoke-Hidden -FilePath $adb -ArgumentList @('disconnect', $addr) | Out-Null } catch {}
             $body = if ($state -eq 'unauthorized') {
                 '手机上还没允许这台电脑调试：点亮手机，在「允许 USB 调试」弹窗里点允许后再试。'
             } else {
@@ -2372,12 +2849,12 @@ function Connect-ByIp {
         } else {
             [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '电脑上查询设备状态失败（adb 没返回设备列表），这次没有断开任何连接；请稍后重试。' $out @('ok'))
         }
-    })
+    }) $dlg $connectionFlow })
     $dlg.Controls.AddRange(@($l1, $l2, $l3, $txtIp, $l4, $txtPort, $btnGo))
     $dlg.AcceptButton = $btnGo
     New-EscCancel $dlg
     [void]$dlg.ShowDialog($owner)
-    if ($result.addr) { Touch-KnownDevice $result.addr }
+    if ($result.addr) { Touch-KnownDevice $result.addr (Get-FriendlyName $result.addr -CachedOnly) }
     return $result.addr
 }
 
@@ -2435,7 +2912,7 @@ function Show-DeviceManager {
     $tt.SetToolTip($btnAuto, '不自动连：助手启动和掉线时都不再自动连这台（再点恢复自动连）。')
 
     # refresh 把「已连接设备」「正在投屏的序列号」算一次塞进 $state；updateButtons 只读它，不再每次点都跑 adb
-    $state = @{ Active = @(); Connected = @() }
+    $state = @{ Active = @(); Connected = @(); SnapshotReady=$false }
 
     # 按选中项启用/禁用：连接=有选中的未连设备；投屏=有选中的已连且未在投；停止=有选中的在投；管理类仅单选有效
     $updateButtons = {
@@ -2462,14 +2939,24 @@ function Show-DeviceManager {
         } else { $btnAuto.Enabled = $false; $btnAuto.Text = '不自动连' }
     }
     $refresh = {
+        $state.SnapshotReady=$false
+        $snapshot=Wait-UiTask -Owner $dlg -Inputs @{ Adb=$adb } -Work {
+            Invoke-DeviceScan -AdbPath $Inputs.Adb -Candidates @() -ConnectAlways $false -InfoCache $InfoCache -Control $Control
+        }
+        if ($snapshot.Cancelled) { return }
+        if (-not $snapshot.Success) {
+            [void](Show-ResultDialog $dlg '设备管理' '查询设备失败，请稍后重试' '设备列表暂未更新，可以稍后重试。' $snapshot.Error @('ok'))
+            return
+        }
+        foreach ($key in $snapshot.Info.Keys) { $script:devInfo[$key]=$snapshot.Info[$key] }
         $active = Get-ActiveSerials; $state.Active = $active
         $selSerials = @($lv.SelectedItems | Where-Object { $_.Tag } | ForEach-Object { $_.Tag.Serial })   # 刷新前记住选中项
         $lv.BeginUpdate(); $lv.Items.Clear()
-        $connected = @(Get-DeviceList); $state.Connected = $connected
+        $connected = @($snapshot.Devices); $state.Connected = $connected
         foreach ($s in $connected) {
-            $info = Get-DevInfo $s; $wl = Test-Wireless $s
+            $info = Get-DevInfo $s -CachedOnly; $wl = Test-Wireless $s
             $tag = if ($settings.defaultDevice -eq $s) { '  ★默认' } else { '' }
-            $it = New-Object System.Windows.Forms.ListViewItem(('●  ' + (Get-FriendlyName $s) + $tag))
+            $it = New-Object System.Windows.Forms.ListViewItem(('●  ' + (Get-FriendlyName $s -CachedOnly) + $tag))
             $it.Group = $grpConn; $it.ForeColor = $cGreen
             [void]$it.SubItems.Add($s)
             $sys = if ($info.Ver -gt 0) { "Android $($info.Ver)" } else { '' }
@@ -2482,7 +2969,7 @@ function Show-DeviceManager {
         }
         foreach ($addr in $script:knownDevices.Keys) {
             if ($connected -contains $addr) { continue }
-            $it = New-Object System.Windows.Forms.ListViewItem(('○  ' + (Get-FriendlyName $addr)))
+            $it = New-Object System.Windows.Forms.ListViewItem(('○  ' + (Get-FriendlyName $addr -CachedOnly)))
             $it.Group = $grpKnown; $it.ForeColor = $cMuted
             [void]$it.SubItems.Add($addr)
             $typ2 = '无线 · 未连接'; if (Test-AutoConnectExcluded $addr) { $typ2 += '  ⊘ 不自动连' }
@@ -2498,20 +2985,20 @@ function Show-DeviceManager {
         $capNoDev.Visible = ($lv.Items.Count -eq 1 -and $lv.Items[0].Text -eq '（还没有设备）')
         foreach ($it in $lv.Items) { if ($it.Tag -and ($selSerials -contains $it.Tag.Serial)) { $it.Selected = $true } }   # 还原选中
         $lv.EndUpdate(); & $updateButtons
+        $state.SnapshotReady=$true
     }
 
     # 连接选中的未连设备（只连，不投）：连成功后它会进到「已连接」组，再点「投屏」即可
     $connectSelected = {
         $items = @($lv.SelectedItems | Where-Object { $_.Tag -and -not $_.Tag.Connected })
         if ($items.Count -eq 0) { return }
-        $fail = @()
-        $owner.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-        foreach ($it in $items) {
-            $addr = $it.Tag.Serial
-            try { $out = (Invoke-Hidden -FilePath $adb -ArgumentList @('connect', $addr)) -join "`n" } catch { $out = $_.Exception.Message }
-            if ($out -match 'connected to') { Touch-KnownDevice $addr } else { $fail += "$addr：$out" }
+        $connection=Connect-DevicesUi $dlg @($items | ForEach-Object { $_.Tag.Serial })
+        if ($connection.Cancelled) { return }
+        $fail=@()
+        foreach ($record in $connection.Records) {
+            if ($record.Success) { Touch-KnownDevice $record.Address (Get-FriendlyName $record.Address -CachedOnly) }
+            else { $fail += "$($record.Address)：$($record.Error)" }
         }
-        $owner.Cursor = [System.Windows.Forms.Cursors]::Default
         if ($fail) { [void](Show-ResultDialog $dlg '设备管理' ("有 " + $fail.Count + " 台没连上") '多半是手机不在线，或没开「无线调试」。确认手机和电脑连的同一个 Wi-Fi 后可重试，或先插一次线。' ($fail -join "`r`n") @('ok')) }
         & $refresh
     }
@@ -2526,8 +3013,10 @@ function Show-DeviceManager {
     }
     # 全部投屏：把所有已连、尚未投屏的设备各开一个窗口
     $castAll = {
+        & $refresh
+        if (-not $state.SnapshotReady) { return }
         $active = Get-ActiveSerials
-        foreach ($s in @(Get-DeviceList)) {
+        foreach ($s in @($state.Connected)) {
             if ($active -contains $s) { continue }
             Start-Scrcpy (@('-s', $s) + (Get-MirrorArgs -Wireless:(Test-Wireless $s)))
         }
@@ -2535,7 +3024,7 @@ function Show-DeviceManager {
     }
     # 停止投屏：只关掉选中设备的投屏窗口，不影响其它台
     $stopSelected = {
-        foreach ($it in @($lv.SelectedItems | Where-Object { $_.Tag })) { Stop-DeviceScrcpy $it.Tag.Serial }
+        [void](Stop-DevicesUi $dlg @($lv.SelectedItems | Where-Object { $_.Tag } | ForEach-Object { $_.Tag.Serial }))
         & $refresh
     }
     # 双击某行＝对它做最顺手的那一步：未连就连、已连未投就投（不关窗口，方便接着操作）
@@ -2565,8 +3054,8 @@ function Show-DeviceManager {
     $btnDisc.Add_Click({ Invoke-MainFlow ({
         $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
         $addr = $items[0].Tag.Serial
-        Stop-DeviceScrcpy $addr   # 断开前先停掉它的投屏窗口，避免悬空
-        try { Invoke-Hidden -FilePath $adb -ArgumentList @('disconnect', $addr) -DiscardStderr | Out-Null } catch {}
+        $stopped=Stop-DevicesUi $dlg @($addr) -Disconnect
+        if ($stopped.Cancelled -or -not $stopped.Success) { & $refresh; return }
         $dirty = $false
         if ($settings.defaultDevice -eq $addr) { $settings.defaultDevice = ''; $dirty = $true }
         # 主动断开的那台别再被 8s 轮询连回来：Reconnect-LastAsync 只认 lastWirelessAddr，不清就等于「断开没生效」。
@@ -2584,9 +3073,9 @@ function Show-DeviceManager {
     $btnRename.Add_Click({ Invoke-MainFlow ({
         $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
         $s = $items[0].Tag.Serial
-        $name = [Microsoft.VisualBasic.Interaction]::InputBox("给这台设备起个名字（如 客厅电视）：", '重命名设备', (Get-FriendlyName $s))
+        $name = [Microsoft.VisualBasic.Interaction]::InputBox("给这台设备起个名字（如 客厅电视）：", '重命名设备', (Get-FriendlyName $s -CachedOnly))
         $name = $name.Trim()
-        if ($name -and $name -ne (Get-FriendlyName $s)) { $script:deviceNames[$s] = $name; Save-Settings; & $refresh }
+        if ($name -and $name -ne (Get-FriendlyName $s -CachedOnly)) { $script:deviceNames[$s] = $name; Save-Settings; & $refresh }
     }) $dlg $script:dmFlow })
     $btnForget.Add_Click({ Invoke-MainFlow ({
         $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
@@ -4006,10 +4495,18 @@ try {
     $tt.SetToolTip($lblStatus, '点击管理设备：切换 / 断开 / 输入 IP 连接（状态会在切回窗口时自动刷新）。')
 
     # ---------------- 行为 ----------------
-    $updateStatus = {
-        $devs = @(Get-DeviceList)
+    $renderStatus = {
+        param($result)
+        if ($script:mainFlow -and $script:mainFlow.Busy) { return }
+        if (-not $result.Success) {
+            $lblStatus.BackColor=$cTagBg; $lblStatus.ForeColor=$cMuted
+            $lblStatus.Text='○ 状态查询失败'
+            $lblDevInfo.Text=''
+            return
+        }
+        $devs=@($result.Devices)
         # 掉线且开了自动重连：后台探测+连回上次的无线地址（不阻塞界面，下次刷新生效）。
-        # 交给 Reconnect-LastAsync：先 TCP 探测可达才连、respect「不自动连」名单、CreateNoWindow 不闪控制台、in-flight 防叠加。
+        # 排除名单仍由 Reconnect-LastAsync 检查，避免用户断开的设备被刷新逻辑连回。
         if ($devs.Count -eq 0 -and $settings.autoConnect -and $settings.lastWirelessAddr) {
             Reconnect-LastAsync $settings.lastWirelessAddr
         }
@@ -4017,7 +4514,7 @@ try {
             $w = $devs | Where-Object { Test-Wireless $_ } | Select-Object -First 1
             if ($w) {
                 if ($settings.lastWirelessAddr -ne $w) { $settings.lastWirelessAddr = $w; Save-Settings }
-                Add-KnownDevice $w   # 任何方式连上的无线设备都自动记住，供「设备管理」重连
+                Add-KnownDevice $w (Get-FriendlyName $w -CachedOnly)   # 任何方式连上的无线设备都自动记住，供「设备管理」重连
             }
             # 状态显示哪台：默认设备（若在线）优先，否则无线优先，再否则第一台
             $isDefault = $settings.defaultDevice -and ($devs -contains $settings.defaultDevice)
@@ -4025,15 +4522,19 @@ try {
             $type = if (Test-Wireless $dev) { '无线' } else { 'USB' }
             $lblStatus.BackColor = $cGreenBg; $lblStatus.ForeColor = $cGreen
             $lblStatus.Text = "● 已连接 $type"
-            $info = Get-DevInfo $dev
+            $info = Get-DevInfo $dev -CachedOnly
             $ver = if ($info.Ver -gt 0) { " · Android $($info.Ver)" } else { '' }
             $star = if ($isDefault -and $devs.Count -gt 1) { '★ ' } else { '' }   # 多设备时标出当前是默认那台
-            $lblDevInfo.Text = "$star$(Get-FriendlyName $dev)$ver"
+            $lblDevInfo.Text = "$star$(Get-FriendlyName $dev -CachedOnly)$ver"
         } else {
             $lblStatus.BackColor = $cTagBg; $lblStatus.ForeColor = $cMuted
             $lblStatus.Text = '○ 未连接'
             $lblDevInfo.Text = ''
         }
+    }
+    $updateStatus = {
+        if ($script:mainFlow -and $script:mainFlow.Busy) { return }
+        Start-DeviceScan -Owner $form -Kind 'status' -OnDone $renderStatus
     }
     $btnShortcuts.Add_Click({ Invoke-MainFlow ({ Show-Shortcuts $form }) })
     $btnSettings.Add_Click({ Invoke-MainFlow ({ Show-Settings $form }) })
@@ -4046,7 +4547,7 @@ try {
     # 主操作防重入。这些流程内部全是模态框（ShowDialog 自己会泵消息队列），期间排队的第二次点击
     # 会被立刻派发 → 整条流程跑两遍（表现为同一个提示弹两次、叠两个设备管理窗）。而 adb 冷启动一次
     # 能阻塞界面 ~2.4 秒且毫无反馈，正是诱发那一次重复点击的源头，所以忙时同时挂等待光标。
-    # 标志必须走「哈希表 + 引用」：闭包里写 $script:裸布尔 只改到闭包模块的副本（见 Reconnect-LastAsync 上方注释）。
+    # 标志必须走「哈希表 + 引用」：闭包有自己的模块作用域，写 $script:裸变量 赋的是副本、真实标志不变；跨闭包共享状态一律用哈希表通过捕获引用传递。
     $script:mainFlow = @{ Busy = $false }
     # 设备管理另用一把锁：它是模态窗，「设备」那条流程的锁会占满整个设备管理开着的时段，
     # 窗内按钮若共用同一把，开完窗就全点不动了。
@@ -4090,7 +4591,7 @@ try {
         foreach ($l in $script:busyLinks) { $l.ForeColor = $cBusyLink }
     }
     function Invoke-MainFlow {
-        param([scriptblock]$Body, $Owner, $Flag, $Source)
+        param([scriptblock]$Body, $Owner, $Flag, $Source, [switch]$WithDevices)
         if (-not $Flag) { $Flag = $script:mainFlow }
         if ($Flag.Busy) {
             # 忙时不动光标：正在跑的那条流程已经把窗口设成等待光标了，这里再设一次没人给它复位
@@ -4114,26 +4615,49 @@ try {
             & $script:showTempHint '正在处理，请稍候…' $cMuted $null
             $script:hintHeld = $true
         }
-        try { & $Body } finally {
-            $w.Cursor = [System.Windows.Forms.Cursors]::Default
-            if ($isMain) {
-                Set-BusyLook -On $false
-                if ($statusSnap) {
-                    $lblStatus.Text = $statusSnap.Text; $lblStatus.BackColor = $statusSnap.Back; $lblStatus.ForeColor = $statusSnap.Fore
-                }
-                $script:hintHeld = $false
-                if ($script:hintKeepAfterFlow) {
-                    $script:hintKeepAfterFlow = $false
-                } else {
-                    & $script:restoreHint
-                }
-            }
-            $Flag.Busy = $false
+        $flow=@{ Owner=$w; Flag=$Flag; IsMain=$isMain; Status=$statusSnap }
+        if ($WithDevices) {
+            $done={
+                param($result)
+                if ($result.Success) { & $Body @($result.Devices) }
+                else { Show-DeviceQueryFailure }
+            }.GetNewClosure()
+            $finished={ Complete-MainFlow $flow }.GetNewClosure()
+            try { Ensure-Devices $w $done $finished }
+            catch { Complete-MainFlow $flow; throw }
+            return
         }
+        try { & $Body } finally { Complete-MainFlow $flow }
+    }
+    function Show-DeviceQueryFailure {
+        & $script:showTempHint '查询设备失败，请稍后重试' $cRed 8000
+        $script:hintKeepAfterFlow=$true
+    }
+    function Complete-MainFlow {
+        param($flow)
+        $Flag=$flow.Flag
+        if ($script:deviceScanState.Closing -or $flow.Owner.IsDisposed) { $Flag.Busy=$false; return }
+        $w=$flow.Owner; $isMain=$flow.IsMain; $statusSnap=$flow.Status
+        $w.Cursor = [System.Windows.Forms.Cursors]::Default
+        if ($isMain) {
+            Set-BusyLook -On $false
+            if ($statusSnap) {
+                $lblStatus.Text = $statusSnap.Text; $lblStatus.BackColor = $statusSnap.Back; $lblStatus.ForeColor = $statusSnap.Fore
+            }
+            $script:hintHeld = $false
+            if ($script:hintKeepAfterFlow) {
+                $script:hintKeepAfterFlow = $false
+            } else {
+                & $script:restoreHint
+            }
+        }
+        $Flag.Busy = $false
     }
 
-    $btnWired.Add_Click({ Invoke-MainFlow -Source $btnWired ({
-        $devs = @(Ensure-Devices $form)
+
+    $btnWired.Add_Click({ Invoke-MainFlow -WithDevices -Source $btnWired ({
+        param($devices)
+        $devs=@($devices)
         if ($devs.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show("没检测到手机。请用数据线连接并点「允许 USB 调试」，或点右上角的连接状态走无线连接。`n`n不会开 USB 调试？看同目录的「使用说明.txt」第一节。", '有线投屏') | Out-Null; return }
         $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
         $wl  = @($devs | Where-Object { Test-Wireless $_ })
@@ -4147,8 +4671,9 @@ try {
         if ($t) { Start-Scrcpy (@('-s', $t) + (Get-MirrorArgs -Wireless:(Test-Wireless $t))) }
     }) })
 
-    $btnWireless.Add_Click({ Invoke-MainFlow -Source $btnWireless ({
-        $devs = @(Ensure-Devices $form)
+    $btnWireless.Add_Click({ Invoke-MainFlow -WithDevices -Source $btnWireless ({
+        param($devices)
+        $devs=@($devices)
         $wl = @($devs | Where-Object { Test-Wireless $_ })
         $usb = @($devs | Where-Object { -not (Test-Wireless $_) })
         if ($wl.Count -ge 1) {
@@ -4213,7 +4738,7 @@ try {
                 $addr = Show-WirelessPair $form
                 if ($addr) {
                     if ($settings.lastWirelessAddr -ne $addr) { $settings.lastWirelessAddr = $addr; Save-Settings }
-                    Touch-KnownDevice $addr
+                    Touch-KnownDevice $addr (Get-FriendlyName $addr -CachedOnly)
                     Start-Scrcpy (@('-s', $addr) + (Get-MirrorArgs -Wireless:$true))
                 }
             }
@@ -4227,12 +4752,14 @@ try {
         }
     }) })
 
-    $btnCamera.Add_Click({ Invoke-MainFlow -Source $btnCamera ({
-        $serial = Resolve-TargetForFeature $form 12 '手机当摄像头'   # 点击即定设备、查版本，不够直接弹提示并中止
+    $btnCamera.Add_Click({ Invoke-MainFlow -WithDevices -Source $btnCamera ({
+        param($devices)
+        $serial = Resolve-TargetForFeature $form 12 '手机当摄像头' -Devices $devices   # 点击即定设备、查版本，不够直接弹提示并中止
         if (-not $serial) { return }
-        # 自动读取这台设备真正支持的采集分辨率（约 1~2 秒），让分辨率下拉只列“一定能开”的尺寸
+        # 自动读取这台设备真正支持的采集分辨率（约 1~2 秒），让分辨率下拉与随后启动的镜头一致
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-        $camSizes = Get-CameraSizes $serial
+        $camSizes = Get-CameraSizes $serial $form
+        if ($null -eq $camSizes) { return }
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
         $camDetected = ((@($camSizes.back).Count + @($camSizes.front).Count) -gt 0)
         $dlg = New-Dialog '手机当摄像头' 264 404 $form
@@ -4251,10 +4778,11 @@ try {
         $tt.SetToolTip($chkRotate180, '手机倒置时勾选，在横屏或竖屏基础上再旋转 180°，不是左右镜像。点「开始」后记住。')
         $gb2.Controls.AddRange(@($rbLand, $rbPort, $chkRotate180))
 
-        # 分辨率：优先用实测支持尺寸（精确 --camera-size，一定能开）；读不到时回退到「最大边长」通用档位。
+        # 分辨率：优先用实测支持尺寸（精确 --camera-size，与镜头一致）；读不到时回退到「最大边长」通用档位。
         # 下拉内容随「后置/前置」切换重填——两个摄像头支持的尺寸常常不一样。
         $lblRes = New-Lbl '分辨率' 16 168
         $cbRes = New-Combo @('自动') @('auto') 'auto' 78 165 170
+        $tt.SetToolTip($cbRes,'同一朝向只使用第一颗镜头的尺寸与变焦范围。')
         # 说明文字顶格放、限宽自动换行：原先跟在下拉下方 x=78 起步，固定宽度的窗横向摆不下、尾巴被裁掉看不全
         $capRes = New-Caption '' 16 196
         $capRes.MaximumSize = New-Object System.Drawing.Size(230, 0)
@@ -4340,7 +4868,7 @@ try {
             $settings.camTorch = $chkTorch.Checked
             $settings.camMic = $chkMic.Checked
             Save-Settings
-            $a = @('-s', $serial, '--video-source=camera', "--camera-facing=$facing")
+            $a = @('-s', $serial, '--video-source=camera') + @(Get-CameraSelectionArgs $camSizes $facing)
             if ($zs -ne '1') { $a += "--camera-zoom=$zs" }   # 1 倍是默认值，不必显式传
             if ($selVal -match '^\d+x\d+$') {
                 # 设备实测支持的精确采集尺寸：直接用 --camera-size，不再加 --camera-ar 以免比例冲突。
@@ -4370,7 +4898,19 @@ try {
             $a += @(Get-HwDecArgs)
             # 交给看门狗盯着（$script:camWatch）：只管「亮屏被抢自动重连」；分辨率带不动已交给 scrcpy 4.1 原生降档，看门狗不再手动换档
             # 同一台的旧会话先标停：用户重新从面板开摄像头 = 放弃旧会话，否则两个会话的看门狗会抢着拉进程
-            foreach ($old in @($script:camSessions)) { if ($old.Serial -eq $serial) { $old.Stopped = $true; $old.SkipZoom = $true } }
+            $previousSessions=@($script:camSessions | Where-Object { $_.Serial -eq $serial })
+            if ($previousSessions.Count) {
+                foreach ($old in $previousSessions) { $old.SkipZoom=$true }
+                $previousItems=@($scrcpyProcs | Where-Object {
+                    $item=$_
+                    @($previousSessions | Where-Object { [object]::ReferenceEquals($_.Proc,$item.Proc) }).Count -gt 0
+                })
+                $stopped=Stop-DevicesUi $form -Items $previousItems
+                if (-not $stopped.Success) {
+                    foreach ($old in $previousSessions) { if (-not (Test-ProcessExited $old.Proc)) { $old.SkipZoom=$false } }
+                    return
+                }
+            }
             $tag = [guid]::NewGuid().ToString('N').Substring(0, 8)
             $errFile = Join-Path $env:TEMP ("scrcpy-helper-cam-{0}.log" -f $tag)
             $outFile = Join-Path $env:TEMP ("scrcpy-helper-cam-{0}.out.log" -f $tag)   # 倍率回传用，见 Read-CamZoom
@@ -4379,55 +4919,55 @@ try {
                 [void]$script:camSessions.Add([pscustomobject]@{
                     Serial = $serial; Facing = $facing; Args = [string[]]$a
                     Proc = $p; StartedAt = (Get-Date); ErrFile = $errFile; OutFile = $outFile; LastZoom = $null
-                    Fails = 0; Proven = $false; Stopped = $false; SkipZoom = $false; NextTryAt = [datetime]::MinValue
+                    Fails = 0; Proven = $false; Stopped = $false; Reconnecting=$false; SkipZoom = $false; NextTryAt = [datetime]::MinValue
                 })
                 $script:camWatch.Start()
             }
         }
     }) })
 
-    $btnRecord.Add_Click({ Invoke-MainFlow -Source $btnRecord ({
-        $tgt = Resolve-Target $form
+    $btnRecord.Add_Click({ Invoke-MainFlow -WithDevices -Source $btnRecord ({
+        param($devices)
+        $tgt = Resolve-Target $form -Devices $devices
         if (-not $tgt.Ok) { if ($tgt.Reason -eq 'none') { [System.Windows.Forms.MessageBox]::Show('没检测到手机，请先连接手机再录制。', '录制屏幕') | Out-Null }; return }
-        # VP8/VP9 装不进 mp4 容器(scrcpy 会直接拒)：这两种编码时强制走 mkv——默认名与筛选器都用 mkv，用户手选 mp4 也纠正回来。
-        $vpNeedsMkv = $settings.videoCodec -in @('vp8', 'vp9')
-        $recExt = if ($vpNeedsMkv) { 'mkv' } else { $settings.recFormat }
+        $recExt = Get-RecordingExtension
+        $mkvOnly = ($settings.videoCodec -in @('vp8', 'vp9') -or ($settings.audioOn -and $settings.audioCodec -eq 'raw'))
         $sfd = New-Object System.Windows.Forms.SaveFileDialog
         $sfd.InitialDirectory = $PSScriptRoot
         $sfd.FileName = "录屏-$(Get-Date -Format 'yyyyMMdd-HHmmss').$recExt"
-        $sfd.Filter = if ($vpNeedsMkv) { 'MKV 视频|*.mkv' } else { 'MP4 视频|*.mp4|MKV 视频|*.mkv' }
+        $sfd.DefaultExt = $recExt
+        $sfd.Filter = if ($mkvOnly) { 'MKV 视频|*.mkv' } else { 'MP4 视频|*.mp4|MKV 视频|*.mkv' }
+        $sfd.FilterIndex = if (-not $mkvOnly -and $recExt -eq 'mkv') { 2 } else { 1 }
+        # 不在对话框关闭后改路径；显式填写不兼容后缀时留在对话框里修改，确保覆盖确认与写入同一文件。
+        $sfd.Add_FileOk({
+            param($sender, $eventArgs)
+            $ext = [System.IO.Path]::GetExtension($sender.FileName)
+            if (($mkvOnly -and $ext -ne '.mkv') -or $ext -notin @('.mp4', '.mkv')) {
+                $eventArgs.Cancel = $true
+                [System.Windows.Forms.MessageBox]::Show($(if ($mkvOnly) { '当前编码需使用 mkv，请把文件后缀改为 .mkv。' } else { '请使用 .mp4 或 .mkv 文件后缀。' }), '录制屏幕') | Out-Null
+            }
+        })
         if ($sfd.ShowDialog($form) -eq 'OK') {
             $recPath = $sfd.FileName
-            if ($vpNeedsMkv -and $recPath -notmatch '\.mkv$') {
-                $recPath = [System.IO.Path]::ChangeExtension($recPath, 'mkv')
-                & $script:showTempHint "VP8/VP9 不能录进 mp4，已自动改存 mkv" $cMuted
-            }
             $a = @('-s', $tgt.Serial, '-r', $recPath) + (Get-VideoArgs) + (Get-AudioArgs)
             # 保持唤醒要分连接方式：无线用 --keep-active（-w/--stay-awake 只在 USB 插电时生效，无线录制会中途息屏断流）
-            if ($settings.stayAwake) { $a += $(if (Test-Wireless $tgt.Serial) { '--keep-active' } else { '-w' }) }
+            if ($settings.noControl) { $a += '--no-control' }
+            elseif ($settings.stayAwake) { $a += $(if (Test-Wireless $tgt.Serial) { '--keep-active' } else { '-w' }) }
             if ([int]$settings.recTimeLimit -gt 0) { $a += "--time-limit=$($settings.recTimeLimit)" }
             if ($settings.recBackground) { $a += @('--no-window', '--no-playback') }
-            $beforeRec = $scrcpyProcs.Count
-            Start-Scrcpy $a -Recording
-            # 非模态提示（不弹窗打断）：把底部提示行临时换成录制提示，几秒后自动恢复。文字保持短，避免压到右侧「设备/快捷键/设置」链接。
-            # 只看本次新增的录制进程：旧录制还在时，新录制失败不能被误报成「录制中」。
-            $recStarted = $false
-            if ($scrcpyProcs.Count -gt $beforeRec) {
-                try {
-                    $newRec = $scrcpyProcs[$scrcpyProcs.Count - 1]
-                    $recStarted = ($newRec.Rec -and $newRec.Proc -and -not $newRec.Proc.HasExited)
-                } catch {}
-            }
+            $newRec=Start-Scrcpy $a -Recording -PassThru
+            $recStarted=($newRec -and -not (Test-ProcessExited $newRec))
             if ($recStarted) {
-                $recTip = if ($settings.recBackground) { '● 后台录制中 · 「设备」里停止投屏即保存' } else { '● 录制中 · 关掉投屏窗口即停止并保存' }
+                $recTip = if ($settings.recBackground) { '● 后台录制中 · 「设备」里可停止录制' } else { '● 录制中 · 关掉投屏窗口可停止录制' }
                 & $script:showTempHint $recTip $cGreen
                 $script:hintKeepAfterFlow = $true
             }
         }
     }) })
 
-    $btnNd.Add_Click({ Invoke-MainFlow -Source $btnNd ({
-        $serial = Resolve-TargetForFeature $form 11 '独立窗口'   # 点击即定设备、查版本，不够直接弹提示并中止
+    $btnNd.Add_Click({ Invoke-MainFlow -WithDevices -Source $btnNd ({
+        param($devices)
+        $serial = Resolve-TargetForFeature $form 11 '独立窗口' -Devices $devices   # 点击即定设备、查版本，不够直接弹提示并中止
         if (-not $serial) { return }
         Show-NewDisplay $form $serial
     }) })
@@ -4451,10 +4991,13 @@ try {
     $script:camWatch = New-Object System.Windows.Forms.Timer
     $script:camWatch.Interval = 1500
     $script:camWatch.Add_Tick({
-        if ($script:camSessions.Count -eq 0) { $script:camWatch.Stop(); return }
+        if ($script:closeState.InProgress) { return }
+        Update-ProcessLifecycle
+        if ($script:camSessions.Count -eq 0) { return }
         $now = Get-Date
         foreach ($cs in @($script:camSessions)) {
           try {
+            if ($cs.Reconnecting) { continue }
             if ($cs.Stopped -or -not $cs.Proc) { Remove-CamSession $cs; continue }
             if (-not $cs.Proc.HasExited) {
                 # 稳定运行 15 秒 = 这次会话确实起来了：清失败计数（供被抢重连的 12 次上限用）
@@ -4482,18 +5025,13 @@ try {
                     & $script:showTempHint '多次重连失败，摄像头已停止' $cRed 12000
                     continue
                 }
-                if ((Get-DeviceList) -notcontains $cs.Serial) {
-                    # 设备整个不在了（拔线/无线掉线）：重启 scrcpy 只会白闪一串失败窗口，直接收手并告知
-                    Remove-CamSession $cs
-                    & $script:showTempHint '设备已断开，摄像头未自动重连' $cRed 12000
-                    continue
-                }
                 $cs.NextTryAt = $now.AddSeconds([Math]::Min(2 * $cs.Fails, 10))
-                # 重连会用新进程覆盖掉日志文件，先把这次按出来的倍率存下来，免得被抢一次就把用户调的倍率丢了
-                $zNow = Read-CamZoom $cs.OutFile; if ($null -ne $zNow) { $cs.LastZoom = $zNow }
-                $cs.Proc = Start-CamProc $cs.Args $cs.ErrFile $cs.OutFile
-                $cs.StartedAt = Get-Date
-                if ($cs.Proc) { & $script:showTempHint '摄像头被亮屏打断，已自动重连；关窗即停' $cGreen }
+                $cs.Reconnecting=$true
+                $session=$cs
+                Start-DeviceScan -Owner $form -Kind 'camera' -OnDone ({
+                    param($snapshot)
+                    Resume-CameraSession $session $snapshot
+                }.GetNewClosure()) -OnFinally ({ $session.Reconnecting=$false }.GetNewClosure())
             } elseif ($kind -eq 'cfg') {
                 # 编码器/配置类失败退出。已去掉 --no-downsize-on-error：scrcpy 4.1 能降档时会内部单步降档、进程不退；
                 # 走到这里 = 它把分级阶梯 {2560..800} 也试完了仍开不出 → 手动再降没意义，直接停并提示选更低分辨率。
@@ -4506,11 +5044,13 @@ try {
             }
           } catch { try { Remove-CamSession $cs } catch {} }   # 看门狗内部任何意外都只放弃这个会话，绝不让异常冒成弹窗
         }
+        Update-ProcessLifecycle
     })
     $form.Add_Shown({
         & $updateStatus
         if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() }
         Connect-RememberedAsync ({ param($connected) & $updateStatus }.GetNewClosure())
+        $script:camWatch.Start()
         Start-ActivationWaiter $form.Handle $script:actEvent   # 开始监听"再次启动时激活本窗口"的信号
         # 首次显示主动抢一次前台：conhost --headless 启动的进程窗口有时不会自动到前台/不聚焦，用户以为"没反应"。
         # 本进程激活自己的窗口是可靠的：Activate + TopMost 翻转 + SetForegroundWindow(自身句柄)。
@@ -4557,47 +5097,17 @@ try {
         }
     })
 
-    # 从任务栏还原「点标题栏最小化」的窗口时，资源管理器的顺序是：先激活窗口、几毫秒后再发还原指令。
-    # 这里一激活就同步跑 adb devices 刷状态（实测几十到上百毫秒），会卡住 UI 线程，导致资源管理器的
-    # 还原指令发不出来——窗口停在「活动但仍最小化」，点一下没反应还响错误提示音，必须再点第二下。
-    # 最小化期间把这次刷新延后 200ms（一次性定时器），让还原指令先走完；窗口正常时照旧立即刷新。
+    # 激活事件仅排队查询，资源管理器可以立即处理还原窗口的消息。
     $form.Add_Activated({
-        if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
-            $deferRefresh = New-Object System.Windows.Forms.Timer
-            $deferRefresh.Interval = 200
-            $deferRefresh.Add_Tick({
-                param($s)
-                $s.Stop(); $s.Dispose()
-                if ($form.IsDisposed) { return }
-                & $updateStatus
-                if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() } else { $timer.Stop() }
-            })
-            $deferRefresh.Start()
-        } else {
-            & $updateStatus; if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() } else { $timer.Stop() }
-        }
+        & $updateStatus
+        if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() } else { $timer.Stop() }
     })
     $form.Add_Deactivate({ $timer.Stop() })
-    # 关闭助手 = 停止它开过的所有投屏；正在录屏时先确认，避免误关丢录像
     $form.Add_FormClosing({
-        param($formSender, $e)
-        if (Test-Recording) {
-            $r = [System.Windows.Forms.MessageBox]::Show("正在录屏。关闭助手会停止录制（已录部分会保存）。`n`n确定要关闭吗？`n（想继续录、只收起助手，点最小化即可）", '正在录屏', 'YesNo', 'Warning')
-            if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { $e.Cancel = $true; return }
-        }
-        # 记住这次的窗口位置（仅正常状态，避免存到最小化时的 -32000）
-        if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Normal) {
-            if ($settings.winX -ne $form.Location.X -or $settings.winY -ne $form.Location.Y) {
-                $settings.winX = $form.Location.X; $settings.winY = $form.Location.Y; Save-Settings
-            }
-        }
-        Stop-AllScrcpy
-        if ($settings.disconnectOnClose) { try { Invoke-Hidden -FilePath $adb -ArgumentList @('disconnect') -DiscardStderr | Out-Null } catch {} }
-        # 关助手时顺手结束自带 adb.exe 的常驻 server 进程，避免它残留在后台、还得去任务管理器手动杀。
-        # 用本助手目录里的 adb 自己 kill-server（只停默认端口的 server，下次用到会自动重启）。
-        try { Invoke-Hidden -FilePath $adb -ArgumentList @('kill-server') -DiscardStderr | Out-Null } catch {}
+        param($sender,$eventArgs)
+        Request-AppClose $sender $eventArgs $updateStatus
     })
-    $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose(); $script:camWatch.Stop(); $script:camWatch.Dispose(); $script:hintRestore.Stop(); $script:hintRestore.Dispose(); Stop-ActivationWaiter; $tray.Visible = $false; $tray.Dispose(); $trayMenu.Dispose() })   # 让激活等待线程退出，否则它阻塞 WaitOne 会钉住进程不退出；托盘图标先隐藏再释放，避免退出后残留幽灵图标
+    $form.Add_FormClosed({ Stop-DeviceScans; Update-ProcessLifecycle; $timer.Stop(); $timer.Dispose(); $script:camWatch.Stop(); $script:camWatch.Dispose(); $script:hintRestore.Stop(); $script:hintRestore.Dispose(); Stop-ActivationWaiter; $tray.Visible = $false; $tray.Dispose(); $trayMenu.Dispose() })   # 让激活等待线程退出，否则它阻塞 WaitOne 会钉住进程不退出；托盘图标先隐藏再释放，避免退出后残留幽灵图标
 
     # 必须用非模态消息循环（Show + Application::Run），不能 ShowDialog()：「最小化到托盘」要在
     # 窗口隐藏（Hide）后进程继续存活；实测模态循环在窗口 Hide 的瞬间就直接返回，进程随即退出，

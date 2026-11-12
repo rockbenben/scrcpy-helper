@@ -41,7 +41,7 @@ assets/                      # README 引用的截图与图标
 - **数组返回一律 `@(...)` 包一层。** PowerShell 会把单元素数组拆成标量，`字符串 + 数组` 变成拼接——`Get-MirrorArgs` 上方有完整说明。
 - **含空格的参数不能靠 `Start-Process` 的数组传参。** 录屏路径 `C:\My Videos\x.mp4` 会被拆成多段，必须自己拼命令行串加引号。
 - **闭包里不要写 `$script:裸变量`。** 闭包有自己的模块作用域，`$script:` 写进去的是副本，真标志永远不变。跨闭包共享状态用「哈希表 + 捕获引用」（`$script:mainFlow` / `$script:reconnectState`）。
-- **别在 UI 线程上做长阻塞。** `Invoke-Hidden` 超时上限 15 秒；连接/重连这类慢操作走 runspace（`Connect-RememberedAsync` / `Reconnect-LastAsync`）。
+- **别在 UI 线程上做长阻塞。** 执行命令走 `Invoke-ShortCommand` / `Invoke-Hidden` 并设置超时；耗时探测、连接、扫描走后台 runspace 队列（`Start-UiTask` / `Wait-UiTask` / `Start-DeviceScan`），支持取消且绝不在 worker 线程操作 UI 控件。
 - **主流程一律走 `Invoke-MainFlow`。** 它负责防重入、忙态配色、状态药丸和提示收尾；自己起流程就会漏掉这些，用户连点两次就跑两遍。
 - **`Get-DeviceList` 只回 `state=device` 的设备。** 要区分 `offline` / `unauthorized` 用 `Get-AdbDeviceState`。
 
@@ -68,9 +68,7 @@ $err = $null; $tok = $null
 $err | ForEach-Object { $_.Message }
 ```
 
-- 语法过了**不等于**界面对了。改了控件坐标/文案/尺寸，双击 `投屏助手-双击运行.bat` 起真程序看。
-- 仓库里没有自动化测试，**CI 绿也不等于「测试通过」**——`ci.yml` 查的是语法、编码、行尾这类硬约束，不查行为。能做的验证是：语法自检 + 起真程序点一遍 + 必要时用 `design-preview/` 下的截图脚本留证（UIAutomation + PrintWindow，产物不入库）。
-- 改了界面却没重截 `assets/*.png`，README 就会展示旧界面——截图和代码要同轮更新。
+- 仓库里没有自动化测试，**CI 绿也不等于「测试通过」**——`ci.yml` 查的是语法、编码、行尾这类硬约束，不查行为。能做的验证是：语法自检 + 与改动相关的功能检查。
 
 ## 6. 工作树与提交
 
@@ -82,7 +80,7 @@ $err | ForEach-Object { $_.Message }
 ## 7. 做完的标准
 
 1. 语法自检无输出。
-2. 改过的界面自己起真程序看过（或用截图脚本留了证）。
+2. 完成与改动相关的功能检查。
 3. 脚本、`README.md`、`使用说明.txt` 三处文案口径一致。
 4. `git diff` 里没有顺手带上的无关改动。
 5. 报告时说清：哪些实际验证过、哪些没验证、有没有推送。
