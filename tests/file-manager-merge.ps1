@@ -1,24 +1,5 @@
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Windows.Forms
-$repo = Split-Path $PSScriptRoot
-$tokens = $null; $errors = $null
-$ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'scrcpy-helper.ps1'), [ref]$tokens, [ref]$errors)
-if ($errors.Count) { throw ($errors.Message -join "`n") }
-# Load definitions only, so regression checks cannot launch the app or contact a phone.
-$ast.FindAll({ param($node)
-    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-    $node.Name -match '^(Fm-|Assert-Fm|Merge-Fm|Move-Fm|Copy-Fm|Test-Fm|Get-Fm|Invoke-Fm)'
-}, $true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
-function Check($Condition, $Message) { if (-not $Condition) { throw $Message } }
-$root = Join-Path ([IO.Path]::GetTempPath()) ('fm-merge-test-' + [guid]::NewGuid().ToString('N'))
-[void][IO.Directory]::CreateDirectory($root)
-$formFunction = $ast.Find({ param($node)
-    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Show-FileManager'
-}, $true)
-$assignment = $formFunction.Find({ param($node)
-    $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$doDownload'
-}, $true)
-$body = $assignment.Right.Expression.ScriptBlock.GetScriptBlock().ToString()
+. (Join-Path $PSScriptRoot 'file-manager-test-support.ps1')
+$body = Get-FileManagerAction 'doDownload'
 $download = [scriptblock]::Create($body.Replace('New-Object System.Windows.Forms.FolderBrowserDialog', 'New-TestFolderDialog'))
 $dlg = @{ Visible=$true; IsDisposed=$false }
 $state = @{ Serial='fixture'; Path='/sdcard' }

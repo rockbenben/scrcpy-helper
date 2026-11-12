@@ -28,6 +28,17 @@ $err | ForEach-Object { $_.Message }
 
 没有输出就是没语法错。但语法过了不等于界面对了——改了控件坐标或文案，还得双击 `投屏助手-双击运行.bat` 起真程序看一遍。
 
+## 文件管理回归
+
+在 Windows 上分别运行以下命令，CI 也会在这两个 PowerShell 版本中执行同一入口。
+
+```powershell
+powershell -NoProfile -File tests/run-file-manager-regression.ps1
+pwsh -NoProfile -File tests/run-file-manager-regression.ps1
+```
+
+用例覆盖文件夹合并、逐项覆盖授权、链接保存目录，以及查重、传输、冲突复查和合并阶段的关窗取消。ADB 与文件选择框使用替身，文件操作使用临时目录，后台取消会启动并终止一个本地 PowerShell 子进程。回归不需要连接手机，实机验证仍按改动范围执行。
+
 ## 打包发行版
 
 仓库不含 scrcpy 二进制，发行包的做法就是：把 `scrcpy-helper.ps1`、`投屏助手-双击运行.bat`、`使用说明.txt` 复制进 [scrcpy](https://github.com/Genymobile/scrcpy/releases) 的解压目录，整个文件夹压成 zip。用户解压后双击 `.bat` 即可使用。

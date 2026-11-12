@@ -20,11 +20,12 @@ THIRD-PARTY-NOTICES.md       # 第三方组件声明（许可证义务，别乱�
 LICENSE                      # 本项目三个文件的 MIT
 assets/                      # README 引用的截图与图标
 .github/workflows/           # ci.yml（检查）+ release.yml（推 v* 标签即发版）
+tests/                      # 无框架的文件管理回归，统一入口 run-file-manager-regression.ps1
 ```
 
 - 仓库**不含** scrcpy 二进制：`.gitignore` 排掉了 `scrcpy.exe` / `adb.exe` / `*.dll` / `scrcpy-server` / scrcpy 官方包自带的 `LICENSE.txt` 等。
 - `docs/superpowers/`、`design-preview/`、`.qoder*`、`投屏助手-设置.json`、`投屏助手-错误日志.txt` 都是本地产物，**不入库**。
-- **有 CI，没有测试框架，也没有本地构建脚本。** `ci.yml` 查语法（5.1 与 7 各一遍）、UTF-8 BOM、行尾与那三个文件在不在；`release.yml` 在推 `v*` 标签时自动打发行包、建 Release、传资产。唯一的「构建」是复制三个文件压 zip——现在由 CI 做，规则见 `CONTRIBUTING.md`。
+- **有 CI，没有测试框架，也没有本地构建脚本。** `ci.yml` 查语法、UTF-8 BOM、行尾与那三个文件在不在，并在 PowerShell 5.1 与 7 中运行文件管理回归；`release.yml` 在推 `v*` 标签时自动打发行包、建 Release、传资产。唯一的「构建」是复制三个文件压 zip——现在由 CI 做，规则见 `CONTRIBUTING.md`。
 
 ## 2. 已确定的事（不要重新讨论）
 
@@ -68,7 +69,7 @@ $err = $null; $tok = $null
 $err | ForEach-Object { $_.Message }
 ```
 
-- `tests/file-manager-merge.ps1` 是无框架的文件管理合并回归脚本，可分别用 `powershell -NoProfile -File tests/file-manager-merge.ps1` 和 `pwsh -NoProfile -File tests/file-manager-merge.ps1` 运行。**CI 绿也不等于「测试通过」**——`ci.yml` 查的是语法、编码、行尾这类硬约束，不查行为。验证仍包括语法自检与改动相关的功能检查。
+- 文件管理回归的统一入口是 `tests/run-file-manager-regression.ps1`，可分别用 `powershell -NoProfile -File tests/run-file-manager-regression.ps1` 和 `pwsh -NoProfile -File tests/run-file-manager-regression.ps1` 运行。CI 在这两个版本中均执行合并、逐项覆盖授权、链接保存目录与关窗取消回归。用例使用模拟 ADB、隔离文件和真实本地子进程，不连接手机；CI 通过只代表这些检查通过，实机验证仍按改动范围执行。
 
 ## 6. 工作树与提交
 

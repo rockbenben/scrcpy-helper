@@ -1,9 +1,9 @@
 name: CI
 
-# 每次 push 到 main、提 PR，或被 release.yml 复用时：跑这台 Windows 机器上跑得动、又真能挡住事的三件事。
+# 每次 push 到 main、提 PR，或被 release.yml 复用时，检查脚本约束并运行文件管理回归。
 #
-# 本项目没有单元测试：界面是一个单文件 WinForms 脚本，没有可隔离的单元可测，
-# 硬凑一套「测试通过」比没有更糟。所以这里只查「错了不会报错、但会静默坑用户」的那几类：
+# 文件管理回归使用隔离文件和模拟 ADB，后台取消另验证真实本地子进程；不需要手机。
+# 基础检查负责这些会静默影响启动和发行包的问题：
 #   ① 语法错——启动器调的是 Windows PowerShell 5.1，解析不过就整个起不来；
 #   ② .ps1 的 UTF-8 BOM 掉了——5.1 按 ANSI 读它，满屏中文变乱码，而脚本不会抛任何异常；
 #   ③ 仓库里混进了 CRLF 内容（应为 LF）——有人用 autocrlf=false 提交时会发生，检出后行尾不一致，
@@ -87,3 +87,11 @@ jobs:
           }
           if ($problems.Count) { $problems | ForEach-Object { Write-Host "::error::$_" }; exit 1 }
           '编码、行尾与文件清单正常'
+
+      - name: File manager regressions with Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/run-file-manager-regression.ps1
+
+      - name: File manager regressions with PowerShell 7
+        shell: pwsh
+        run: ./tests/run-file-manager-regression.ps1
