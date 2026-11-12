@@ -1,8 +1,11 @@
 param(
     [ValidateRange(0, 20000)][int]$TaskCloseDelayMs = 0,
+    [ValidateRange(0, 40000)][int]$TaskStartupDelayMs = 0,
     [string]$EvidencePath = ''
 )
 . (Join-Path $PSScriptRoot 'file-manager-test-support.ps1')
+. (Join-Path $PSScriptRoot 'file-manager-process-support.ps1')
+if (-not $EvidencePath) { $EvidencePath = Join-Path $root 'child-evidence.jsonl' }
 # Use the actual task queue and a harmless local child process to exercise cancellation.
 foreach ($name in @('Start-UiTask', 'Start-NextDeviceScan', 'Receive-DeviceScan', 'Stop-DeviceScans', 'Cancel-OwnerTasks',
                     'Invoke-ShortCommand', 'Test-TcpAddress', 'Test-MdnsSerial', 'Test-Wireless', 'Get-ReachableAddrs', 'Invoke-DeviceScan')) {
@@ -16,15 +19,19 @@ $script:closeState = @{ InProgress=$false }
 $script:devInfo = @{}
 # The deadline starts at the close event, excluding interpreter startup on busy CI hosts.
 function Test-ProcessCancellation([string]$Mode) {
+    $identityPath = "$EvidencePath.$Mode.started.json"
+    $name = if ($Mode -eq 'task') { 'Invoke-ShortCommand' } else { 'Fm-Transfer' }
+    $variable = if ($Mode -eq 'task') { '$proc' } else { '$p' }
+    Invoke-Expression (Get-FixtureProcessDefinition $name $variable $identityPath $Mode)
     $owner = if ($Mode -eq 'task') { New-Object Windows.Forms.Form } else { $null }
     $window = @{ Visible=$true; IsDisposed=$false }
     $timer = New-Object Windows.Forms.Timer
-    $childIdFile = Join-Path $root ($Mode + '.pid')
+    $childIdFile = "$EvidencePath.$Mode.ready.json"
     $escapedPath = $childIdFile.Replace("'", "''")
-    # Publish readiness atomically so a timer cannot read a newly created, still empty PID file.
-    $command = "[IO.File]::WriteAllText('$escapedPath.tmp',[string]`$PID); [IO.File]::Move('$escapedPath.tmp','$escapedPath'); Start-Sleep -Seconds 30"
+    # Keep readiness independent of the launch observer so broken registration can still be contained.
+    $command = "`$identity = [pscustomobject]@{ Id=`$PID; StartTicks=[Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks }; [IO.File]::WriteAllText('$escapedPath.tmp', (`$identity | ConvertTo-Json -Compress)); [IO.File]::Move('$escapedPath.tmp','$escapedPath'); Start-Sleep -Seconds 30"
     $startup = [Diagnostics.Stopwatch]::StartNew()
-    $taskTiming = [hashtable]::Synchronized(@{ Watch=$null })
+    $taskTiming = [hashtable]::Synchronized(@{ Watch=$null; StartupWatch=$null })
     $commandTimeoutMs = 15000
     $closeDelayMs = if ($Mode -eq 'task') { $TaskCloseDelayMs } else { 0 }
     $startupLimitMs = [Math]::Max(12000, ($closeDelayMs + 5000))
@@ -37,23 +44,17 @@ function Test-ProcessCancellation([string]$Mode) {
         if (($ready -and $delayElapsed -ge $closeDelayMs) -or $startup.ElapsedMilliseconds -gt $startupLimitMs) {
             $timer.Stop()
             if ($ready) {
-                $childId = [int][IO.File]::ReadAllText($childIdFile)
-                $cancellation.Child = Get-Process -Id $childId -ErrorAction Stop
-                # Retain the process handle so cleanup cannot target a later process reusing its PID.
-                $null = $cancellation.Child.Handle
-                if ($EvidencePath) {
-                    $record = [pscustomobject]@{
-                        Phase='started'; Mode=$Mode; Id=$cancellation.Child.Id
-                        StartTicks=$cancellation.Child.StartTime.ToUniversalTime().Ticks
-                    }
-                    [IO.File]::AppendAllText($EvidencePath, (($record | ConvertTo-Json -Compress) + [Environment]::NewLine))
-                }
+                $identity = [IO.File]::ReadAllText($childIdFile) | ConvertFrom-Json
+                $cancellation.Child = Get-FixtureProcess $identity
+                Check ($null -ne $cancellation.Child) 'Ready fixture child already exited'
             }
             $cancellation.Closed = $true
             $cancellation.CloseWatch = [Diagnostics.Stopwatch]::StartNew()
             if ($taskTiming.Watch) {
                 $cancellation.TimeoutRemainingMs = $commandTimeoutMs - $taskTiming.Watch.ElapsedMilliseconds
             }
+            $record = [pscustomobject]@{ Phase='closed'; Mode=$Mode; TimeoutRemainingMs=$cancellation.TimeoutRemainingMs }
+            [IO.File]::AppendAllText($EvidencePath, (($record | ConvertTo-Json -Compress) + [Environment]::NewLine))
             if ($owner) { $owner.Dispose() }
             else { $window.Visible=$false; $window.IsDisposed=$true }
         }
@@ -61,7 +62,9 @@ function Test-ProcessCancellation([string]$Mode) {
     try {
         $timer.Start()
         if ($Mode -eq 'task') {
-            $result = Invoke-FmTask $owner -Inputs @{ File=(Get-Command powershell.exe).Source; Args=@('-NoProfile', '-Command', $command); Timing=$taskTiming; TimeoutMs=$commandTimeoutMs } -Work {
+            $result = Invoke-FmTask $owner -Inputs @{ File=(Get-Command powershell.exe).Source; Args=@('-NoProfile', '-Command', $command); Timing=$taskTiming; TimeoutMs=$commandTimeoutMs; StartupDelayMs=$TaskStartupDelayMs } -Work {
+                $Inputs.Timing.StartupWatch = [Diagnostics.Stopwatch]::StartNew()
+                if ($Inputs.StartupDelayMs) { Start-Sleep -Milliseconds $Inputs.StartupDelayMs }
                 # Starting just before the command gives the UI a conservative timeout budget.
                 $Inputs.Timing.Watch = [Diagnostics.Stopwatch]::StartNew()
                 $commandResult = Invoke-ShortCommand -FilePath $Inputs.File -ArgumentList $Inputs.Args -TimeoutMs $Inputs.TimeoutMs -Control $Control
@@ -92,6 +95,9 @@ function Test-ProcessCancellation([string]$Mode) {
             if ($owner) { $owner.Dispose(); Stop-DeviceScans }
         } finally {
             # Even an assertion or task teardown failure must not leave the fixture child alive.
+            if (-not $cancellation.Child -and (Test-Path -LiteralPath $identityPath)) {
+                $cancellation.Child = Get-FixtureProcess ([IO.File]::ReadAllText($identityPath) | ConvertFrom-Json)
+            }
             if ($cancellation.Child) {
                 try {
                     if (-not $cancellation.Child.HasExited) {
