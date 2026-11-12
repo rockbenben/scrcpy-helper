@@ -74,3 +74,5 @@
 [365 开源计划](https://github.com/rockbenben/365opensource) 的第 **#019** 个项目——一个人 + AI，一年 300+ 个开源项目。
 
 [提交你的需求 →](https://365.aishort.top/) · [Discord](https://discord.gg/PZTQfJ4GjX) · [Telegram](https://t.me/aishort_top)
+
+文件管理会拒绝批内重名（含大小写冲突）、文件与文件夹同名，以及下载目录中的链接；请调整名称或保存位置后重试。

@@ -217,3 +217,5 @@
 
 详细图文教程：
   https://newzone.top/posts/2019-08-26-scrcpy_screen_projection.html
+
+文件管理会拒绝批内重名（含大小写冲突）、文件与文件夹同名，以及下载目录中的链接；请调整名称或保存位置后重试。

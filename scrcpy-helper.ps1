@@ -3392,8 +3392,9 @@ function Fm-ShellLong {
     try { [void][System.Threading.Tasks.Task]::WaitAll(@($outTask, $errTask), 3000) } catch {}
     $out = if ($outTask.IsCompleted -and -not $outTask.IsFaulted) { $outTask.Result } else { '' }
     $err = if ($errTask.IsCompleted -and -not $errTask.IsFaulted) { $errTask.Result } else { '' }
+    $code = try { $p.ExitCode } catch { -1 }
     try { $p.Dispose() } catch {}
-    return @{ Aborted = $aborted; Output = (($out + "`n" + $err).Trim()) }
+    return @{ Code = $code; Aborted = $aborted; Output = (($out + "`n" + $err).Trim()) }
 }
 
 # 设备端脚本用单引号 here-string：里面的 $f / $p / $(...) 是给设备 sh 用的，绝不能让 PowerShell 先插值。
@@ -3414,6 +3415,7 @@ cd __PATH__ 2>/dev/null || { printf 'ERR\t%s\t-\t-\n' cannot-enter; exit 1; };
 printf 'V2\n';
 n=0; set --;
 for f in * .[!.]* ..?*; do
+  ctrl=$(printf '\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037\177'); case "$f" in *["$ctrl"]*) continue;; esac;
   p="./$f"; [ -e "$p" ] || [ -L "$p" ] || continue;
   if [ -L "$p" ]; then k=L; elif [ -d "$p" ]; then k=D; else k=F; fi;
   printf '%s\t%s\t-\t-\n' "$k" "$f";
@@ -3427,7 +3429,7 @@ printf 'FM_DONE\n'
 # 兼容回退：老 ROM 的 stat 若不支持多参数，或某个文件 stat 失败（toybox 会跳过该文件、少输出一行），
 # 属性行数就对不上，这时绝不硬配对（会把大小/时间张冠李戴），改用逐文件模板重读一次。
 $fmListTemplateLegacy = @'
-cd __PATH__ 2>/dev/null || { printf 'ERR\t%s\t-\t-\n' cannot-enter; exit 1; }; for f in * .[!.]* ..?*; do p="./$f"; [ -e "$p" ] || [ -L "$p" ] || continue; t=$(stat -c %Y "$p" 2>/dev/null); if [ -L "$p" ]; then printf 'L\t%s\t-\t%s\n' "$f" "$t"; elif [ -d "$p" ]; then printf 'D\t%s\t-\t%s\n' "$f" "$t"; else printf 'F\t%s\t%s\t%s\n' "$f" "$(stat -c %s "$p" 2>/dev/null)" "$t"; fi; done; printf 'FM_DONE\n'
+cd __PATH__ 2>/dev/null || { printf 'ERR\t%s\t-\t-\n' cannot-enter; exit 1; }; for f in * .[!.]* ..?*; do ctrl=$(printf '\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037\177'); case "$f" in *["$ctrl"]*) continue;; esac; p="./$f"; [ -e "$p" ] || [ -L "$p" ] || continue; t=$(stat -c %Y "$p" 2>/dev/null); if [ -L "$p" ]; then printf 'L\t%s\t-\t%s\n' "$f" "$t"; elif [ -d "$p" ]; then printf 'D\t%s\t-\t%s\n' "$f" "$t"; else printf 'F\t%s\t%s\t%s\n' "$f" "$(stat -c %s "$p" 2>/dev/null)" "$t"; fi; done; printf 'FM_DONE\n'
 '@
 # 解析一次 adb shell 的输出，同时兼容两代模板：
 #   V2     —— 条目行四列占位，属性在「S 字节数 秒数」行里按出现顺序批量给出；
@@ -3563,7 +3565,7 @@ function Fm-ConfirmOverwrite {
     $show = @($names | Select-Object -First 12)
     $list = (@($show | ForEach-Object { '· ' + $_ }) -join "`n")
     if ($names.Count -gt $show.Count) { $list += "`n· …以及另外 $($names.Count - $show.Count) 项" }
-    $msg = "$where 已经有 $($names.Count) 个同名项，$action会覆盖它们，覆盖后无法恢复：`n`n$list`n`n「是」= 覆盖并继续（其余项照常处理）`n「否」= 跳过这些同名项，只处理其余的`n「取消」= 什么都不做"
+    $msg = "$where 已经有 $($names.Count) 个同名项，${action}会覆盖它们，覆盖后无法恢复：`n`n$list`n`n「是」= 覆盖并继续（其余项照常处理）`n「否」= 跳过这些同名项，只处理其余的`n「取消」= 什么都不做"
     # 显式转成 IWin32Window + 强类型枚举：6 个参数的 Show 有两个重载，只靠字符串让 PowerShell
     # 自己挑，有可能误落到 (String, ..., MessageBoxOptions) 那个上，把窗体当字符串塞进去。
     $r = [System.Windows.Forms.MessageBox]::Show(
@@ -3587,39 +3589,76 @@ function Fm-ConfirmOverwrite {
 # 或者写出一个乱码文件名。下载一律先落到纯 ASCII 的临时名，再由 .NET 的 Unicode 文件 API
 # 改成真名；同盘 Move-Item 是瞬时 rename，不会复制大文件。
 # 目标已存在时保持 adb pull 原本的语义：同名文件覆盖，文件夹合并内容、绝不整目录删掉旧文件。
+# 写入前检查完整树，避免合并到一半才发现类型冲突或目录联接。
+function Assert-FmLocalPath {
+    param([string]$Path)
+    $current = [IO.Path]::GetFullPath($Path)
+    while ($current) {
+        if (Test-Path -LiteralPath $current) {
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "路径包含链接：$current" }
+        }
+        $current = [IO.Path]::GetDirectoryName($current)
+    }
+}
+function Assert-FmNames {
+    param([string[]]$Names)
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $Names) {
+        if (-not (Fm-ValidName $name) -or $name -match '[:*?"<>|]|[. ]$|^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') {
+            throw "无法保存这个名称：$name"
+        }
+        if (-not $seen.Add($name)) { throw "同一批文件存在重名（含大小写冲突）：$name" }
+    }
+}
+function Assert-FmTree {
+    param([string]$From, [string]$To, [bool]$Overwrite)
+    Assert-FmLocalPath $From
+    Assert-FmLocalPath $To
+    $a = Get-Item -LiteralPath $From -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $To) {
+        $b = Get-Item -LiteralPath $To -Force -ErrorAction Stop
+        if ($a.PSIsContainer -ne $b.PSIsContainer) { throw "文件与文件夹同名：$To" }
+        if (-not $Overwrite) { throw "目标已存在：$To" }
+    }
+    if ($a.PSIsContainer) {
+        $children = @(Get-ChildItem -LiteralPath $From -Force -ErrorAction Stop)
+        Assert-FmNames @($children | ForEach-Object { $_.Name })
+        foreach ($child in $children) { Assert-FmTree $child.FullName (Join-Path $To $child.Name) $Overwrite }
+    }
+}
 function Merge-FmDirectory {
-    param([string]$From, [string]$To)
-    foreach ($child in @(Get-ChildItem -LiteralPath $From -Force)) {
+    param([string]$From, [string]$To, [bool]$Overwrite = $false)
+    Assert-FmTree $From $To $Overwrite
+    if (-not (Test-Path -LiteralPath $To)) { [void][IO.Directory]::CreateDirectory($To) }
+    foreach ($child in @(Get-ChildItem -LiteralPath $From -Force -ErrorAction Stop)) {
         $target = Join-Path $To $child.Name
-        if ($child.PSIsContainer) {
-            if (-not (Test-Path -LiteralPath $target)) { [void](New-Item -ItemType Directory -Path $target -Force) }
-            Merge-FmDirectory $child.FullName $target
-        } else {
-            Copy-Item -LiteralPath $child.FullName -Destination $target -Force -ErrorAction Stop
+        if ($child.PSIsContainer) { Merge-FmDirectory $child.FullName $target $Overwrite }
+        else {
+            Assert-FmLocalPath $target
+            [IO.File]::Copy($child.FullName, $target, $Overwrite)
         }
     }
 }
 function Move-FmPulledItem {
-    param([string]$From, [string]$To)
-    if (-not (Test-Path -LiteralPath $From)) { return $false }
+    param([string]$From, [string]$To, [bool]$Overwrite = $false)
     try {
-        if (-not (Test-Path -LiteralPath $To)) {
-            Move-Item -LiteralPath $From -Destination $To -ErrorAction Stop
-            return $true
-        }
+        Assert-FmTree $From $To $Overwrite
         $a = Get-Item -LiteralPath $From -Force -ErrorAction Stop
-        $b = Get-Item -LiteralPath $To -Force -ErrorAction Stop
-        if ($a.PSIsContainer -and $b.PSIsContainer) {
-            Merge-FmDirectory $a.FullName $b.FullName
-            Remove-Item -LiteralPath $From -Recurse -Force -ErrorAction Stop
-            return $true
-        }
-        if (-not $a.PSIsContainer -and -not $b.PSIsContainer) {
-            Move-Item -LiteralPath $From -Destination $To -Force -ErrorAction Stop
-            return $true
-        }
-        return $false   # 文件 / 文件夹类型对不上，不猜用户意图
+        if ($a.PSIsContainer) { Merge-FmDirectory $From $To $Overwrite }
+        else { [IO.File]::Copy($From, $To, $Overwrite) }
+        return $true
     } catch { return $false }
+}
+function Assert-FmRemoteTree {
+    param($Owner, $Serial, [string]$Path)
+    $listing = Fm-ListDir $Owner $Serial $Path
+    if (-not $listing.Ok -or $listing.Hidden -gt 0) { throw "目录未能完整检查：$Path" }
+    Assert-FmNames @($listing.Items | ForEach-Object { $_.Name })
+    foreach ($entry in $listing.Items) {
+        if ($entry.IsLink) { throw "下载目录含链接：$($entry.Path)" }
+        if ($entry.IsDir) { Assert-FmRemoteTree $Owner $Serial $entry.Path }
+    }
 }
 
 function Fm-Transfer {
@@ -3970,15 +4009,21 @@ function Show-FileManager {
         # adb push 会把手机上的同名文件直接覆盖掉，且不问一声。先在设备端批量查一次同名项，
         # 让用户选「覆盖 / 跳过 / 取消」；不查就等同于把手机上的原件无声地弄丢。
         $names = @($list | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+        try { Assert-FmNames $names } catch {
+            [void](Show-ResultDialog $dlg '上传' '请先处理重名或不支持的名称' $_.Exception.Message '' @('ok'))
+            return
+        }
         $chk = Fm-ExistingIndexes $dlg $batchSerial $batchPath $names
         if (-not $chk.Ok) {
             [void](Show-ResultDialog $dlg '上传' '没能确认手机上有没有同名文件' '为避免悄悄覆盖已有文件，本次上传已取消。请确认手机仍连着，点「刷新」后再试。' '' @('ok'))
             return
         }
         $existing = @($chk.Indexes)
+        $approved = @()
         if ($existing.Count -gt 0) {
             $choice = Fm-ConfirmOverwrite $dlg '上传' @($existing | ForEach-Object { $names[$_] }) "手机上的 $batchPath"
             if ($choice -eq 'cancel') { return }
+            if ($choice -eq 'overwrite') { $approved = @($existing | ForEach-Object { $names[$_] }) }
             if ($choice -eq 'skip') {
                 $keep = @()
                 for ($k = 0; $k -lt $list.Count; $k++) { if ($existing -notcontains $k) { $keep += $list[$k] } }
@@ -3996,6 +4041,24 @@ function Show-FileManager {
                 $i++
                 $name = [System.IO.Path]::GetFileName($f)
                 $remote = Fm-ChildPath $batchPath $name
+                # 批量确认后目录仍可能变化；未获授权的新同名项必须再次确认。
+                $check = Fm-ExistingIndexes $dlg $batchSerial $batchPath @($name)
+                if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                if (-not $check.Ok) { $fail += "$name → 无法复查目标，已跳过"; continue }
+                if (@($check.Indexes).Count -gt 0 -and $approved -notcontains $name) {
+                    $answer = Fm-ConfirmOverwrite $dlg '上传' @($name) "手机上的 $batchPath"
+                    if ($answer -eq 'cancel') { $aborted = $true; break }
+                    if ($answer -eq 'skip') { continue }
+                }
+                $q = Fm-ShQuote $remote
+                $type = @(Fm-Shell $batchSerial "if [ -d $q ]; then echo FM_DIR; elif [ -e $q ] || [ -L $q ]; then echo FM_FILE; else echo FM_NEW; fi" $dlg)
+                if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                $isDirectory = (Get-Item -LiteralPath $f -Force).PSIsContainer
+                if ($type -notcontains 'FM_NEW' -and (($type -contains 'FM_DIR') -ne $isDirectory -or ($type -notcontains 'FM_DIR' -and $type -notcontains 'FM_FILE'))) {
+                    $fail += "$name → 目标类型不符或无法确认，已跳过"; continue
+                }
+                # adb 以父目录为目的地时，目录上传合并到同名目录，避免产生 name/name。
+                $remote = $batchPath.TrimEnd('/') + '/'
                 # push 的方向是「电脑→手机」，本地文件大小不变，没有可用的字节信号，按项数步进。
                 $progState.Index = $i; $progState.WatchPath = ''; $progState.TotalBytes = 0L
                 $r = Fm-Transfer (@('-s', $batchSerial, 'push', $f, $remote)) $dlg $lblInfo "正在上传 ($i/$($list.Count))：$name" $progState
@@ -4040,6 +4103,19 @@ function Show-FileManager {
         $dest = $fbd.SelectedPath
         $fbd.Dispose()
         if (-not (Test-Path -LiteralPath $dest)) { return }
+        try {
+            Assert-FmLocalPath $dest
+            Assert-FmNames @($sel | ForEach-Object { $_.Tag.Name })
+            foreach ($item in $sel) {
+                if ($item.Tag.IsLink) { throw '下载暂不支持链接，请选择原文件。' }
+                if ($item.Tag.IsDir) { Assert-FmRemoteTree $dlg $batchSerial $item.Tag.Path }
+            }
+        } catch {
+            if ($dlg.IsDisposed -or -not $dlg.Visible) { return }
+            [void](Show-ResultDialog $dlg '下载' '无法安全保存这批文件' $_.Exception.Message '' @('ok'))
+            return
+        }
+        $allowOverwrite = $false
         # adb pull 同样会覆盖电脑上已有的同名文件，且不问一声。纯本地检查，不需要 adb。
         $overlap = @()
         for ($k = 0; $k -lt $sel.Count; $k++) {
@@ -4048,6 +4124,7 @@ function Show-FileManager {
         if ($overlap.Count -gt 0) {
             $choice = Fm-ConfirmOverwrite $dlg '下载' @($overlap | ForEach-Object { [string]$sel[$_].Tag.Name }) "电脑上的 $dest"
             if ($choice -eq 'cancel') { return }
+            $allowOverwrite = ($choice -eq 'overwrite')
             if ($choice -eq 'skip') {
                 $keep = @()
                 for ($k = 0; $k -lt $sel.Count; $k++) { if ($overlap -notcontains $k) { $keep += $sel[$k] } }
@@ -4086,7 +4163,7 @@ function Show-FileManager {
                     # 只把纯 ASCII 路径交给 adb；成功后由 Move-FmPulledItem 改成真正的中文名。
                     $r = Fm-Transfer (@('-s', $batchSerial, 'pull', $e.Path, $stage)) $dlg $lblInfo "正在下载 ($i/$($sel.Count))：$($e.Name)" $progState
                     if (-not $r.Aborted) {
-                        if ($r.Ok -and (Move-FmPulledItem $stage $local)) { $okN++ }
+                        if ($r.Ok -and (Move-FmPulledItem $stage $local $allowOverwrite)) { $okN++ }
                         else {
                             $detail = if ($r.Detail) { ([string]$r.Detail).Replace($stage, $local) } else { '手机上的文件没保存到指定位置' }
                             $fail += "$($e.Name) → $detail"
@@ -4130,9 +4207,9 @@ function Show-FileManager {
         # 必须先判「本来就在」：否则同名时 mkdir 虽然失败，[ -d ] 却是真，会误报新建成功。
         $cmd = "if [ -e $q ]; then printf 'FM_EXISTS\n'; else mkdir $q 2>&1; if [ -d $q ]; then printf 'FM_OK\n'; else printf 'FM_FAIL\n'; fi; fi"
         $out = @(Fm-Shell $batchSerial $cmd $dlg) -join "`n"
-        if ($out -match 'FM_EXISTS') {
+        if ($out -match '(?m)^FM_EXISTS\r?$') {
             [System.Windows.Forms.MessageBox]::Show("当前目录里已经有叫「$name」的了，换一个名称再试。", '新建文件夹') | Out-Null
-        } elseif ($out -match 'FM_OK') {
+        } elseif ($out -match '(?m)^FM_OK\r?$') {
             & $refresh
             $lblInfo.ForeColor = $cGreen; $lblInfo.Text = "已新建文件夹：$name"
         } else {
@@ -4166,9 +4243,9 @@ function Show-FileManager {
         # mv 后双向确认「新名字在、旧名字不在」，只读目录 / 厂商限制导致失败时不会误报成功。
         $cmd = "cd $cd 2>/dev/null || { printf 'FM_FAIL\n'; exit 1; }; if [ -e $qn ] || [ -L $qn ]; then printf 'FM_EXISTS\n'; else mv $qo $qn 2>&1; if [ -e $qn ] || [ -L $qn ]; then if [ -e $qo ] || [ -L $qo ]; then printf 'FM_FAIL\n'; else printf 'FM_OK\n'; fi; else printf 'FM_FAIL\n'; fi; fi"
         $out = @(Fm-Shell $batchSerial $cmd $dlg) -join "`n"
-        if ($out -match 'FM_EXISTS') {
+        if ($out -match '(?m)^FM_EXISTS\r?$') {
             [System.Windows.Forms.MessageBox]::Show("当前目录里已经有叫「$new」的了，换一个名称再试。", '重命名') | Out-Null
-        } elseif ($out -match 'FM_OK') {
+        } elseif ($out -match '(?m)^FM_OK\r?$') {
             & $refresh
             $lblInfo.ForeColor = $cGreen; $lblInfo.Text = "已重命名：$old → $new"
         } else {
@@ -4237,13 +4314,13 @@ function Show-FileManager {
                 $r = Fm-ShellLong $batchSerial $cmd $dlg $lblInfo "正在删除 ($i/$($sel.Count))：$($e.Name)"
                 if ($r.Aborted) { $aborted = $true; break }
                 $out = [string]$r.Output
-                if ($out -match 'FM_OK') { $okN++ }
+                if ($r.Code -eq 0 -and $out -match '(?m)^FM_OK\r?$') { $okN++ }
                 else {
                     $fail += "$($e.Name) → $(if ($out) { $out } else { '设备没有返回结果' })"
                     # 普通文件报 FM_FAIL＝还在原地、没删掉，可以继续下一项；但文件夹不一样：
                     # rm -rf 可能已经删掉里面一部分才在某个子文件上失败，这时 FM_FAIL 不代表「没动过」。
                     # 连标记都没有（命令没跑完 / 输出被截断）同理。两种情况都立刻停，不碰剩下的项。
-                    if ($out -notmatch 'FM_FAIL' -or $e.IsDir) { $uncertain = $true; break }
+                    if ($out -notmatch '(?m)^FM_FAIL\r?$' -or $e.IsDir) { $uncertain = $true; break }
                 }
             }
         } finally { & $setDeviceLock $false }
