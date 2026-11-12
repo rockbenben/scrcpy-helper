@@ -39,6 +39,8 @@ pwsh -NoProfile -File tests/run-file-manager-regression.ps1
 
 用例覆盖文件夹合并、逐项覆盖授权、链接保存目录，以及查重、传输、冲突复查和合并阶段的关窗取消。ADB 与文件选择框使用替身，文件操作使用临时目录，后台取消会启动并终止一个本地 PowerShell 子进程。回归不需要连接手机，实机验证仍按改动范围执行。
 
+取消回归分别执行后台任务队列和真实 `Fm-Transfer`，以本地 PowerShell 子进程代替 ADB。子进程就绪后才触发关窗，从关窗事件起要求在 5 秒内返回，并确认该子进程已退出，避免把等待命令超时当成主动取消。失败时也会清理该用例持有句柄的子进程。
+
 ## 打包发行版
 
 仓库不含 scrcpy 二进制，发行包的做法就是：把 `scrcpy-helper.ps1`、`投屏助手-双击运行.bat`、`使用说明.txt` 复制进 [scrcpy](https://github.com/Genymobile/scrcpy/releases) 的解压目录，整个文件夹压成 zip。用户解压后双击 `.bat` 即可使用。
