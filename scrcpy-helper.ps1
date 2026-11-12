@@ -1,4 +1,4 @@
-# scrcpy 投屏助手（图形界面）
+﻿# scrcpy 投屏助手（图形界面）
 # 由「投屏助手-双击运行.bat」启动，无需手动运行本文件。
 # 启动器用 `conhost.exe --headless powershell ... -File 本文件`：Windows 11 默认终端是 Windows Terminal，
 # 它会无视 `powershell -WindowStyle Hidden`、始终留一个可见终端窗口；conhost --headless 则无窗口运行、
@@ -2650,6 +2650,11 @@ function Show-DeviceManager {
 #     没选中文件夹时 Enter 不吞键，免得抢走按钮的原生回车，或在选中文件时假装在导航。
 # 11) 列表重建用 ListViewItem[] + Items.AddRange 一次填充，不逐项 Items.Add；读目录前先把
 #     状态行刷成「正在读取…」，等待时也看得出在干活。
+# 12) 批量操作（上传 / 下载 / 删除）一开始就把设备和目录快照到 $batchSerial / $batchPath，
+#     整批只认这两个值；等待期间 DoEvents 会泵消息，设备下拉框的 SelectedIndexChanged 仍会来，
+#     忙时既不接受切换也把下拉框拨回去。否则第一项传去 A 手机、第二项就传去 B 手机了。
+# 13) 目录协议有 FM_DONE 结束标记（V2 和兼容回退模板都打）。adb 启动失败、设备掉线、输出
+#     被截断都会缺这个标记，一律判「读不到」，绝不把空输出显示成「这个文件夹是空的」。
 
 # 设备端 sh 的单引号字面量：内部的 ' 用 '\'' 表示（闭合 + 转义单引号 + 重开）。
 function Fm-ShQuote {
@@ -2789,6 +2794,11 @@ function Fm-Shell {
 # 并由调用方如实提示「可能已部分删除」，绝不给出「什么都没发生」的假结论。
 function Fm-ShellLong {
     param($serial, [string]$Command, $dlg, $status, [string]$tip)
+    # 窗口已关就一条命令都别发：短命令可能在 WaitForExit(120) 的第一轮就跑完，
+    # 根本进不到下面的关窗检查，外层批量循环会误以为这项正常结束、接着删下一项。
+    if ($dlg -and ($dlg.IsDisposed -or -not $dlg.Visible)) {
+        return @{ Aborted = $true; Output = '' }
+    }
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $adb
     $psi.Arguments = (@((Get-FmShellArgs $serial $Command) | ForEach-Object { Fm-WinArg $_ }) -join ' ')
@@ -2841,17 +2851,20 @@ for f in * .[!.]* ..?*; do
   set -- "$@" "$p"; n=$((n+1));
   if [ "$n" -ge 128 ]; then s=$(stat -c 'S %s %Y' "$@" 2>/dev/null); printf '%s\n' "$s"; n=0; set --; fi;
 done;
-if [ "$n" -gt 0 ]; then s=$(stat -c 'S %s %Y' "$@" 2>/dev/null); printf '%s\n' "$s"; fi
+if [ "$n" -gt 0 ]; then s=$(stat -c 'S %s %Y' "$@" 2>/dev/null); printf '%s\n' "$s"; fi;
+printf 'FM_DONE\n'
 '@) -replace "`r?`n", ' '
 
 # 兼容回退：老 ROM 的 stat 若不支持多参数，或某个文件 stat 失败（toybox 会跳过该文件、少输出一行），
 # 属性行数就对不上，这时绝不硬配对（会把大小/时间张冠李戴），改用逐文件模板重读一次。
 $fmListTemplateLegacy = @'
-cd __PATH__ 2>/dev/null || { printf 'ERR\t%s\t-\t-\n' cannot-enter; exit 1; }; for f in * .[!.]* ..?*; do p="./$f"; [ -e "$p" ] || [ -L "$p" ] || continue; t=$(stat -c %Y "$p" 2>/dev/null); if [ -L "$p" ]; then printf 'L\t%s\t-\t%s\n' "$f" "$t"; elif [ -d "$p" ]; then printf 'D\t%s\t-\t%s\n' "$f" "$t"; else printf 'F\t%s\t%s\t%s\n' "$f" "$(stat -c %s "$p" 2>/dev/null)" "$t"; fi; done
+cd __PATH__ 2>/dev/null || { printf 'ERR\t%s\t-\t-\n' cannot-enter; exit 1; }; for f in * .[!.]* ..?*; do p="./$f"; [ -e "$p" ] || [ -L "$p" ] || continue; t=$(stat -c %Y "$p" 2>/dev/null); if [ -L "$p" ]; then printf 'L\t%s\t-\t%s\n' "$f" "$t"; elif [ -d "$p" ]; then printf 'D\t%s\t-\t%s\n' "$f" "$t"; else printf 'F\t%s\t%s\t%s\n' "$f" "$(stat -c %s "$p" 2>/dev/null)" "$t"; fi; done; printf 'FM_DONE\n'
 '@
 # 解析一次 adb shell 的输出，同时兼容两代模板：
 #   V2     —— 条目行四列占位，属性在「S 字节数 秒数」行里按出现顺序批量给出；
 #   Legacy —— 属性直接写在条目行的第 3/4 列（无 V2 标记、无 S 行）。
+# 两代模板都以 FM_DONE 收尾；没有它说明设备端没跑完（掉线 / 截断 / adb 没起来），
+# 这时目录内容不完整，必须报「读不到」，不能当成空文件夹。
 function Fm-ParseListLines {
     param($Lines, [string]$path)
     # 设备掉线 / offline 时 adb 只吐一句英文、没有任何结构化行，若不挡住会被当成「空文件夹」，
@@ -2867,11 +2880,13 @@ function Fm-ParseListLines {
     $slots = New-Object System.Collections.ArrayList
     $hidden = 0
     $isV2 = $false
+    $done = $false
     foreach ($raw in @($Lines)) {
         if ($null -eq $raw) { continue }
         # Windows 版 adb 可能把设备端的 LF 换成 CRLF，行尾的 \r 先整体去掉。
         $ln = ([string]$raw).TrimEnd([char[]]@([char]13))
         if (-not $ln) { continue }
+        if (([string]$ln).Trim() -eq 'FM_DONE') { $done = $true; continue }
         if ($ln -eq 'V2') { $isV2 = $true; continue }
         # 批量属性行：空格分隔，内容只有数字，不会被文件名里的特殊字符撕裂。
         if ($ln.StartsWith('S ')) {
@@ -2911,6 +2926,11 @@ function Fm-ParseListLines {
             Size = $sz; Time = $ts; Path = (Fm-ChildPath $path $nm)
         })
         $slots[$slots.Count - 1] = $idx
+    }
+    # 空输出、adb 启动失败、设备掉线、命令被掐断，都会缺 FM_DONE。这些情况下「目录里没东西」
+    # 是最危险的假结论（用户可能据此以为文件没了），一律判失败，也不再走兼容回退。
+    if (-not $done) {
+        return @{ Ok = $false; Items = @(); Hidden = 0; NeedLegacy = $false }
     }
     # toybox stat 遇到某个文件失败会直接跳过、少输出一行，或老 ROM 根本不支持多参数。
     # 数量对不上时绝不按顺序硬配对（会把 A 的大小安到 B 上），交回逐文件模板重读一次。
@@ -2996,6 +3016,11 @@ function Fm-ConfirmOverwrite {
 # 就按已完成的项数走步进条，单项时切成跑马灯——界面一直在动，但绝不编一个假的百分比出来。
 function Fm-Transfer {
     param([string[]]$Argv, $dlg, $status, [string]$tip, $prog)
+    # 先挡一道：窗口关了就别再起 adb。传输本身可能 120ms 内就结束、一次都不进下面的等待循环，
+    # 只靠循环里的关窗判断会漏掉，外层批量循环就接着发下一项了。
+    if ($dlg -and ($dlg.IsDisposed -or -not $dlg.Visible)) {
+        return @{ Ok = $false; Code = -1; Aborted = $true; Detail = '窗口已关闭' }
+    }
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $adb
     $psi.Arguments = (@($Argv | ForEach-Object { Fm-WinArg $_ }) -join ' ')
@@ -3004,13 +3029,14 @@ function Fm-Transfer {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     try { $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8 } catch {}
-    try { $p = [System.Diagnostics.Process]::Start($psi) } catch { return @{ Ok = $false; Code = -1; Detail = $_.Exception.Message } }
+    try { $p = [System.Diagnostics.Process]::Start($psi) } catch { return @{ Ok = $false; Code = -1; Aborted = $false; Detail = $_.Exception.Message } }
     $outTask = $p.StandardOutput.ReadToEndAsync()
     $errTask = $p.StandardError.ReadToEndAsync()
     try { $status.Text = $tip; $status.Refresh() } catch {}
+    $aborted = $false
     while (-not $p.WaitForExit(120)) {
         [System.Windows.Forms.Application]::DoEvents()
-        if ($dlg.IsDisposed -or -not $dlg.Visible) { try { $p.Kill() } catch {}; break }
+        if ($dlg -and ($dlg.IsDisposed -or -not $dlg.Visible)) { try { $p.Kill() } catch {}; $aborted = $true; break }
         if ($prog) {
             # 每 120ms 一跳：读一次本地文件大小即可，不额外起 adb 进程、不干扰正在进行的传输。
             $frac = 0.0
@@ -3046,7 +3072,9 @@ function Fm-Transfer {
     $err = if ($errTask.IsCompleted -and -not $errTask.IsFaulted) { $errTask.Result } else { '' }
     $code = try { $p.ExitCode } catch { -1 }
     try { $p.Dispose() } catch {}
-    return @{ Ok = ($code -eq 0); Code = $code; Detail = (($out + "`n" + $err).Trim()) }
+    # 进程很快就退出的那一项也要带上关窗结论：调用方靠 Aborted 决定是否停止整批。
+    if (-not $aborted -and $dlg -and ($dlg.IsDisposed -or -not $dlg.Visible)) { $aborted = $true }
+    return @{ Ok = ($code -eq 0 -and -not $aborted); Code = $code; Aborted = $aborted; Detail = (($out + "`n" + $err).Trim()) }
 }
 
 function Show-FileManager {
@@ -3204,6 +3232,17 @@ function Show-FileManager {
         try { $barFm.Visible = $false; $lblPct.Visible = $false; $lblPct.Text = '' } catch {}
     }
 
+    # 批量操作期间锁死设备下拉框：Fm-Transfer / Fm-ShellLong 等待时靠 DoEvents 泵消息，
+    # 那段时间窗口仍「活着」，用户能切设备。锁控件 + 事件守卫 + 快照三道一起做，
+    # 才不会把同一批文件分头发到两台手机上。
+    $setDeviceLock = {
+        param([bool]$on)
+        try {
+            if ($dlg.IsDisposed) { return }
+            $cmbDev.Enabled = (-not $on)
+        } catch {}
+    }
+
     # —— 状态 / 按钮可用性 ——
     $updateButtons = {
         # 框选松手时会批量改 Selected，会逐项触发 SelectedIndexChanged；那期间跳过重算，结束后手动调一次。
@@ -3218,6 +3257,9 @@ function Show-FileManager {
     $refresh = {
         # 长传输中点「关闭」会先杀掉 adb，回到这里时窗体可能已 Dispose；别再碰控件。
         if ($dlg.IsDisposed) { return }
+        # 读一次就固定住：整次读取（包括失败重试）都用同一台设备、同一个目录。
+        $snapSerial = [string]$state.Serial
+        $snapPath = [string]$state.Path
         # 列目录要起 adb、设备端还要遍历文件；先把状态行刷出来，别让窗口看着像卡死。
         $lblInfo.ForeColor = $cMuted
         $lblInfo.Text = '正在读取…'
@@ -3225,14 +3267,14 @@ function Show-FileManager {
         $lv.BeginUpdate()
         try {
             $lv.Items.Clear()
-            $r = Fm-ListDir $state.Serial $state.Path
+            $r = Fm-ListDir $snapSerial $snapPath
             # 逐项 Items.Add 在几百上千项时也是一笔开销；攒成数组一次 AddRange。
             $newItems = New-Object System.Collections.ArrayList
             if (-not $r.Ok) {
                 $it = New-Object System.Windows.Forms.ListViewItem('（打不开这个目录）')
                 $it.ForeColor = $cRed; [void]$newItems.Add($it)
                 $lblInfo.ForeColor = $cRed
-                $lblInfo.Text = '读不到这个目录：可能已不存在，或当前系统不允许 ADB 访问。点「上一级」返回。'
+                $lblInfo.Text = '读不到这个目录：手机可能已掉线、目录已不存在，或当前系统不允许 ADB 访问。请确认连接后点「刷新」，或点「上一级」返回。'
             } else {
                 $dirs  = @($r.Items | Where-Object { $_.IsDir } | Sort-Object { $_.Name })
                 $files = @($r.Items | Where-Object { -not $_.IsDir } | Sort-Object { $_.Name })
@@ -3262,7 +3304,7 @@ function Show-FileManager {
                 [void]$lv.Items.AddRange($newItems.ToArray([System.Windows.Forms.ListViewItem]))
             }
         } finally { $lv.EndUpdate() }
-        $txtPath.Text = $state.Path
+        $txtPath.Text = $snapPath
         & $updateButtons
     }
 
@@ -3292,6 +3334,10 @@ function Show-FileManager {
     # —— 上传：按钮选文件，或直接把文件拖进列表 ——
     $doUpload = {
         param($paths)
+        # 整批从这一刻起就钉死目标：同名检查、确认框、每一项 push 都用这两个快照值，
+        # 不重新读 $state。等待期间 DoEvents 会让设备下拉框事件插进来，重读就会换手机 / 换目录。
+        $batchSerial = [string]$state.Serial
+        $batchPath = [string]$state.Path
         # 去掉结尾的 \ / 再取名字：盘符根 C:\ 的 GetFileName 是空串，直接 push 会把整个盘推上去。
         $list = @($paths | Where-Object { $_ } | ForEach-Object {
             $t = ([string]$_).TrimEnd([char[]]@([char]92, [char]47))
@@ -3306,14 +3352,14 @@ function Show-FileManager {
         # adb push 会把手机上的同名文件直接覆盖掉，且不问一声。先在设备端批量查一次同名项，
         # 让用户选「覆盖 / 跳过 / 取消」；不查就等同于把手机上的原件无声地弄丢。
         $names = @($list | ForEach-Object { [System.IO.Path]::GetFileName($_) })
-        $chk = Fm-ExistingIndexes $state.Serial $state.Path $names
+        $chk = Fm-ExistingIndexes $batchSerial $batchPath $names
         if (-not $chk.Ok) {
             [void](Show-ResultDialog $dlg '上传' '没能确认手机上有没有同名文件' '为避免悄悄覆盖已有文件，本次上传已取消。请确认手机仍连着，点「刷新」后再试。' '' @('ok'))
             return
         }
         $existing = @($chk.Indexes)
         if ($existing.Count -gt 0) {
-            $choice = Fm-ConfirmOverwrite $dlg '上传' @($existing | ForEach-Object { $names[$_] }) "手机上的 $($state.Path)"
+            $choice = Fm-ConfirmOverwrite $dlg '上传' @($existing | ForEach-Object { $names[$_] }) "手机上的 $batchPath"
             if ($choice -eq 'cancel') { return }
             if ($choice -eq 'skip') {
                 $keep = @()
@@ -3324,25 +3370,33 @@ function Show-FileManager {
         }
         & $beginProgress $list.Count
         try {
-            $okN = 0; $fail = @(); $i = 0
+            & $setDeviceLock $true
+            $okN = 0; $fail = @(); $i = 0; $aborted = $false
             foreach ($f in $list) {
+                # 每项开始前先看窗口：关窗后一项都不再启动，短传输来不及进等待循环也照样拦住。
+                if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
                 $i++
                 $name = [System.IO.Path]::GetFileName($f)
-                $remote = Fm-ChildPath $state.Path $name
+                $remote = Fm-ChildPath $batchPath $name
                 # push 的方向是「电脑→手机」，本地文件大小不变，没有可用的字节信号，按项数步进。
                 $progState.Index = $i; $progState.WatchPath = ''; $progState.TotalBytes = 0L
-                $r = Fm-Transfer (@('-s', $state.Serial, 'push', $f, $remote)) $dlg $lblInfo "正在上传 ($i/$($list.Count))：$name" $progState
+                $r = Fm-Transfer (@('-s', $batchSerial, 'push', $f, $remote)) $dlg $lblInfo "正在上传 ($i/$($list.Count))：$name" $progState
+                if ($r.Aborted) { $aborted = $true; break }
                 if ($r.Ok) { $okN++ } else { $fail += "$name → $($r.Detail)" }
             }
-            if ($dlg.IsDisposed -or -not $dlg.Visible) { return }
+            # 关窗 / 中止后整批到此为止：不刷新、不弹结果框，窗体可能已经没了。
+            if ($aborted -or $dlg.IsDisposed -or -not $dlg.Visible) { return }
             & $refresh
             if ($fail.Count -gt 0) {
                 [void](Show-ResultDialog $dlg '上传' "有 $($fail.Count) 项没传成功" '可能是手机存储空间不足，或当前目录不允许写入。换到「内部存储 > Download」再试。' ($fail -join "`r`n") @('ok'))
             } else {
                 $lblInfo.ForeColor = $cGreen
-                $lblInfo.Text = "已上传 $okN 项到 $($state.Path)"
+                $lblInfo.Text = "已上传 $okN 项到 $batchPath"
             }
-        } finally { & $endProgress ($fail.Count -eq 0) }
+        } finally {
+            & $endProgress (-not $aborted -and $fail.Count -eq 0)
+            & $setDeviceLock $false
+        }
     }
     $pickAndUpload = {
         $ofd = New-Object System.Windows.Forms.OpenFileDialog
@@ -3356,6 +3410,9 @@ function Show-FileManager {
     # —— 下载：多选后挑一个电脑目录，逐项 pull；用「本地是否出现同名项」再验一次，
     #    因为部分老 adb 传输出错时退出码仍是 0。——
     $doDownload = {
+        # 整批固定目标设备；每条来源路径取自列表项的 Tag.Path 快照，保存位置取自下面选中的 $dest，
+        # 两者都不再读 $state，所以中途切设备 / 跳目录都不会把后续项拉到别的手机上。
+        $batchSerial = [string]$state.Serial
         $sel = @($lv.SelectedItems | Where-Object { $_.Tag })
         if ($sel.Count -eq 0) { return }
         $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -3382,8 +3439,11 @@ function Show-FileManager {
         }
         & $beginProgress $sel.Count
         try {
-            $okN = 0; $fail = @(); $i = 0
+            & $setDeviceLock $true
+            $okN = 0; $fail = @(); $i = 0; $aborted = $false
             foreach ($it in $sel) {
+                # 每项开始前先看窗口：关窗后不再启动新的 pull，短传输也不会漏网。
+                if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
                 $i++; $e = $it.Tag
                 $local = Join-Path $dest $e.Name
                 # pull 时目标文件在电脑上边写边长，用「当前大小 ÷ 手机上列出的大小」得到真实百分比；
@@ -3393,17 +3453,22 @@ function Show-FileManager {
                 $progState.Index = $i
                 $progState.WatchPath = $(if ($sz -gt 0) { $local } else { '' })
                 $progState.TotalBytes = $sz
-                $r = Fm-Transfer (@('-s', $state.Serial, 'pull', $e.Path, $dest)) $dlg $lblInfo "正在下载 ($i/$($sel.Count))：$($e.Name)" $progState
+                $r = Fm-Transfer (@('-s', $batchSerial, 'pull', $e.Path, $dest)) $dlg $lblInfo "正在下载 ($i/$($sel.Count))：$($e.Name)" $progState
+                if ($r.Aborted) { $aborted = $true; break }
                 if ($r.Ok -and (Test-Path -LiteralPath $local)) { $okN++ }
                 else { $fail += "$($e.Name) → $(if ($r.Detail) { $r.Detail } else { '手机上的文件没保存到指定位置' })" }
             }
-            if ($dlg.IsDisposed -or -not $dlg.Visible) { return }
+            # 关窗 / 中止后整批到此为止，不碰可能已经释放的控件。
+            if ($aborted -or $dlg.IsDisposed -or -not $dlg.Visible) { return }
             if ($fail.Count -gt 0) {
                 [void](Show-ResultDialog $dlg '下载' "有 $($fail.Count) 项没下载成功" '确认电脑磁盘空间充足、保存位置可写；手机上的文件若刚被移走，点「刷新」后再试。' ($fail -join "`r`n") @('ok'))
             }
             $lblInfo.ForeColor = $(if ($fail.Count -gt 0) { $cRed } else { $cGreen })
             $lblInfo.Text = "已下载 $okN 项到 $dest"
-        } finally { & $endProgress ($fail.Count -eq 0) }
+        } finally {
+            & $endProgress (-not $aborted -and $fail.Count -eq 0)
+            & $setDeviceLock $false
+        }
     }
 
     # —— 新建文件夹 ——
@@ -3416,11 +3481,14 @@ function Show-FileManager {
             [System.Windows.Forms.MessageBox]::Show('名称里不能包含 \ / : * ? " < > | 等符号、空格以外的控制字符，也不能叫「.」或「..」。', '新建文件夹') | Out-Null
             return
         }
-        $target = Fm-ChildPath $state.Path $name
+        # 与批量操作同理：输入 / 等待 adb 期间不让设备切换把 mkdir 挪到另一台手机上。
+        $batchSerial = [string]$state.Serial
+        $batchPath = [string]$state.Path
+        $target = Fm-ChildPath $batchPath $name
         $q = Fm-ShQuote $target
         # 必须先判「本来就在」：否则同名时 mkdir 虽然失败，[ -d ] 却是真，会误报新建成功。
         $cmd = "if [ -e $q ]; then printf 'FM_EXISTS\n'; else mkdir $q 2>&1; if [ -d $q ]; then printf 'FM_OK\n'; else printf 'FM_FAIL\n'; fi; fi"
-        $out = @(Fm-Shell $state.Serial $cmd) -join "`n"
+        $out = @(Fm-Shell $batchSerial $cmd) -join "`n"
         if ($out -match 'FM_EXISTS') {
             [System.Windows.Forms.MessageBox]::Show("当前目录里已经有叫「$name」的了，换一个名称再试。", '新建文件夹') | Out-Null
         } elseif ($out -match 'FM_OK') {
@@ -3435,6 +3503,10 @@ function Show-FileManager {
     $doDelete = {
         $sel = @($lv.SelectedItems | Where-Object { $_.Tag })
         if ($sel.Count -eq 0) { return }
+        # 整批固定设备和目录：确认框里写的、cd 进去的、以及每一项 rm 用的，全都是这两个快照。
+        # 删到一半换成另一台手机、或跳到别的目录，是这里最不能出的事故。
+        $batchSerial = [string]$state.Serial
+        $batchPath = [string]$state.Path
         # 删除目标只取「当前目录 + 列表里的名字」，绝不用 Tag.Path：
         # 就算列目录协议被奇怪文件名撕开过，也删不到当前目录之外去。
         # 设备端先 cd 到当前目录、再用 ./名字 操作，范围被钉死在这一层。
@@ -3451,7 +3523,7 @@ function Show-FileManager {
         }) -join "`n"
         if ($sel.Count -gt $showN) { $preview += "`n· …以及另外 $($sel.Count - $showN) 项" }
         $dirN = @($sel | Where-Object { $_.Tag.IsDir }).Count
-        $msg = "确定要删除手机上的这 $($sel.Count) 项吗？（其中 $dirN 个文件夹）`n`n$preview`n`n位置：$($state.Path)`n`n删除文件夹会连同里面所有内容一起删；手机上的删除不进回收站，无法恢复。"
+        $msg = "确定要删除手机上的这 $($sel.Count) 项吗？（其中 $dirN 个文件夹）`n`n$preview`n`n位置：$batchPath`n`n删除文件夹会连同里面所有内容一起删；手机上的删除不进回收站，无法恢复。"
         $ask = [System.Windows.Forms.MessageBox]::Show(
             [System.Windows.Forms.IWin32Window]$dlg, [string]$msg, '确认删除',
             [System.Windows.Forms.MessageBoxButtons]::YesNo,
@@ -3459,7 +3531,7 @@ function Show-FileManager {
             [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
         if ($ask -ne [System.Windows.Forms.DialogResult]::Yes) { return }
         # 不在用户自有存储里的位置再拦一道：普通机器 ADB 本来就没权限，但 root / 工程机真能删掉系统文件。
-        $here = [string]$state.Path
+        $here = $batchPath
         $inStorage = ($here -eq '/sdcard' -or $here.StartsWith('/sdcard/') -or
                       $here -eq '/storage' -or $here.StartsWith('/storage/') -or
                       $here -eq '/mnt/sdcard' -or $here.StartsWith('/mnt/sdcard/'))
@@ -3473,26 +3545,31 @@ function Show-FileManager {
             if ($ask2 -ne [System.Windows.Forms.DialogResult]::Yes) { return }
         }
         $okN = 0; $fail = @(); $i = 0; $uncertain = $false; $aborted = $false
-        foreach ($it in $sel) {
-            $i++; $e = $it.Tag
-            $q = './' + (Fm-ShQuote $e.Name)
-            $flag = if ($e.IsDir) { '-rf' } else { '-f' }
-            $cd = Fm-ShQuote $state.Path
-            # cd 失败就直接 FM_FAIL 退出：宁可什么都没删，也不能在错误的工作目录里执行 rm。
-            # -L 一并检查，否则「断链」会让 -e 恒为假、把删除失败误报成成功。
-            $cmd = "cd $cd 2>/dev/null || { printf 'FM_FAIL\n'; exit 1; }; rm $flag $q 2>&1; if [ -e $q ] || [ -L $q ]; then printf 'FM_FAIL\n'; else printf 'FM_OK\n'; fi"
-            $r = Fm-ShellLong $state.Serial $cmd $dlg $lblInfo "正在删除 ($i/$($sel.Count))：$($e.Name)"
-            if ($r.Aborted) { $aborted = $true; break }
-            $out = [string]$r.Output
-            if ($out -match 'FM_OK') { $okN++ }
-            else {
-                $fail += "$($e.Name) → $(if ($out) { $out } else { '设备没有返回结果' })"
-                # 普通文件报 FM_FAIL＝还在原地、没删掉，可以继续下一项；但文件夹不一样：
-                # rm -rf 可能已经删掉里面一部分才在某个子文件上失败，这时 FM_FAIL 不代表「没动过」。
-                # 连标记都没有（命令没跑完 / 输出被截断）同理。两种情况都立刻停，不碰剩下的项。
-                if ($out -notmatch 'FM_FAIL' -or $e.IsDir) { $uncertain = $true; break }
+        & $setDeviceLock $true
+        try {
+            foreach ($it in $sel) {
+                # 关窗后绝不启动下一条 rm：删除是不可恢复操作，比传输更需要这条前置检查。
+                if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                $i++; $e = $it.Tag
+                $q = './' + (Fm-ShQuote $e.Name)
+                $flag = if ($e.IsDir) { '-rf' } else { '-f' }
+                $cd = Fm-ShQuote $batchPath
+                # cd 失败就直接 FM_FAIL 退出：宁可什么都没删，也不能在错误的工作目录里执行 rm。
+                # -L 一并检查，否则「断链」会让 -e 恒为假、把删除失败误报成成功。
+                $cmd = "cd $cd 2>/dev/null || { printf 'FM_FAIL\n'; exit 1; }; rm $flag $q 2>&1; if [ -e $q ] || [ -L $q ]; then printf 'FM_FAIL\n'; else printf 'FM_OK\n'; fi"
+                $r = Fm-ShellLong $batchSerial $cmd $dlg $lblInfo "正在删除 ($i/$($sel.Count))：$($e.Name)"
+                if ($r.Aborted) { $aborted = $true; break }
+                $out = [string]$r.Output
+                if ($out -match 'FM_OK') { $okN++ }
+                else {
+                    $fail += "$($e.Name) → $(if ($out) { $out } else { '设备没有返回结果' })"
+                    # 普通文件报 FM_FAIL＝还在原地、没删掉，可以继续下一项；但文件夹不一样：
+                    # rm -rf 可能已经删掉里面一部分才在某个子文件上失败，这时 FM_FAIL 不代表「没动过」。
+                    # 连标记都没有（命令没跑完 / 输出被截断）同理。两种情况都立刻停，不碰剩下的项。
+                    if ($out -notmatch 'FM_FAIL' -or $e.IsDir) { $uncertain = $true; break }
+                }
             }
-        }
+        } finally { & $setDeviceLock $false }
         if ($dlg.IsDisposed -or -not $dlg.Visible) {
             # 关窗中止时已经没有可挂靠的窗体了，用一个不挂 Owner 的提示把风险说清楚，
             # 否则用户下次打开看到的只是「少了一些文件」，不知道是删了一半。
@@ -3678,7 +3755,25 @@ function Show-FileManager {
     $lnkRoot.Add_Click({ Invoke-MainFlow ({ & $enter '/' }) $dlg $script:fmFlow })
     $cmbDev.Add_SelectedIndexChanged({
         if ($state.Rebuilding -or $cmbDev.SelectedIndex -lt 0) { return }
-        $state.Serial = $state.Serials[$cmbDev.SelectedIndex]
+        $pick = [string]$state.Serials[$cmbDev.SelectedIndex]
+        # Fm-Transfer / Fm-ShellLong 等待时会 DoEvents，这个事件照样会插进来。忙时绝不能改
+        # $state.Serial / $script:fmShellMode：正在跑的批量循环一旦重读，下一项就发到另一台手机上。
+        # 同时把下拉框拨回当前设备，别让用户以为切换已经生效。
+        if ($script:fmFlow.Busy) {
+            if ($pick -ne $state.Serial) {
+                $j = [array]::IndexOf($state.Serials, $state.Serial)
+                if ($j -ge 0 -and $j -ne $cmbDev.SelectedIndex) {
+                    $state.Rebuilding = $true
+                    try { $cmbDev.SelectedIndex = $j } finally { $state.Rebuilding = $false }
+                }
+                try {
+                    $lblInfo.ForeColor = $cMuted
+                    $lblInfo.Text = '正在处理，等这一批完成再切换设备'
+                } catch {}
+            }
+            return
+        }
+        $state.Serial = $pick
         $script:fmShellMode = $null
         Invoke-MainFlow ({ & $refresh }) $dlg $script:fmFlow
     })
