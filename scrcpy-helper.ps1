@@ -3884,6 +3884,8 @@ function Show-FileManager {
         try {
             $lv.Items.Clear()
             $r = Fm-ListDir $dlg $snapSerial $snapPath
+            # 后台读取期间会泵消息；关窗取消后控件可能已释放，不能再填列表或更新状态。
+            if ($dlg.IsDisposed -or -not $dlg.Visible) { return }
             # 逐项 Items.Add 在几百上千项时也是一笔开销；攒成数组一次 AddRange。
             $newItems = New-Object System.Collections.ArrayList
             if (-not $r.Ok) {
@@ -3919,7 +3921,7 @@ function Show-FileManager {
             if ($newItems.Count -gt 0) {
                 [void]$lv.Items.AddRange($newItems.ToArray([System.Windows.Forms.ListViewItem]))
             }
-        } finally { $lv.EndUpdate() }
+        } finally { if (-not $lv.IsDisposed) { $lv.EndUpdate() } }
         $txtPath.Text = $snapPath
         & $updateButtons
     }
@@ -4489,7 +4491,8 @@ function Show-FileManager {
     # 首屏读目录等窗口真正显示（Shown）后再跑：后台任务靠 WinForms Timer 收结果，
     # ShowDialog 之前窗口还没进消息循环、Visible 也是 false，过早读会出现「打不开这个目录」，
     # 而用户点一下「内部存储」又能正常打开。窗口显示后所有按 Visible 判关窗的传输/删除逻辑也才成立。
-    $dlg.Add_Shown({ & $refresh })
+    # 首屏读取也占用文件窗口的忙锁，防止等待时切设备或导航触发嵌套读取、把旧列表填到新目录。
+    $dlg.Add_Shown({ Invoke-MainFlow ($refresh) $dlg $script:fmFlow })
 
     [void]$dlg.ShowDialog($owner)
     # 不主动 Dispose $boldFont / $fmtip：列表行还持有这个 Font 引用，窗口 Close 后句柄未必立刻释放，
