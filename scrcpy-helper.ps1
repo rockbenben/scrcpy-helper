@@ -3599,6 +3599,104 @@ function Fm-ConfirmOverwrite {
 # 下载先落到独立暂存项，避免失败或取消破坏已有文件；提交时用 Unicode API 精确处理目标名。
 # 目标已存在时保持 adb pull 原本的语义：同名文件覆盖，文件夹合并内容、绝不整目录删掉旧文件。
 # 写入前检查完整树，避免合并到一半才发现类型冲突或目录联接。
+# 保存根目录由用户明确选择，先通过句柄解析实际位置；其下的子路径仍逐级拒绝链接。
+function Get-FmSaveRoot {
+    param([string]$Path)
+    if (-not ('Native.FmPath' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+namespace Native {
+    public static class FmPath {
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        private static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        private static extern uint GetFinalPathNameByHandle(SafeFileHandle handle, StringBuilder name, uint size, uint flags);
+        public static string Resolve(string path) {
+            using (SafeFileHandle handle = CreateFile(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+                if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+                StringBuilder name = new StringBuilder(32768);
+                uint size = GetFinalPathNameByHandle(handle, name, (uint)name.Capacity, 0);
+                if (size == 0 || size >= name.Capacity) throw new Win32Exception(Marshal.GetLastWin32Error());
+                string result = name.ToString();
+                if (result.StartsWith(@"\\?\UNC\")) return @"\\" + result.Substring(8);
+                if (result.StartsWith(@"\\?\")) return result.Substring(4);
+                return result;
+            }
+        }
+    }
+}
+'@
+    }
+    $root = [Native.FmPath]::Resolve([IO.Path]::GetFullPath($Path))
+    Assert-FmLocalPath $root
+    return $root
+}
+function Test-FmOverwrite {
+    param($Approved, [string]$Path)
+    if ($Approved -is [bool]) { return $Approved }
+    return ($null -ne $Approved -and $Approved.ContainsKey([IO.Path]::GetFullPath($Path)))
+}
+# 授权只记录确认框出现之前实际存在的路径，避免给整批中新出现的目标顺带授权。
+function Get-FmExistingTargets {
+    param([string]$Path, $Control)
+    if ($Control -and $Control.Cancelled) { throw '操作已取消' }
+    Assert-FmLocalPath $Path
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    $paths = @($item.FullName)
+    if ($item.PSIsContainer) {
+        foreach ($child in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)) {
+            $paths += @(Get-FmExistingTargets $child.FullName $Control)
+        }
+    }
+    return @($paths)
+}
+function Get-FmUnapprovedTargets {
+    param([string]$From, [string]$To, $Approved, $Control)
+    if ($Control -and $Control.Cancelled) { throw '操作已取消' }
+    Assert-FmLocalPath $From
+    Assert-FmLocalPath $To
+    $paths = @()
+    if ((Test-Path -LiteralPath $To) -and -not (Test-FmOverwrite $Approved $To)) { $paths += [IO.Path]::GetFullPath($To) }
+    if ((Get-Item -LiteralPath $From -Force -ErrorAction Stop).PSIsContainer) {
+        foreach ($child in @(Get-ChildItem -LiteralPath $From -Force -ErrorAction Stop)) {
+            $paths += @(Get-FmUnapprovedTargets $child.FullName (Join-Path $To $child.Name) $Approved $Control)
+        }
+    }
+    return @($paths)
+}
+function Get-FmTargetPaths {
+    param($Owner, [string]$Path, [string]$From = '', $Approved = @{})
+    return (Invoke-FmTask $Owner -Functions @('Get-FmExistingTargets','Get-FmUnapprovedTargets','Test-FmOverwrite','Assert-FmLocalPath') -Inputs @{ Path=$Path; From=$From; Approved=$Approved } -Work {
+        try {
+            $paths = if ($Inputs.From) { @(Get-FmUnapprovedTargets $Inputs.From $Inputs.Path $Inputs.Approved $Control) }
+                     else { @(Get-FmExistingTargets $Inputs.Path $Control) }
+            [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$true; Paths=@($paths) }
+        } catch {
+            [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$false; Cancelled=[bool]$Control.Cancelled; Error=$_.Exception.Message }
+        }
+    })
+}
+function Assert-FmUploadTarget {
+    param($Owner, $Serial, [string]$Local, [string]$Remote)
+    $q = Fm-ShQuote $Remote
+    $type = @(Fm-Shell $Serial "if [ -L $q ]; then echo FM_LINK; elif [ -d $q ]; then echo FM_DIR; elif [ -e $q ]; then echo FM_FILE; else echo FM_NEW; fi" $Owner | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    if ($Owner.IsDisposed -or -not $Owner.Visible) { throw '操作已取消' }
+    if ($type -contains 'FM_LINK') { throw "上传目标是链接：$Remote" }
+    $isDirectory = (Get-Item -LiteralPath $Local -Force -ErrorAction Stop).PSIsContainer
+    if ($type.Count -ne 1 -or $type[0] -notin @('FM_DIR','FM_FILE','FM_NEW')) { throw "无法确认目标类型：$Remote" }
+    if ($type[0] -eq 'FM_NEW') { return }
+    if (($type[0] -eq 'FM_DIR') -ne $isDirectory) { throw "目标类型不符：$Remote" }
+    if ($isDirectory) {
+        foreach ($child in @(Get-ChildItem -LiteralPath $Local -Force -ErrorAction Stop)) {
+            Assert-FmUploadTarget $Owner $Serial $child.FullName (Fm-ChildPath $Remote $child.Name)
+        }
+    }
+}
 function Assert-FmLocalPath {
     param([string]$Path)
     $current = [IO.Path]::GetFullPath($Path)
@@ -3621,7 +3719,7 @@ function Assert-FmNames {
     }
 }
 function Assert-FmTree {
-    param([string]$From, [string]$To, [bool]$Overwrite, $Control)
+    param([string]$From, [string]$To, $Overwrite, $Control)
     if ($Control -and $Control.Cancelled) { throw '操作已取消' }
     Assert-FmLocalPath $From
     Assert-FmLocalPath $To
@@ -3629,7 +3727,7 @@ function Assert-FmTree {
     if (Test-Path -LiteralPath $To) {
         $b = Get-Item -LiteralPath $To -Force -ErrorAction Stop
         if ($a.PSIsContainer -ne $b.PSIsContainer) { throw "文件与文件夹同名：$To" }
-        if (-not $Overwrite) { throw "目标已存在：$To" }
+        if (-not (Test-FmOverwrite $Overwrite $To)) { throw "目标已存在：$To" }
     }
     if ($a.PSIsContainer) {
         $children = @(Get-ChildItem -LiteralPath $From -Force -ErrorAction Stop)
@@ -3638,7 +3736,7 @@ function Assert-FmTree {
     }
 }
 function Copy-FmFile {
-    param([string]$From, [string]$To, [bool]$Overwrite, $Control)
+    param([string]$From, [string]$To, $Overwrite, $Control)
     Assert-FmLocalPath $To
     $temp = Join-Path ([IO.Path]::GetDirectoryName($To)) ('.scrcpy-' + [guid]::NewGuid().ToString('N'))
     $inputStream=$null; $outputStream=$null
@@ -3653,7 +3751,7 @@ function Copy-FmFile {
         $outputStream.Dispose(); $outputStream=$null
         if ($Control -and $Control.Cancelled) { throw '操作已取消' }
         Assert-FmLocalPath $To
-        if ([IO.File]::Exists($To) -and $Overwrite) { [IO.File]::Replace($temp,$To,[System.Management.Automation.Language.NullString]::Value) }
+        if ([IO.File]::Exists($To) -and (Test-FmOverwrite $Overwrite $To)) { [IO.File]::Replace($temp,$To,[System.Management.Automation.Language.NullString]::Value) }
         else { [IO.File]::Move($temp,$To) }
     } finally {
         if ($inputStream) { $inputStream.Dispose() }
@@ -3662,7 +3760,7 @@ function Copy-FmFile {
     }
 }
 function Merge-FmDirectory {
-    param([string]$From, [string]$To, [bool]$Overwrite = $false, $Control)
+    param([string]$From, [string]$To, $Overwrite = $false, $Control)
     Assert-FmTree $From $To $Overwrite $Control
     if (-not (Test-Path -LiteralPath $To)) { [void][IO.Directory]::CreateDirectory($To) }
     foreach ($child in @(Get-ChildItem -LiteralPath $From -Force -ErrorAction Stop)) {
@@ -3675,7 +3773,7 @@ function Merge-FmDirectory {
     }
 }
 function Move-FmPulledItem {
-    param([string]$From, [string]$To, [bool]$Overwrite = $false, $Control)
+    param([string]$From, [string]$To, $Overwrite = $false, $Control)
     try {
         Assert-FmTree $From $To $Overwrite $Control
         $a = Get-Item -LiteralPath $From -Force -ErrorAction Stop
@@ -4049,6 +4147,7 @@ function Show-FileManager {
             return
         }
         $chk = Fm-ExistingIndexes $dlg $batchSerial $batchPath $names
+        if ($dlg.IsDisposed -or -not $dlg.Visible) { return }
         if (-not $chk.Ok) {
             [void](Show-ResultDialog $dlg '上传' '没能确认手机上有没有同名文件' '为避免悄悄覆盖已有文件，本次上传已取消。请确认手机仍连着，点「刷新」后再试。' '' @('ok'))
             return
@@ -4085,12 +4184,9 @@ function Show-FileManager {
                     if ($answer -eq 'cancel') { $aborted = $true; break }
                     if ($answer -eq 'skip') { continue }
                 }
-                $q = Fm-ShQuote $remote
-                $type = @(Fm-Shell $batchSerial "if [ -d $q ]; then echo FM_DIR; elif [ -e $q ] || [ -L $q ]; then echo FM_FILE; else echo FM_NEW; fi" $dlg)
-                if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
-                $isDirectory = (Get-Item -LiteralPath $f -Force).PSIsContainer
-                if ($type -notcontains 'FM_NEW' -and (($type -contains 'FM_DIR') -ne $isDirectory -or ($type -notcontains 'FM_DIR' -and $type -notcontains 'FM_FILE'))) {
-                    $fail += "$name → 目标类型不符或无法确认，已跳过"; continue
+                try { Assert-FmUploadTarget $dlg $batchSerial $f $remote } catch {
+                    if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                    $fail += "$name → $($_.Exception.Message)"; continue
                 }
                 # adb 以父目录为目的地时，目录上传合并到同名目录，避免产生 name/name。
                 $remote = $batchPath.TrimEnd('/') + '/'
@@ -4139,7 +4235,7 @@ function Show-FileManager {
         $fbd.Dispose()
         if (-not (Test-Path -LiteralPath $dest)) { return }
         try {
-            Assert-FmLocalPath $dest
+            $dest = Get-FmSaveRoot $dest
             Assert-FmNames @($sel | ForEach-Object { $_.Tag.Name })
             foreach ($item in $sel) {
                 if ($item.Tag.IsLink) { throw '下载暂不支持链接，请选择原文件。' }
@@ -4150,16 +4246,29 @@ function Show-FileManager {
             [void](Show-ResultDialog $dlg '下载' '无法安全保存这批文件' $_.Exception.Message '' @('ok'))
             return
         }
-        $allowOverwrite = $false
+        $approvedTargets = @{}
+        $existingTargets = @{}
         # adb pull 同样会覆盖电脑上已有的同名文件，且不问一声。纯本地检查，不需要 adb。
         $overlap = @()
         for ($k = 0; $k -lt $sel.Count; $k++) {
-            if (Test-Path -LiteralPath (Join-Path $dest ([string]$sel[$k].Tag.Name))) { $overlap += $k }
+            $target = Join-Path $dest ([string]$sel[$k].Tag.Name)
+            $check = Get-FmTargetPaths $dlg $target
+            if ($dlg.IsDisposed -or -not $dlg.Visible -or $check.Cancelled) { return }
+            if (-not $check.Ok) {
+                [void](Show-ResultDialog $dlg '下载' '无法安全保存这批文件' $check.Error '' @('ok'))
+                return
+            }
+            $existingTargets[$k] = @($check.Paths)
+            if ($existingTargets[$k].Count -gt 0) { $overlap += $k }
         }
         if ($overlap.Count -gt 0) {
             $choice = Fm-ConfirmOverwrite $dlg '下载' @($overlap | ForEach-Object { [string]$sel[$_].Tag.Name }) "电脑上的 $dest"
             if ($choice -eq 'cancel') { return }
-            $allowOverwrite = ($choice -eq 'overwrite')
+            if ($choice -eq 'overwrite') {
+                foreach ($k in $overlap) {
+                    foreach ($path in $existingTargets[$k]) { $approvedTargets[$path] = $true }
+                }
+            }
             if ($choice -eq 'skip') {
                 $keep = @()
                 for ($k = 0; $k -lt $sel.Count; $k++) { if ($overlap -notcontains $k) { $keep += $sel[$k] } }
@@ -4199,7 +4308,17 @@ function Show-FileManager {
                     if (-not $r.Aborted) {
                         $commit = $null
                         if ($r.Ok) {
-                            $commit = Invoke-FmTask $dlg -Functions @('Fm-ValidName','Assert-FmNames','Assert-FmLocalPath','Assert-FmTree','Copy-FmFile','Merge-FmDirectory','Move-FmPulledItem') -Inputs @{ From=$stage; To=$local; Overwrite=$allowOverwrite } -Work {
+                            $check = Get-FmTargetPaths $dlg $local $stage $approvedTargets
+                            if ($dlg.IsDisposed -or -not $dlg.Visible -or $check.Cancelled) { $aborted=$true; break }
+                            if (-not $check.Ok) { $fail += "$($e.Name) → $($check.Error)"; continue }
+                            $conflicts = @($check.Paths)
+                            if ($conflicts.Count -gt 0) {
+                                $answer = Fm-ConfirmOverwrite $dlg '下载' $conflicts "电脑上的 $dest"
+                                if ($dlg.IsDisposed -or -not $dlg.Visible -or $answer -eq 'cancel') { $aborted = $true; break }
+                                if ($answer -eq 'skip') { continue }
+                                foreach ($path in $conflicts) { $approvedTargets[$path] = $true }
+                            }
+                            $commit = Invoke-FmTask $dlg -Functions @('Fm-ValidName','Assert-FmNames','Assert-FmLocalPath','Assert-FmTree','Test-FmOverwrite','Copy-FmFile','Merge-FmDirectory','Move-FmPulledItem') -Inputs @{ From=$stage; To=$local; Overwrite=$approvedTargets } -Work {
                                 $ok=Move-FmPulledItem $Inputs.From $Inputs.To $Inputs.Overwrite $Control
                                 [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$ok; Cancelled=[bool]$Control.Cancelled }
                             }
