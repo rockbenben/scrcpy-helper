@@ -16,7 +16,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  workflow_call:          # release.yml 复用它：标签指向的提交也得先过检查才准发版
+  workflow_call:
+    inputs:
+      ref:
+        description: '要检查的提交 SHA'
+        required: true
+        type: string
 
 jobs:
   check:
@@ -24,6 +29,8 @@ jobs:
     timeout-minutes: 10          # 卡住就快点红，别一路挂到 6 小时上限
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       # 启动器（投屏助手-双击运行.bat）调的是 powershell.exe = Windows PowerShell 5.1，
       # 所以必须用它解析一遍；pwsh 7 是开发时手边那台，也跑一遍防两头不一致。

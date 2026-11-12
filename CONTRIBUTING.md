@@ -9,7 +9,7 @@
 - `README.md`：概览与「能做什么」里逐字引用的说法
 - `使用说明.txt`：随包说明书，逐字引用必须对得上
 - 脚本里的悬停提示与按钮文案：同一件事在别处也要统一口径
-- `assets/*.png`：README 里画的是真实界面（头图里有主界面和「手机当摄像头」面板），改了界面要同轮重出对应截图
+- `assets/*.png`：README 里画的是真实界面（头图里有主界面和「手机当摄像头」面板）
 
 口径上有一条容易写错：数字输入框最小值是 0、留不下空值，所以要写「0=不限制」「0=用默认」；只有文本框才写「不填=…」（如「不填=投整屏」「不填=用自带的」）。
 
@@ -34,7 +34,7 @@ $err | ForEach-Object { $_.Message }
 
 **这一步现在由 CI 做**（`.github/workflows/release.yml`）：推一个 `v*` 标签，它会下载官方 win64 包、按官方 `SHA256SUMS.txt` 核对、把这三个文件放进去、确认 scrcpy 的 16 个文件逐字节没动且 `LICENSE.txt` 还在，压成 `scrcpy-helper-<版本>-windows.zip` 传到 Release 上，并把 `releases/latest` 指向它。
 
-发版说明建议提前写好放在 `.github/release-notes/<标签>.md`（例如 `.github/release-notes/v1.6.3.md`），CI 会拿它当 Release 正文；没有这个文件就用提交记录拼一版。标签推上去之后想补发（当时还没有这个 workflow），去 Actions 页面手动跑一次 `Release`、填标签名即可。
+发版说明建议提前写好放在 `.github/release-notes/<标签>.md`（例如 `.github/release-notes/v1.6.3.md`），CI 会拿它当 Release 正文；没有这个文件就用提交记录拼一版。标签推上去之后想补发（当时还没有这个 workflow），去 Actions 页面手动跑一次 `Release`、填标签名即可。标签格式为 `v主版本.次版本.修订号`（如 `v1.6.3`）；预检和打包均使用该标签解析出的同一提交。手动补发默认不改变最新版，需要提升时勾选 `promote_latest`。推送版本标签仍会自动提升最新版。
 
 **scrcpy 的 `LICENSE.txt` 不要删**——原样保留它是 Apache-2.0 的要求。它只覆盖 scrcpy 自己那些文件；助手这三个文件的 MIT 许可放在仓库的 `LICENSE` 里，不再往发行包里塞一份副本（版权人就是本项目作者，不存在第三方授权约束）。CI 会替你查这一条：少了或被改动就打不出包。
 

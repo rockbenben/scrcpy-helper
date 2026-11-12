@@ -1,6 +1,6 @@
 name: Release
 
-# push 一个 v* 标签：自动打发行包、建 Release、传资产，并核对 releases/latest 指向它。
+# push 一个 v主版本.次版本.修订号 标签：自动打发行包、建 Release、传资产，并核对 releases/latest 指向它。
 #
 # 手工补发（标签已经推了、这个 workflow 当时还不存在）：Actions 页面 → 本 workflow →
 # Run workflow，填标签名。标签推上去的那一刻 GitHub 只认**那个提交里已有的** workflow，
@@ -19,15 +19,50 @@ on:
         description: '要发布的标签（如 v1.6.2）'
         required: true
         type: string
+      promote_latest:
+        description: '将此版本设为最新版（补发旧版本时保持关闭）'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
-  # 标签指向的提交也得先过检查才准发版：复用 ci.yml（workflow 之间不能互相 needs，
-  # 所以把检查做成可复用工作流，由这里显式调用）。
+  resolve:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.target.outputs.tag }}
+      version: ${{ steps.target.outputs.version }}
+      sha: ${{ steps.target.outputs.sha }}
+      latest: ${{ steps.target.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Resolve the target tag once
+        id: target
+        env:
+          TARGET_TAG: ${{ inputs.tag || github.ref_name }}
+          PROMOTE_LATEST: ${{ github.event_name == 'push' || inputs.promote_latest }}
+        shell: pwsh
+        run: |
+          $tag = $env:TARGET_TAG
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw '标签必须为 v主版本.次版本.修订号，例如 v1.6.2' }
+          $sha = git rev-parse --verify "refs/tags/${tag}^{commit}"
+          if ($LASTEXITCODE -ne 0) { throw "找不到标签 $tag 对应的提交" }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$($tag.Substring(1))" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "latest=$($env:PROMOTE_LATEST.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
   preflight:
+    needs: resolve
     uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
 
   release:
-    needs: preflight
+    needs: [resolve, preflight]
     runs-on: windows-latest
     timeout-minutes: 20          # 卡住就快点红，别一路挂到 6 小时上限
     permissions:
@@ -37,27 +72,20 @@ jobs:
     env:
       # 打包基线（见 CONTRIBUTING「打包发行版」）。scrcpy 出新版本时，连同文档一起改这里。
       SCRCPY_VERSION: '5.0.1'
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+      PROMOTE_LATEST: ${{ needs.resolve.outputs.latest }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 0           # 要拿上一个标签来列提交范围
-
-      - name: Derive version from tag
-        id: ver
-        shell: bash
-        run: |
-          
-          tag="${{ inputs.tag || github.ref_name }}"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
-          echo "打包 $tag（版本号 ${tag#v}）"
 
       - name: Download the official scrcpy package and check it against the official checksums
         shell: pwsh
         run: |
           
-          $v = '${{ env.SCRCPY_VERSION }}'
+          $v = $env:SCRCPY_VERSION
           $base = "https://github.com/Genymobile/scrcpy/releases/download/v$v"
           $sums = "$env:RUNNER_TEMP/SHA256SUMS.txt"
           Invoke-WebRequest -Uri "$base/SHA256SUMS.txt" -OutFile $sums -UseBasicParsing
@@ -73,12 +101,12 @@ jobs:
         shell: pwsh
         run: |
           
-          $v = '${{ env.SCRCPY_VERSION }}'
+          $v = $env:SCRCPY_VERSION
           $stage = "$env:RUNNER_TEMP/stage"
           $src = "$env:RUNNER_TEMP/scrcpy-win64-v$v.zip"
           # 产物放工作区根目录：后面的 SHA256SUMS 与 attach 步骤都按相对路径引用，
           # 和同族仓库的写法一致，少一层「这个绝对路径到底指到哪」的疑虑。
-          $out = "scrcpy-helper-${{ steps.ver.outputs.version }}-windows.zip"
+          $out = "scrcpy-helper-${env:RELEASE_VERSION}-windows.zip"
           Expand-Archive -LiteralPath $src -DestinationPath $stage -Force
           # 官方包里带一层目录 scrcpy-win64-vX.Y.Z/，发行包要的是它的**内容**平铺在根目录。
           $pkg = Get-ChildItem $stage -Directory
@@ -120,7 +148,7 @@ jobs:
         shell: pwsh
         run: |
           
-          $zip = "scrcpy-helper-${{ steps.ver.outputs.version }}-windows.zip"
+          $zip = "scrcpy-helper-${env:RELEASE_VERSION}-windows.zip"
           Get-FileHash $zip -Algorithm SHA256 |
             ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
             Set-Content SHA256SUMS.txt -Encoding ascii
@@ -142,13 +170,14 @@ jobs:
         shell: pwsh
         run: |
           
-          $tag = '${{ steps.ver.outputs.tag }}'
+          $tag = $env:RELEASE_TAG
           $hand = ".github/release-notes/$tag.md"
           if (Test-Path $hand) {
             Copy-Item $hand release-body.md
             "用仓库里的手写说明：$hand"
           } else {
-            $prev = (git tag --sort=-v:refname | Where-Object { $_ -ne $tag } | Select-Object -First 1)
+            $prev = git describe --tags --abbrev=0 --match "v*" "$tag^" 2>$null
+            if ($LASTEXITCODE -ne 0) { $prev = $null; $global:LASTEXITCODE = 0 }
             $range = if ($prev) { "$prev..$tag" } else { $tag }
             $items = @(git log --pretty=format:'%s' $range)
             $body = @('## 更新内容', '', '本版包含以下改动：', '')
@@ -166,39 +195,35 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
           files: |
-            scrcpy-helper-${{ steps.ver.outputs.version }}-windows.zip
+            scrcpy-helper-${{ needs.resolve.outputs.version }}-windows.zip
             SHA256SUMS.txt
           body_path: release-body.md
           generate_release_notes: false
           # ⚠️ **fail_on_unmatched_files 默认是 false**：glob 一个都没匹配上时这一步照样成功，
           # 结果是「Release 建好了、资产是空的」——绿灯骗人。显式打开，匹配不到就红。
           fail_on_unmatched_files: true
-          # 正常路径下由这个输入把 releases/latest 指到本版；下面那步还会用 API 再核一遍
-          # （草稿转发布时 GitHub 不会重算 latest，那个坑只有显式 PATCH 能填）。
-          make_latest: 'true'
+          # 标签推送默认提升 latest；手动补发只有勾选 promote_latest 才提升。
+          make_latest: ${{ needs.resolve.outputs.latest }}
 
-      - name: Publish the release and point latest at it
+      - name: Verify the published release and latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
+        shell: pwsh
         run: |
-          
-          set -euo pipefail
-          tag="${{ steps.ver.outputs.tag }}"
-          # ⚠️ **不能用 `releases/tags/<tag>` 找这条 release**：那个端点不返回草稿。
-          # 草稿只能从 release 列表里捞——列表按创建时间倒序，新建的总在第一页。
-          id="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-                 --jq "first(.[] | select(.tag_name == \"${tag}\") | .id)")"
-          if [ -z "$id" ]; then
-            echo "::error::没找到 tag ${tag} 对应的 release"
-            exit 1
-          fi
-          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${id}" \
-            -F draft=false -f make_latest=true > /dev/null
-          latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
-          if [ "$latest" != "$tag" ]; then
-            echo "::error::releases/latest 指着 ${latest}，不是 ${tag}"
-            exit 1
-          fi
-          echo "release ${tag} 已发布，releases/latest 指向它"
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.draft -or $release.tag_name -ne $tag) { throw "目标 Release $tag 未成功发布" }
+          $names = @($release.assets | ForEach-Object { $_.name })
+          foreach ($name in @("scrcpy-helper-${env:RELEASE_VERSION}-windows.zip", 'SHA256SUMS.txt')) {
+            if ($names -notcontains $name) { throw "Release 缺少资产 $name" }
+          }
+          if ($env:PROMOTE_LATEST -eq 'true') {
+            gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)" -F draft=false -f make_latest=true | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw '更新 latest 失败' }
+            $latest = gh api "repos/$env:GITHUB_REPOSITORY/releases/latest" --jq .tag_name
+            if ($LASTEXITCODE -ne 0 -or $latest -ne $tag) { throw "releases/latest 未指向 $tag" }
+          }
+          "Release $tag 及资产已核对"
