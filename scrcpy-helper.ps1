@@ -3646,14 +3646,7 @@ function Get-FmExistingTargets {
     if ($Control -and $Control.Cancelled) { throw '操作已取消' }
     Assert-FmLocalPath $Path
     if (-not (Test-Path -LiteralPath $Path)) { return @() }
-    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-    $paths = @($item.FullName)
-    if ($item.PSIsContainer) {
-        foreach ($child in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)) {
-            $paths += @(Get-FmExistingTargets $child.FullName $Control)
-        }
-    }
-    return @($paths)
+    return @((Get-Item -LiteralPath $Path -Force -ErrorAction Stop).FullName)
 }
 function Get-FmUnapprovedTargets {
     param([string]$From, [string]$To, $Approved, $Control)
@@ -3670,11 +3663,15 @@ function Get-FmUnapprovedTargets {
     return @($paths)
 }
 function Get-FmTargetPaths {
-    param($Owner, [string]$Path, [string]$From = '', $Approved = @{})
-    return (Invoke-FmTask $Owner -Functions @('Get-FmExistingTargets','Get-FmUnapprovedTargets','Test-FmOverwrite','Assert-FmLocalPath') -Inputs @{ Path=$Path; From=$From; Approved=$Approved } -Work {
+    param($Owner, [string]$Path, [string]$From = '', $Approved = @{}, [string[]]$Paths = @())
+    return (Invoke-FmTask $Owner -Functions @('Get-FmExistingTargets','Get-FmUnapprovedTargets','Test-FmOverwrite','Assert-FmLocalPath') -Inputs @{ Path=$Path; From=$From; Approved=$Approved; Paths=$Paths } -Work {
         try {
             $paths = if ($Inputs.From) { @(Get-FmUnapprovedTargets $Inputs.From $Inputs.Path $Inputs.Approved $Control) }
-                     else { @(Get-FmExistingTargets $Inputs.Path $Control) }
+                     else {
+                         # 只扫描远端清单对应的目标，已有目录中的无关内容不会被访问。
+                         $targets = if ($Inputs.Paths.Count) { @($Inputs.Paths) } else { @($Inputs.Path) }
+                         foreach ($target in $targets) { Get-FmExistingTargets $target $Control }
+                     }
             [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$true; Paths=@($paths) }
         } catch {
             [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$false; Cancelled=[bool]$Control.Cancelled; Error=$_.Exception.Message }
@@ -3719,7 +3716,8 @@ function Assert-FmNames {
     }
 }
 function Assert-FmTree {
-    param([string]$From, [string]$To, $Overwrite, $Control)
+    param([string]$From, [string]$To, $Overwrite, $Control, $Skipped = @{})
+    if ($Skipped.ContainsKey([IO.Path]::GetFullPath($To))) { return }
     if ($Control -and $Control.Cancelled) { throw '操作已取消' }
     Assert-FmLocalPath $From
     Assert-FmLocalPath $To
@@ -3732,11 +3730,12 @@ function Assert-FmTree {
     if ($a.PSIsContainer) {
         $children = @(Get-ChildItem -LiteralPath $From -Force -ErrorAction Stop)
         Assert-FmNames @($children | ForEach-Object { $_.Name })
-        foreach ($child in $children) { Assert-FmTree $child.FullName (Join-Path $To $child.Name) $Overwrite $Control }
+        foreach ($child in $children) { Assert-FmTree $child.FullName (Join-Path $To $child.Name) $Overwrite $Control $Skipped }
     }
 }
 function Copy-FmFile {
-    param([string]$From, [string]$To, $Overwrite, $Control)
+    param([string]$From, [string]$To, $Overwrite, $Control, $Skipped = @{})
+    if ($Skipped.ContainsKey([IO.Path]::GetFullPath($To))) { return }
     Assert-FmLocalPath $To
     $temp = Join-Path ([IO.Path]::GetDirectoryName($To)) ('.scrcpy-' + [guid]::NewGuid().ToString('N'))
     $inputStream=$null; $outputStream=$null
@@ -3760,25 +3759,26 @@ function Copy-FmFile {
     }
 }
 function Merge-FmDirectory {
-    param([string]$From, [string]$To, $Overwrite = $false, $Control)
-    Assert-FmTree $From $To $Overwrite $Control
+    param([string]$From, [string]$To, $Overwrite = $false, $Control, $Skipped = @{})
+    if ($Skipped.ContainsKey([IO.Path]::GetFullPath($To))) { return }
+    Assert-FmTree $From $To $Overwrite $Control $Skipped
     if (-not (Test-Path -LiteralPath $To)) { [void][IO.Directory]::CreateDirectory($To) }
     foreach ($child in @(Get-ChildItem -LiteralPath $From -Force -ErrorAction Stop)) {
         $target = Join-Path $To $child.Name
-        if ($child.PSIsContainer) { Merge-FmDirectory $child.FullName $target $Overwrite $Control }
+        if ($child.PSIsContainer) { Merge-FmDirectory $child.FullName $target $Overwrite $Control $Skipped }
         else {
-            Assert-FmLocalPath $target
-            Copy-FmFile $child.FullName $target $Overwrite $Control
+            Copy-FmFile $child.FullName $target $Overwrite $Control $Skipped
         }
     }
 }
 function Move-FmPulledItem {
-    param([string]$From, [string]$To, $Overwrite = $false, $Control)
+    param([string]$From, [string]$To, $Overwrite = $false, $Control, $Skipped = @{})
+    if ($Skipped.ContainsKey([IO.Path]::GetFullPath($To))) { return }
     try {
-        Assert-FmTree $From $To $Overwrite $Control
+        Assert-FmTree $From $To $Overwrite $Control $Skipped
         $a = Get-Item -LiteralPath $From -Force -ErrorAction Stop
-        if ($a.PSIsContainer) { Merge-FmDirectory $From $To $Overwrite $Control }
-        else { Copy-FmFile $From $To $Overwrite $Control }
+        if ($a.PSIsContainer) { Merge-FmDirectory $From $To $Overwrite $Control $Skipped }
+        else { Copy-FmFile $From $To $Overwrite $Control $Skipped }
         return $true
     } catch { return $false }
 }
@@ -3787,10 +3787,17 @@ function Assert-FmRemoteTree {
     $listing = Fm-ListDir $Owner $Serial $Path
     if (-not $listing.Ok -or $listing.Hidden -gt 0) { throw "目录未能完整检查：$Path" }
     Assert-FmNames @($listing.Items | ForEach-Object { $_.Name })
+    $paths = @()
     foreach ($entry in $listing.Items) {
         if ($entry.IsLink) { throw "下载目录含链接：$($entry.Path)" }
-        if ($entry.IsDir) { Assert-FmRemoteTree $Owner $Serial $entry.Path }
+        $paths += $entry.Name
+        if ($entry.IsDir) {
+            foreach ($relative in @(Assert-FmRemoteTree $Owner $Serial $entry.Path)) {
+                $paths += $entry.Name + '/' + $relative
+            }
+        }
     }
+    return @($paths)
 }
 
 function Fm-Transfer {
@@ -3978,7 +3985,7 @@ function Show-FileManager {
     $btnDel.ForeColor = $cRed
     $btnClose    = New-PrimaryBtn   '关闭'        576 376 88  34 10
     $fmtip.SetToolTip($btnUpload, '选电脑上的文件传到手机当前目录（可多选），也可以直接把文件拖进列表。')
-    $fmtip.SetToolTip($btnDownload, '把选中的文件 / 文件夹下载到电脑（可多选，会让你挑保存位置）。')
+    $fmtip.SetToolTip($btnDownload, '把选中的文件 / 文件夹下载到电脑（可多选，会让你挑保存位置）。合并文件夹时，仅跳过确认框列出的冲突子项，其余文件继续保存；链接检查仅覆盖本次实际写入的路径。')
     $fmtip.SetToolTip($btnRename, '给选中的一个文件 / 文件夹改名（F2）。只在当前目录里改名字，遇到同名会提示换名，不会覆盖。')
     $fmtip.SetToolTip($btnRefresh, '重新读取当前目录，并刷新设备列表。')
     $fmtip.SetToolTip($btnNew, '在手机当前目录里新建一个文件夹。')
@@ -4234,12 +4241,13 @@ function Show-FileManager {
         $dest = $fbd.SelectedPath
         $fbd.Dispose()
         if (-not (Test-Path -LiteralPath $dest)) { return }
+        $relativeTargets = @{}
         try {
             $dest = Get-FmSaveRoot $dest
             Assert-FmNames @($sel | ForEach-Object { $_.Tag.Name })
             foreach ($item in $sel) {
                 if ($item.Tag.IsLink) { throw '下载暂不支持链接，请选择原文件。' }
-                if ($item.Tag.IsDir) { Assert-FmRemoteTree $dlg $batchSerial $item.Tag.Path }
+                if ($item.Tag.IsDir) { $relativeTargets[$item.Tag.Name] = @(Assert-FmRemoteTree $dlg $batchSerial $item.Tag.Path) }
             }
         } catch {
             if ($dlg.IsDisposed -or -not $dlg.Visible) { return }
@@ -4252,7 +4260,11 @@ function Show-FileManager {
         $overlap = @()
         for ($k = 0; $k -lt $sel.Count; $k++) {
             $target = Join-Path $dest ([string]$sel[$k].Tag.Name)
-            $check = Get-FmTargetPaths $dlg $target
+            $targets = @($target)
+            foreach ($relative in @($relativeTargets[[string]$sel[$k].Tag.Name])) {
+                if ($relative) { $targets += Join-Path $target $relative }
+            }
+            $check = Get-FmTargetPaths $dlg $target -Paths $targets
             if ($dlg.IsDisposed -or -not $dlg.Visible -or $check.Cancelled) { return }
             if (-not $check.Ok) {
                 [void](Show-ResultDialog $dlg '下载' '无法安全保存这批文件' $check.Error '' @('ok'))
@@ -4308,6 +4320,7 @@ function Show-FileManager {
                     if (-not $r.Aborted) {
                         $commit = $null
                         if ($r.Ok) {
+                            $skippedTargets = @{}
                             $check = Get-FmTargetPaths $dlg $local $stage $approvedTargets
                             if ($dlg.IsDisposed -or -not $dlg.Visible -or $check.Cancelled) { $aborted=$true; break }
                             if (-not $check.Ok) { $fail += "$($e.Name) → $($check.Error)"; continue }
@@ -4315,11 +4328,15 @@ function Show-FileManager {
                             if ($conflicts.Count -gt 0) {
                                 $answer = Fm-ConfirmOverwrite $dlg '下载' $conflicts "电脑上的 $dest"
                                 if ($dlg.IsDisposed -or -not $dlg.Visible -or $answer -eq 'cancel') { $aborted = $true; break }
-                                if ($answer -eq 'skip') { continue }
-                                foreach ($path in $conflicts) { $approvedTargets[$path] = $true }
+                                if ($answer -eq 'skip') {
+                                    foreach ($path in $conflicts) { $skippedTargets[$path] = $true }
+                                    if ($skippedTargets.ContainsKey([IO.Path]::GetFullPath($local))) { continue }
+                                } else {
+                                    foreach ($path in $conflicts) { $approvedTargets[$path] = $true }
+                                }
                             }
-                            $commit = Invoke-FmTask $dlg -Functions @('Fm-ValidName','Assert-FmNames','Assert-FmLocalPath','Assert-FmTree','Test-FmOverwrite','Copy-FmFile','Merge-FmDirectory','Move-FmPulledItem') -Inputs @{ From=$stage; To=$local; Overwrite=$approvedTargets } -Work {
-                                $ok=Move-FmPulledItem $Inputs.From $Inputs.To $Inputs.Overwrite $Control
+                            $commit = Invoke-FmTask $dlg -Functions @('Fm-ValidName','Assert-FmNames','Assert-FmLocalPath','Assert-FmTree','Test-FmOverwrite','Copy-FmFile','Merge-FmDirectory','Move-FmPulledItem') -Inputs @{ From=$stage; To=$local; Overwrite=$approvedTargets; Skipped=$skippedTargets } -Work {
+                                $ok=Move-FmPulledItem $Inputs.From $Inputs.To $Inputs.Overwrite $Control $Inputs.Skipped
                                 [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$ok; Cancelled=[bool]$Control.Cancelled }
                             }
                         }

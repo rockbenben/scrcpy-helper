@@ -68,7 +68,7 @@ $err = $null; $tok = $null
 $err | ForEach-Object { $_.Message }
 ```
 
-- 仓库里没有自动化测试，**CI 绿也不等于「测试通过」**——`ci.yml` 查的是语法、编码、行尾这类硬约束，不查行为。能做的验证是：语法自检 + 与改动相关的功能检查。
+- `tests/file-manager-merge.ps1` 是无框架的文件管理合并回归脚本，可分别用 `powershell -NoProfile -File tests/file-manager-merge.ps1` 和 `pwsh -NoProfile -File tests/file-manager-merge.ps1` 运行。**CI 绿也不等于「测试通过」**——`ci.yml` 查的是语法、编码、行尾这类硬约束，不查行为。验证仍包括语法自检与改动相关的功能检查。
 
 ## 6. 工作树与提交
 
