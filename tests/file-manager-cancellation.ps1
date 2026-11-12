@@ -1,3 +1,7 @@
+param(
+    [ValidateRange(0, 20000)][int]$TaskCloseDelayMs = 0,
+    [string]$EvidencePath = ''
+)
 . (Join-Path $PSScriptRoot 'file-manager-test-support.ps1')
 # Use the actual task queue and a harmless local child process to exercise cancellation.
 foreach ($name in @('Start-UiTask', 'Start-NextDeviceScan', 'Receive-DeviceScan', 'Stop-DeviceScans', 'Cancel-OwnerTasks',
@@ -20,20 +24,36 @@ function Test-ProcessCancellation([string]$Mode) {
     # Publish readiness atomically so a timer cannot read a newly created, still empty PID file.
     $command = "[IO.File]::WriteAllText('$escapedPath.tmp',[string]`$PID); [IO.File]::Move('$escapedPath.tmp','$escapedPath'); Start-Sleep -Seconds 30"
     $startup = [Diagnostics.Stopwatch]::StartNew()
-    $cancellation = @{ Child=$null; Closed=$false; CloseWatch=$null }
+    $taskTiming = [hashtable]::Synchronized(@{ Watch=$null })
+    $commandTimeoutMs = 15000
+    $closeDelayMs = if ($Mode -eq 'task') { $TaskCloseDelayMs } else { 0 }
+    $startupLimitMs = [Math]::Max(12000, ($closeDelayMs + 5000))
+    $cancellation = @{ Child=$null; Closed=$false; CloseWatch=$null; TimeoutRemainingMs=$null }
     $timer.Interval = 50
     $timer.Add_Tick({
         $ready = Test-Path -LiteralPath $childIdFile
-        if ($ready -or $startup.ElapsedMilliseconds -gt 12000) {
+        $delayElapsed = if ($Mode -eq 'task' -and $taskTiming.Watch) { $taskTiming.Watch.ElapsedMilliseconds }
+                        else { $startup.ElapsedMilliseconds }
+        if (($ready -and $delayElapsed -ge $closeDelayMs) -or $startup.ElapsedMilliseconds -gt $startupLimitMs) {
             $timer.Stop()
             if ($ready) {
                 $childId = [int][IO.File]::ReadAllText($childIdFile)
                 $cancellation.Child = Get-Process -Id $childId -ErrorAction Stop
                 # Retain the process handle so cleanup cannot target a later process reusing its PID.
                 $null = $cancellation.Child.Handle
+                if ($EvidencePath) {
+                    $record = [pscustomobject]@{
+                        Phase='started'; Mode=$Mode; Id=$cancellation.Child.Id
+                        StartTicks=$cancellation.Child.StartTime.ToUniversalTime().Ticks
+                    }
+                    [IO.File]::AppendAllText($EvidencePath, (($record | ConvertTo-Json -Compress) + [Environment]::NewLine))
+                }
             }
             $cancellation.Closed = $true
             $cancellation.CloseWatch = [Diagnostics.Stopwatch]::StartNew()
+            if ($taskTiming.Watch) {
+                $cancellation.TimeoutRemainingMs = $commandTimeoutMs - $taskTiming.Watch.ElapsedMilliseconds
+            }
             if ($owner) { $owner.Dispose() }
             else { $window.Visible=$false; $window.IsDisposed=$true }
         }
@@ -41,8 +61,10 @@ function Test-ProcessCancellation([string]$Mode) {
     try {
         $timer.Start()
         if ($Mode -eq 'task') {
-            $result = Invoke-FmTask $owner -Inputs @{ File=(Get-Command powershell.exe).Source; Args=@('-NoProfile', '-Command', $command) } -Work {
-                $commandResult = Invoke-ShortCommand -FilePath $Inputs.File -ArgumentList $Inputs.Args -TimeoutMs 15000 -Control $Control
+            $result = Invoke-FmTask $owner -Inputs @{ File=(Get-Command powershell.exe).Source; Args=@('-NoProfile', '-Command', $command); Timing=$taskTiming; TimeoutMs=$commandTimeoutMs } -Work {
+                # Starting just before the command gives the UI a conservative timeout budget.
+                $Inputs.Timing.Watch = [Diagnostics.Stopwatch]::StartNew()
+                $commandResult = Invoke-ShortCommand -FilePath $Inputs.File -ArgumentList $Inputs.Args -TimeoutMs $Inputs.TimeoutMs -Control $Control
                 [pscustomobject]@{ Info=@{}; Connected=@(); Ok=($commandResult.ExitCode -eq 0); Cancelled=$commandResult.Cancelled }
             }
         } else {
@@ -51,6 +73,10 @@ function Test-ProcessCancellation([string]$Mode) {
             $result = Fm-Transfer @('-NoProfile', '-Command', $command) $window $null 'fixture' $null $root
         }
         Check ($cancellation.Closed -and $null -ne $cancellation.Child) "$Mode child did not reach the close fixture"
+        if ($Mode -eq 'task') {
+            # A fallback deadline inside the cancellation window cannot prove proactive cancellation.
+            Check ($cancellation.TimeoutRemainingMs -ge 6000) "Insufficient command timeout margin at close: $($cancellation.TimeoutRemainingMs) ms (minimum 6000 ms)"
+        }
         $elapsed = $cancellation.CloseWatch.ElapsedMilliseconds
         Check ($elapsed -lt 5000) "$Mode cancellation took $elapsed ms after close (limit 5000 ms)"
         $cancelled = if ($Mode -eq 'task') { $result.Cancelled } else { $result.Aborted }
@@ -61,16 +87,31 @@ function Test-ProcessCancellation([string]$Mode) {
         }
         "PASS $Mode process terminated within $elapsed ms after close"
     } finally {
-        $timer.Stop(); $timer.Dispose()
-        if ($owner) { $owner.Dispose(); Stop-DeviceScans }
-        # Broken cancellation must fail without leaving the fixture child running in CI.
-        if ($cancellation.Child) {
-            try {
-                if (-not $cancellation.Child.HasExited) {
-                    $cancellation.Child.Kill()
-                    [void]$cancellation.Child.WaitForExit(2000)
+        try {
+            $timer.Stop(); $timer.Dispose()
+            if ($owner) { $owner.Dispose(); Stop-DeviceScans }
+        } finally {
+            # Even an assertion or task teardown failure must not leave the fixture child alive.
+            if ($cancellation.Child) {
+                try {
+                    if (-not $cancellation.Child.HasExited) {
+                        $cancellation.Child.Kill()
+                        [void]$cancellation.Child.WaitForExit(2000)
+                    }
+                } finally {
+                    try {
+                        if ($EvidencePath) {
+                            $record = [pscustomobject]@{
+                                Phase='cleaned'; Mode=$Mode; Id=$cancellation.Child.Id
+                                StartTicks=$cancellation.Child.StartTime.ToUniversalTime().Ticks
+                                Exited=$cancellation.Child.HasExited
+                                TimeoutRemainingMs=$cancellation.TimeoutRemainingMs
+                            }
+                            [IO.File]::AppendAllText($EvidencePath, (($record | ConvertTo-Json -Compress) + [Environment]::NewLine))
+                        }
+                    } finally { $cancellation.Child.Dispose() }
                 }
-            } finally { $cancellation.Child.Dispose() }
+            }
         }
     }
 }
