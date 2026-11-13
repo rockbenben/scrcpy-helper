@@ -2845,7 +2845,7 @@ function Connect-ByIp {
             }
             [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" $body $out @('ok'))
         } elseif ($state -eq '') {
-            [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '手机没开「无线调试」或与电脑不在同一 WiFi：Android 11+ 去开发者选项里打开；更早的手机先插一次线，点「无线投屏 → 插数据线连接」切换。' $out @('ok'))
+            [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '手机没开「无线调试」或与电脑不在同一 Wi-Fi：Android 11+ 去开发者选项里打开；更早的手机先插一次线，点「无线投屏 → 插数据线连接」切换。' $out @('ok'))
         } else {
             [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '电脑上查询设备状态失败（adb 没返回设备列表），这次没有断开任何连接；请稍后重试。' $out @('ok'))
         }
@@ -3160,6 +3160,10 @@ function Show-DeviceManager {
 #     mv 后双向确认「新名在、旧名不在」才报成功，避免只读目录里误报。
 # 18) 下载用所选目录作为进程工作目录，adb 只接收 ASCII 相对暂存名，避免依赖盘符根目录权限。
 #     文件合并由后台任务执行，取消标志逐块检查；每个文件写完后才原子替换，保留取消时的原件。
+# 19) 覆盖授权仅记录确认框出现前已存在的具体目标路径，避免给整批或树形合并中新出现的冲突文件顺带授权；
+#     若下载或合并中途产生新冲突，会二次弹窗确认。
+# 20) 保存根目录通过句柄或 Target 解析实际物理路径，允许用户选择目录联接作为保存位置，但实际写入路径
+#     中的链接和上传目标链接仍逐级拦截；合并文件夹时仅跳过确认框列出的冲突子项，其余非冲突文件继续保存。
 
 # 设备端 sh 的单引号字面量：内部的 ' 用 '\'' 表示（闭合 + 转义单引号 + 重开）。
 function Fm-ShQuote {
@@ -3600,10 +3604,14 @@ function Fm-ConfirmOverwrite {
 # 目标已存在时保持 adb pull 原本的语义：同名文件覆盖，文件夹合并内容、绝不整目录删掉旧文件。
 # 写入前检查完整树，避免合并到一半才发现类型冲突或目录联接。
 # 保存根目录由用户明确选择，先通过句柄解析实际位置；其下的子路径仍逐级拒绝链接。
+# 在受限环境或特定 Windows 权限配置下，PowerShell 5.1 的 Add-Type/csc 可能会抛出权限异常；
+# 用 try/catch 保护并提供 Target 解析兜底，避免非管理员或管控环境在下载选目录时直接报错中断。
 function Get-FmSaveRoot {
     param([string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
     if (-not ('Native.FmPath' -as [type])) {
-        Add-Type -TypeDefinition @'
+        try {
+            Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
@@ -3630,10 +3638,29 @@ namespace Native {
     }
 }
 '@
+        } catch {}
     }
-    $root = [Native.FmPath]::Resolve([IO.Path]::GetFullPath($Path))
-    Assert-FmLocalPath $root
-    return $root
+    if ('Native.FmPath' -as [type]) {
+        try {
+            $root = [Native.FmPath]::Resolve($full)
+            Assert-FmLocalPath $root
+            return $root
+        } catch {}
+    }
+    $curr = $full
+    while ($true) {
+        $item = Get-Item -LiteralPath $curr -Force -ErrorAction SilentlyContinue
+        if ($item -and $item.Target) {
+            $target = [string]($item.Target | Select-Object -First 1)
+            if ($target) {
+                $curr = [IO.Path]::GetFullPath($target)
+                continue
+            }
+        }
+        break
+    }
+    Assert-FmLocalPath $curr
+    return $curr
 }
 function Test-FmOverwrite {
     param($Approved, [string]$Path)
@@ -4956,7 +4983,7 @@ try {
     $tt.SetToolTip($btnNd, '在电脑上单开一块屏运行某个 App，不影响手机（需 Android 11+）。')
     $tt.SetToolTip($btnShortcuts, 'scrcpy 常用快捷键速查（全屏、息屏、旋转、复制粘贴、拖文件装 APK 等）。')
     $tt.SetToolTip($btnSettings, '画质、声音、控制、窗口、独立窗口、录制等都可在这里自定义。')
-    $tt.SetToolTip($btnFiles, '浏览手机上的文件：上传、下载、新建文件夹、删除（直接走 ADB，不用装 App）。')
+    $tt.SetToolTip($btnFiles, '浏览手机上的文件：上传、下载、新建文件夹、重命名、删除（直接走 ADB，不用装 App）。')
     $tt.SetToolTip($btnDevices, '管理多台设备：切换、断开、设默认、忘记，或输入 IP 直连。')
     $tt.SetToolTip($lblStatus, '点击管理设备：切换 / 断开 / 输入 IP 连接（状态会在切回窗口时自动刷新）。')
 

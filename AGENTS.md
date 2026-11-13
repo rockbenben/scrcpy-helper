@@ -45,6 +45,7 @@ tests/                      # 无框架的文件管理回归，统一入口 run-
 - **别在 UI 线程上做长阻塞。** 执行命令走 `Invoke-ShortCommand` / `Invoke-Hidden` 并设置超时；耗时探测、连接、扫描走后台 runspace 队列（`Start-UiTask` / `Wait-UiTask` / `Start-DeviceScan`），支持取消且绝不在 worker 线程操作 UI 控件。
 - **主流程一律走 `Invoke-MainFlow`。** 它负责防重入、忙态配色、状态药丸和提示收尾；自己起流程就会漏掉这些，用户连点两次就跑两遍。
 - **`Get-DeviceList` 只回 `state=device` 的设备。** 要区分 `offline` / `unauthorized` 用 `Get-AdbDeviceState`。
+- **不要无保护裸调 `Add-Type`/`csc`。** 在非管理员、受限策略或缺少 `SeSecurityPrivilege` 的 Windows 环境下，.NET Framework 4.8（PowerShell 5.1）的 CodeDOM 会抛出权限异常。调用 Win32 原生 API 优先使用 Reflection.Emit（如 `Native.ShellEmit`）或加 `try/catch` 辅以原生回退（如 `Get-FmSaveRoot`），切勿让编译失败直接中断主流程。
 
 ## 4. 界面文案改了要同轮同步
 
@@ -69,7 +70,7 @@ $err = $null; $tok = $null
 $err | ForEach-Object { $_.Message }
 ```
 
-- 文件管理回归的统一入口是 `tests/run-file-manager-regression.ps1`，可分别用 `powershell -NoProfile -File tests/run-file-manager-regression.ps1` 和 `pwsh -NoProfile -File tests/run-file-manager-regression.ps1` 运行。CI 在这两个版本中均执行合并、逐项覆盖授权、链接保存目录与关窗取消回归。用例使用模拟 ADB、隔离文件和真实本地子进程，不连接手机；CI 通过只代表这些检查通过，实机验证仍按改动范围执行。
+- 文件管理回归的统一入口是 `tests/run-file-manager-regression.ps1`，可分别用 `powershell -NoProfile -File tests/run-file-manager-regression.ps1` 和 `pwsh -NoProfile -File tests/run-file-manager-regression.ps1` 运行。CI 在这两个版本中均执行合并、传输、逐项覆盖授权、链接保存目录、关窗取消、超时余量负向回归与故障注入突变回归（mutation）。用例使用模拟 ADB、隔离文件和真实本地子进程，不连接手机；CI 通过只代表这些检查通过，实机验证仍按改动范围执行。
 
 ## 6. 工作树与提交
 
