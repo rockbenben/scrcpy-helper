@@ -410,13 +410,14 @@ function Cancel-OwnerTasks {
     }
 }
 function Wait-UiTask {
-    param($Owner, [scriptblock]$Work, [hashtable]$Inputs = @{}, [string[]]$Functions = @(), [string]$Kind='operation')
+    param($Owner, [scriptblock]$Work, [hashtable]$Inputs = @{}, [string[]]$Functions = @(),
+          [string]$Kind='operation', [string]$StatusText='正在处理，请稍候…')
     if ($script:deviceScanState.Closing -or ($Owner -and $Owner.IsDisposed)) {
         return [pscustomobject]@{ Success = $false; Cancelled = $true; Error = '操作已取消' }
     }
     $box = @{ Completed = $false; InsideClosing=$false; Result = [pscustomobject]@{ Success = $false; Cancelled = $true; Error = '操作已取消' } }
-    $wait = New-Dialog '正在处理，请稍候…' 280 100 $Owner
-    $wait.Controls.Add((New-Lbl '正在处理，请稍候…' 16 14))
+    $wait = New-Dialog $StatusText 280 100 $Owner
+    $wait.Controls.Add((New-Lbl $StatusText 16 14))
     $cancel = New-SecondaryBtn '取消' 174 52 90 32
     $cancel.Add_Click({ $wait.Close() }.GetNewClosure())
     $wait.Controls.Add($cancel)
@@ -452,13 +453,14 @@ function Wait-UiTask {
 # 手动刷新只查询当前设备，保留等待框的取消结果和后台扫描的错误信息。
 function Wait-DeviceScan {
     param($Owner)
-    return (Wait-UiTask -Owner $Owner -Inputs @{ Adb=$adb } -Work {
+    return (Wait-UiTask -Owner $Owner -StatusText '正在读取设备列表…' -Inputs @{ Adb=$adb } -Work {
         Invoke-DeviceScan -AdbPath $Inputs.Adb -Candidates @() -ConnectAlways $false -InfoCache $InfoCache -Control $Control
     })
 }
 function Invoke-UiCommand {
-    param($Owner, [string]$FilePath, [string[]]$ArgumentList = @(), [int]$TimeoutMs = 15000)
-    return (Wait-UiTask -Owner $Owner -Inputs @{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMs = $TimeoutMs } -Work {
+    param($Owner, [string]$FilePath, [string[]]$ArgumentList = @(), [int]$TimeoutMs = 15000,
+          [string]$StatusText='正在处理，请稍候…')
+    return (Wait-UiTask -Owner $Owner -StatusText $StatusText -Inputs @{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMs = $TimeoutMs } -Work {
         Invoke-ShortCommand -FilePath $Inputs.FilePath -ArgumentList $Inputs.ArgumentList -TimeoutMs $Inputs.TimeoutMs -Control $Control
     })
 }
@@ -511,7 +513,7 @@ function Invoke-ConnectDevices {
 }
 function Connect-DevicesUi {
     param($Owner,[string[]]$Addresses,[switch]$Probe)
-    Wait-UiTask -Owner $Owner -Functions @('Invoke-ConnectDevices','Test-CommandSuccess','Get-CommandDetail','Get-AdbDeviceState') -Inputs @{
+    Wait-UiTask -Owner $Owner -StatusText '正在连接无线设备…' -Functions @('Invoke-ConnectDevices','Test-CommandSuccess','Get-CommandDetail','Get-AdbDeviceState') -Inputs @{
         Adb = $adb; Addresses = $Addresses; Probe = [bool]$Probe
     } -Work {
         Invoke-ConnectDevices -Adb $Inputs.Adb -Addresses $Inputs.Addresses -Probe:$Inputs.Probe -Control $Control
@@ -691,9 +693,10 @@ function Stop-DevicesUi {
     $forcedRecording=$false
     $recordingError=$false
     $result=[pscustomobject]@{ Success=$false; Cancelled=$true; Error='' }
+    $stopText = if ($Disconnect) { '正在停止投屏并断开无线…' } else { '正在停止投屏和录制…' }
     try {
         do {
-            $result=Wait-UiTask -Owner $Owner -Kind $(if ($ForExit) { 'shutdown' } else { 'operation' }) -Functions @(
+            $result=Wait-UiTask -Owner $Owner -StatusText $stopText -Kind $(if ($ForExit) { 'shutdown' } else { 'operation' }) -Functions @(
                 'Invoke-StopItems','Stop-ScrcpyGraceful','Wait-ScrcpyExit','Test-ProcessExited','Test-CommandSuccess','Get-CommandDetail'
             ) -Inputs @{ Items=$pending; Adb=$adb; Disconnect=$addresses; Force=$force } -Work {
                 Invoke-StopItems $Inputs.Items $Inputs.Adb $Inputs.Disconnect $Control -Force:$Inputs.Force
@@ -710,7 +713,11 @@ function Stop-DevicesUi {
             if ($result.Cancelled) { break }
             $pending=@($Items | Where-Object { -not (Test-ProcessExited $_.Proc) })
             if ($pending.Count -eq 0) {
-                if (-not $result.Success) { [void](Show-ResultDialog $Owner '停止投屏' '操作未完成' '可以稍后重试。' $result.Error @('ok')) }
+                if (-not $result.Success) {
+                    $heading = if ($Disconnect) { '无线连接未能断开' } else { '未能确认停止结果' }
+                    $body = if ($result.Error) { '可点「查看原因」查看错误详情。' } else { '请在「设备管理」重新查看设备状态。' }
+                    [void](Show-ResultDialog $Owner '停止投屏' $heading $body $result.Error @('ok'))
+                }
                 break
             }
             $detail=(@($pending | ForEach-Object { "设备：$($_.Serial)" }) -join "`n")
@@ -797,7 +804,7 @@ function Request-AppClose {
         $stopped=Stop-AllScrcpy $Owner
         if (-not $stopped.Success) { return }
         if ($settings.disconnectOnClose -and $addresses.Count) {
-            $disconnected=Wait-UiTask -Owner $Owner -Kind 'shutdown' -Functions @(
+            $disconnected=Wait-UiTask -Owner $Owner -StatusText '正在断开无线设备…' -Kind 'shutdown' -Functions @(
                 'Invoke-ExitDisconnect','Test-CommandSuccess','Get-CommandDetail'
             ) -Inputs @{ Adb=$adb; Addresses=$addresses } -Work {
                 Invoke-ExitDisconnect $Inputs.Adb $Inputs.Addresses $Control
@@ -1224,7 +1231,7 @@ function Get-CameraSizes {
     $result = @{ back = @(); front = @(); zoom = @{ back = $null; front = $null }; ids = @{ back=$null; front=$null } }
     try {
         $argv = @(); if ($serial) { $argv += @('-s', $serial) }; $argv += '--list-camera-sizes'
-        $command=Invoke-UiCommand $Owner $exe $argv
+        $command=Invoke-UiCommand $Owner $exe $argv -StatusText '正在读取手机摄像头信息…'
         if ($command.Cancelled) { return $null }
         $out=if (Test-CommandSuccess $command) { $command.Stdout + "`n" + $command.Stderr } else { '' }
     } catch { return $result }
@@ -1280,7 +1287,7 @@ function Get-DeviceDisplay {
     try {
         $szArgs = @(); if ($serial) { $szArgs += @('-s', $serial) }; $szArgs += @('shell', 'wm', 'size')
         $dnArgs = @(); if ($serial) { $dnArgs += @('-s', $serial) }; $dnArgs += @('shell', 'wm', 'density')
-        $outputs=Wait-UiTask -Owner $form -Inputs @{ Adb=$adb; Size=$szArgs; Density=$dnArgs } -Work {
+        $outputs=Wait-UiTask -Owner $form -StatusText '正在读取手机屏幕尺寸…' -Inputs @{ Adb=$adb; Size=$szArgs; Density=$dnArgs } -Work {
             $size=Invoke-ShortCommand $Inputs.Adb $Inputs.Size -TimeoutMs 7000 -Control $Control
             $density=Invoke-ShortCommand $Inputs.Adb $Inputs.Density -TimeoutMs 7000 -Control $Control
             [pscustomobject]@{ Size=$size; Density=$density }
@@ -1433,21 +1440,31 @@ function Start-Scrcpy {
     # Windows 版自带的「Press Enter to continue…」暂停——进程卡着不退、还冒出黑窗，看门狗误判成异常又反复重开。
     # 两道一起下才干净：① -RedirectStandardInput 指到一个空文件 → scrcpy 那次 getchar 立刻读到 EOF，不等回车；
     # ② -WindowStyle Hidden → 不弹控制台窗。stderr 落文件由 OS 直接写（不占管道缓冲，避免 scrcpy 刷不动 stderr 卡死）。
-    # 普通投屏路径(elseif/else 分支)是 ShellExecute：若 scrcpy.exe 还带「网络来源」标记、SmartScreen 弹窗被用户取消，
-    # Start-Process 会抛 ERROR_CANCELLED「操作已被用户取消」。这里提示用户自行确认来源并放行：
-    # 万一仍被拦下并取消，给句人话提示而不是让异常冒成崩溃窗/静默无反应。摄像头带 -RedirectStandardError 那支是 UseShellExecute=$false，不触发。
+    # 让 Start-Process 的错误进入结果弹窗，保留 Windows 返回的原因（如找不到程序或取消了系统提示）。
     $p = $null
     try {
         $winStyle = if ($settings.showConsole) { 'Normal' } else { 'Hidden' }
         # StdoutFile 只有摄像头会话传：scrcpy 的 INFO 级日志（含每次变焦的 "Set camera zoom: 3.16"）走的是 stdout，
         # ERROR/WARN 才走 stderr——两路分开落两个文件，看门狗读 stderr 判病因，倍率回传读 stdout。
-        $p = if ($cmd -and $StderrFile -and $StdoutFile) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru -RedirectStandardError $StderrFile -RedirectStandardOutput $StdoutFile -RedirectStandardInput (Get-NulStdin) -WindowStyle $winStyle }
-        elseif ($cmd -and $StderrFile) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru -RedirectStandardError $StderrFile -RedirectStandardInput (Get-NulStdin) -WindowStyle $winStyle }
-        elseif ($cmd) { Start-Process -FilePath $exe -ArgumentList $cmd -WorkingDirectory $PSScriptRoot -PassThru -WindowStyle $winStyle}
-        else { Start-Process -FilePath $exe -WorkingDirectory $PSScriptRoot -PassThru -WindowStyle $winStyle }
+        $launch = @{ FilePath=$exe; WorkingDirectory=$PSScriptRoot; PassThru=$true; WindowStyle=$winStyle; ErrorAction='Stop' }
+        if ($cmd) { $launch.ArgumentList = $cmd }
+        if ($cmd -and $StderrFile) {
+            $launch.RedirectStandardError = $StderrFile
+            $launch.RedirectStandardInput = Get-NulStdin
+            if ($StdoutFile) { $launch.RedirectStandardOutput = $StdoutFile }
+        }
+        $p = Start-Process @launch
     } catch {
-        if ($script:showTempHint) { & $script:showTempHint '投屏被安全提示拦下：点弹窗里「更多信息」>「仍要运行」' $cRed 12000 }
-        try { $lp = Join-Path $PSScriptRoot '投屏助手-错误日志.txt'; Add-Content -LiteralPath $lp -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Start-Scrcpy 启动失败: $($_.Exception.Message)`r`n" -Encoding UTF8 } catch {}
+        $detail = $_.Exception.Message
+        # 摄像头看门狗也走这个入口，启动失败时不能用对话框阻塞自动重连回调。
+        if ($StderrFile -and $StdoutFile) {
+            $logged = Add-ErrorLog '摄像头启动失败' $detail
+            $hint = if ($logged) { '无法启动摄像头，请查看「投屏助手-错误日志.txt」。' }
+                else { '无法启动摄像头，请核对 scrcpy 路径。' }
+            if ($script:showTempHint) { & $script:showTempHint $hint $cRed 12000 }
+        } else {
+            [void](Show-ResultDialog $form '投屏' '无法启动投屏' '先点「查看原因」看详情。如果提示找不到程序，请检查压缩包是否已完整解压。' $detail @('ok'))
+        }
         return
     }
     # Audio=本会话是否在电脑上出声（被自动静音的新会话记 false，供后续同设备会话判定「是否已有出声窗口」）
@@ -1463,7 +1480,7 @@ function Start-Scrcpy {
         if ($script:showTempHint) { & $script:showTempHint '正在打开投屏窗口…' $cMuted $null; $script:hintHeld = $true }
         if ((Wait-ScrcpyWindow $p $winTitle) -ne 'exited') { return }
         $code = try { $p.ExitCode } catch { '未知' }
-        [void](Show-ResultDialog $form '投屏' '投屏窗口没能打开' '多半是数据线松了、手机刚锁屏，或这台正被别的地方占用。重新插一下、点亮屏幕再点一次；反复如此的话，到「设置 > 常用」勾「显示 scrcpy 控制台窗口」，就能看到具体原因。' ("命令：scrcpy.exe $cmd`r`n退出码：$code") @('ok'))
+        [void](Show-ResultDialog $form '投屏' '投屏窗口没能打开' '投屏在窗口打开前就结束了。到「设置 > 常用」勾选「显示投屏日志窗口」，保存后再投一次，就能看到报错。' ("命令：scrcpy.exe $cmd`r`n退出码：$code") @('ok'))
     } finally { $entry.Starting=$false }
 }
 
@@ -1533,7 +1550,7 @@ function Resume-CameraSession {
     Release-ExitedProcess $previous
     $Session.Proc=Start-CamProc $Session.Args $Session.ErrFile $Session.OutFile -ReconnectCameraZoom $Session.LastZoom
     $Session.StartedAt=Get-Date
-    if ($Session.Proc) { & $script:showTempHint '摄像头被亮屏打断，已自动重连；关窗即停' $cGreen }
+    if ($Session.Proc) { & $script:showTempHint '摄像头已自动重连。关闭摄像头窗口可停止。' $cGreen }
 }
 
 # 从 scrcpy 的 stdout 日志里取「最后一次生效的倍率」：投屏中每按一下 MOD+↑/↓ 都会打一行 "Set camera zoom: 3.1640973"。
@@ -1664,7 +1681,7 @@ function Get-AdbDeviceState {
     param($addr, [string]$DeviceText, [switch]$FromText)
     if (-not $addr) { return $null }
     if (-not $FromText) {
-        $command=Invoke-UiCommand $form $adb @('devices') -TimeoutMs 3000
+        $command=Invoke-UiCommand $form $adb @('devices') -TimeoutMs 3000 -StatusText '正在读取设备列表…'
         if (-not (Test-CommandSuccess $command)) { return $null }
         $DeviceText=$command.Stdout
     }
@@ -1700,7 +1717,7 @@ function Get-DevInfo {
     if ($CachedOnly) { return @{ Ver=0; Text='' } }
     $ver = 0; $txt = ''
     try {
-        $props=Wait-UiTask -Owner $form -Inputs @{ Adb=$adb; Serial=$serial } -Work {
+        $props=Wait-UiTask -Owner $form -StatusText '正在读取手机型号和版本…' -Inputs @{ Adb=$adb; Serial=$serial } -Work {
             $version=Invoke-ShortCommand $Inputs.Adb @('-s',$Inputs.Serial,'shell','getprop','ro.build.version.release') -TimeoutMs 7000 -Control $Control
             $model=Invoke-ShortCommand $Inputs.Adb @('-s',$Inputs.Serial,'shell','getprop','ro.product.model') -TimeoutMs 7000 -Control $Control
             [pscustomobject]@{ Version=$version; Model=$model }
@@ -2074,58 +2091,58 @@ function Show-Settings {
     # 顺序按使用度：人人都调的清晰度/声音在前，只无线用户才碰的两项次之，调试用的控制台沉到最后
     $nudSize = New-Nud $settings.maxSize 0 4096 16 110 13
     $chkAudio = New-Chk '把手机声音也传到电脑' $settings.audioOn 14 46
-    $chkStay = New-Chk '保持手机唤醒（避免锁屏 / 无线中途断开）' $settings.stayAwake 14 74
-    $chkScreenOff = New-Chk '投屏时关闭手机屏幕（省电、防偷看）' $settings.screenOff 14 102
-    $chkReconnect = New-Chk '自动连接记住的无线设备（开机自动连附近的 · 掉线自动重连）' $settings.autoConnect 14 130
-    $chkDisconnect = New-Chk '关闭助手时断开无线连接（默认保持，重开即用）' $settings.disconnectOnClose 14 158
-    $chkShowConsole = New-Chk '显示 scrcpy 控制台窗口（调试用，会弹黑窗）' $settings.showConsole 14 186
-    $tt.SetToolTip($nudSize, '画面最大边长（像素）。数值越大越清晰、越小越流畅；0=不限制。')
-    $tt.SetToolTip($chkAudio, '取消勾选则完全不传声音（等同 --no-audio）。')
-    $tt.SetToolTip($chkStay, '保持手机不锁屏，避免无线投屏中途断开。想更省电可关掉，让手机自然休眠。')
-    $tt.SetToolTip($chkScreenOff, '投屏时关掉手机屏幕，明显省电、还能防偷看（投屏照常进行）。无线投屏想省电首选它。')
-    $tt.SetToolTip($chkReconnect, '助手启动时尝试连接附近记住的无线设备，掉线后尝试连回。会跳过标记「不自动连」的设备。会略增耗电，按需开启。')
-    $tt.SetToolTip($chkDisconnect, '不勾（默认）：关掉助手后仍保持手机连接，重开即用、几乎不耗电。勾上：关助手时定向断开助手记住或启动过的无线设备。若提示「无线连接未全部断开」，可查看「断开失败」和「尚未处理」的设备，再选「仍然退出」或「取消」。')
-    $tt.SetToolTip($chkShowConsole, '勾上后投屏时会弹出一个黑色控制台窗口，里面显示 scrcpy 的运行日志。默认关闭，不影响正常使用。')
+    $chkStay = New-Chk '投屏时保持手机唤醒' $settings.stayAwake 14 74
+    $chkScreenOff = New-Chk '开始投屏时熄灭手机屏幕' $settings.screenOff 14 102
+    $chkReconnect = New-Chk '自动重连已记住的无线设备' $settings.autoConnect 14 130
+    $chkDisconnect = New-Chk '关闭助手时断开无线连接' $settings.disconnectOnClose 14 158
+    $chkShowConsole = New-Chk '显示投屏日志窗口' $settings.showConsole 14 186
+    $tt.SetToolTip($nudSize, '按比例缩小投屏画面，最长的一边不超过这个像素数。0=不限制。投屏卡顿时可试 1280。')
+    $tt.SetToolTip($chkAudio, '适用于普通投屏和屏幕录制。需要 Android 11+。Android 11 请先解锁手机再开始。')
+    $tt.SetToolTip($chkStay, '投屏时防止手机因长时间没操作而休眠。手机仍可手动锁屏。')
+    $tt.SetToolTip($chkScreenOff, '开始投屏时熄灭手机屏幕，电脑画面继续显示。按手机电源键或在投屏窗口按左 Alt+Shift+O 点亮。')
+    $tt.SetToolTip($chkReconnect, '打开助手时尝试连回记住的手机。手机掉线后也会尝试重连。')
+    $tt.SetToolTip($chkDisconnect, '想在退出时顺便断开助手记住或使用过的无线设备，就勾选这项。')
+    $tt.SetToolTip($chkShowConsole, '保存后重新投屏，就能看到日志窗口。投屏打不开时可在这里看报错。')
     $tabCommon.Controls.AddRange(@(
-        (New-Lbl '清晰度：' 14 16), $nudSize, (New-Caption '越大越清晰，0=不限制' 210 19),
+        (New-Lbl '清晰度：' 14 16), $nudSize, (New-Caption '像素，0=不限制' 210 19),
         $chkAudio, $chkStay, $chkScreenOff, $chkReconnect, $chkDisconnect, $chkShowConsole))
 
     # ===== 画面 =====
     $tabVideo = New-Object System.Windows.Forms.Panel
     $nudFps  = New-Nud $settings.maxFps  0 240 5  110 16
     $nudBit  = New-Nud $settings.bitRate 0 50  1  110 52
-    $cbVCodec = New-Combo @('默认（H.264，兼容最好）', 'H.265（更清晰）', 'AV1（更省流量）', 'VP8（兜底）', 'VP9（兜底）') @('', 'h265', 'av1', 'vp8', 'vp9') $settings.videoCodec 110 88 230
+    $cbVCodec = New-Combo @('默认（H.264，兼容最好）', 'H.265', 'AV1', 'VP8', 'VP9') @('', 'h265', 'av1', 'vp8', 'vp9') $settings.videoCodec 110 88 230
     $txtCrop = New-Txt 110 124 230
     $txtCrop.Text = $settings.crop
-    $chkIgnoreEnc = New-Chk '忽略编码器分辨率限制（分辨率或独立窗口画面不对时再勾）' $settings.ignoreEncoderConstraints 14 184
-    $tt.SetToolTip($chkIgnoreEnc, '高级兜底：某些机型上报的编码器限制值不准，导致分辨率或独立窗口画面不对。勾上让 scrcpy 完全忽略这些限制（含对齐要求）。一般不用勾。需 scrcpy 4.1+。')
-    $cbHwDec = New-Combo @('自动（用显卡解码，省电脑性能）', '软件解码（画面不对时再选）') @('', 'disabled') $settings.hwDec 110 217 230
-    $tt.SetToolTip($cbHwDec, '电脑怎么把收到的画面还原出来。自动=优先让显卡干活，CPU 占用能低一个数量级、笔记本更省电，显卡干不了会自动改用 CPU。要是投屏出现花屏、偏色或整块变黑，改成「软件解码」再投，就能排除显卡的兼容问题；它更吃 CPU，平时不用选。')
-    $tt.SetToolTip($nudFps, '每秒帧数上限。0=用默认；填 60 更顺滑、填 30 更省资源。')
-    $tt.SetToolTip($nudBit, '视频码率（Mbps）。越高越清晰越占带宽；0=用默认（约 8M）。无线卡顿可调小。')
-    $tt.SetToolTip($cbVCodec, 'H.265/AV1 同等清晰度更省带宽，但老机型/老电脑可能不支持，卡顿就换回 H.264。VP8/VP9 仅当机型这几种都不支持时才用作兜底；选 VP8 / VP9 编码，或开启音频并选原始 PCM 时，录屏使用 mkv。')
-    $tt.SetToolTip($txtCrop, '只投屏幕的一块区域。格式 宽:高:左:上（像素），例如 1080:1080:0:300。不填=投整屏。')
+    $chkIgnoreEnc = New-Chk '忽略画面尺寸限制（高级）' $settings.ignoreEncoderConstraints 14 184
+    $tt.SetToolTip($chkIgnoreEnc, '画面比设定的尺寸小很多时可以试试。若开启后投屏打不开，关掉再试。')
+    $cbHwDec = New-Combo @('自动（推荐）', '软件解码') @('', 'disabled') $settings.hwDec 110 217 230
+    $tt.SetToolTip($cbHwDec, '平时选「自动」即可。遇到花屏、偏色或黑屏时，可换「软件解码」再试。')
+    $tt.SetToolTip($nudFps, '每秒最多更新多少次画面。0=不限制。正看静止画面时，实际更新次数会更少。')
+    $tt.SetToolTip($nudBit, '数字越高，画面通常越清楚，也更占网速。0=用默认（8 Mbps）。无线投屏卡顿时可试 4 Mbps。')
+    $tt.SetToolTip($cbVCodec, '平时用默认的 H.264。改过后如果投屏打不开或变卡，可以先换回默认。')
+    $tt.SetToolTip($txtCrop, '按设备的自然方向填写宽:高:左:上（像素）。手机通常以竖屏为准，例如 1080:1080:0:300。不填=投整屏。')
     $tabVideo.Controls.AddRange(@(
-        (New-Lbl '帧率：' 14 19), $nudFps, (New-Caption '越高越流畅，0=默认' 210 21),
-        (New-Lbl '画质：' 14 55), $nudBit, (New-Caption '越高越清晰，0=默认' 210 57),
+        (New-Lbl '帧率：' 14 19), $nudFps, (New-Caption '帧/秒，0=不限制' 210 21),
+        (New-Lbl '画质：' 14 55), $nudBit, (New-Caption '越高越占网速，0=用默认' 210 57),
         (New-Lbl '视频编码：' 14 91), $cbVCodec,
         (New-Lbl '裁剪画面：' 14 127), $txtCrop,
         (New-Caption '宽:高:左:上，不填=投整屏。例 1080:1080:0:300' 110 156),
         $chkIgnoreEnc,
         (New-Lbl '解码方式：' 14 220), $cbHwDec,
-        (New-Caption '画面花屏、偏色或整块变黑时，改成「软件解码」再投一次' 110 249)))
+        (New-Caption '花屏或偏色时，可换软件解码再试' 110 249)))
 
     # ===== 声音 =====
     $tabAudio = New-Object System.Windows.Forms.Panel
-    $cbASrc = New-Combo @('手机外放声音', '麦克风') @('', 'mic') $settings.audioSource 110 73 230
+    $cbASrc = New-Combo @('手机正在播放的声音', '手机麦克风') @('', 'mic') $settings.audioSource 110 73 230
     $cbACodec = New-Combo @('默认（Opus）', 'AAC（兼容）', 'FLAC（无损）', '原始 PCM') @('', 'aac', 'flac', 'raw') $settings.audioCodec 110 111 230
     # 主开关在「常用」类里也有一个：两处勾选框同时存在，状态必须互相同步，否则保存时后读的会把先改的抹掉
     $chkAudio2 = New-Chk '把手机声音也传到电脑' $settings.audioOn 14 18
     $chkAudio2.Add_CheckedChanged({ $chkAudio.Checked = $chkAudio2.Checked }.GetNewClosure())
     $chkAudio.Add_CheckedChanged({ $chkAudio2.Checked = $chkAudio.Checked }.GetNewClosure())
-    $lblAudioTip = New-Caption '不勾就完全不出声。下面两项只在勾选时生效：' 14 46
-    $tt.SetToolTip($cbASrc, '「手机外放声音」把手机正在播放的声音传到电脑；「麦克风」采集手机话筒，适合当摄像头/直播。')
-    $tt.SetToolTip($cbACodec, '一般保持默认即可；个别播放器不出声时可改 AAC。')
+    $lblAudioTip = New-Caption '需 Android 11+。Android 11 请先解锁手机再开始。' 14 46
+    $tt.SetToolTip($cbASrc, '想听手机里正在播放的内容，选第一项，声音会改从电脑播放。想收周围的声音，选「手机麦克风」。')
+    $tt.SetToolTip($cbACodec, '默认使用 Opus。若录屏文件在播放器里没有声音，可选 AAC 后重新录制。选原始 PCM 时录屏使用 mkv。')
     $tabAudio.Controls.AddRange(@(
         $lblAudioTip,
         $chkAudio2,
@@ -2134,20 +2151,21 @@ function Show-Settings {
 
     # ===== 控制 =====
     $tabCtrl = New-Object System.Windows.Forms.Panel
-    $cbKb = New-Combo @('默认（推荐，能打中文）', '游戏模式（更跟手，用不了电脑输入法）', 'USB 直连（特殊情况）') @('', 'uhid', 'aoa') $settings.keyboard 110 13 300
-    $cbMouse = New-Combo @('默认（推荐）', '游戏模式（更跟手）', 'USB 直连（特殊情况）') @('', 'uhid', 'aoa') $settings.mouse 110 89 300
+    $cbKb = New-Combo @('默认（推荐）', '模拟实体键盘', 'USB 直连（只控制）') @('', 'uhid', 'aoa') $settings.keyboard 110 13 300
+    $cbMouse = New-Combo @('默认（推荐）', '模拟实体鼠标', 'USB 直连（只控制）') @('', 'uhid', 'aoa') $settings.mouse 110 89 300
     # 顺序按使用度：键鼠模式在前，常用的「只投屏」「关窗息屏」次之，niche 的触摸点 / 手柄沉底
     $chkNoCtrl = New-Chk '只投屏，不允许控制手机' $settings.noControl 14 126
     $chkPowerOff = New-Chk '结束投屏后熄灭手机屏幕' $settings.powerOffOnClose 14 154
     $chkTouches = New-Chk '显示触摸点' $settings.showTouches 14 182
     $chkGamepad = New-Chk '启用手柄（把电脑手柄映射到手机）' $settings.gamepad 14 210
-    $tt.SetToolTip($chkTouches, '手机画面上触点处显示小白点，演示时让别人看清你点了哪里。')
-    $tt.SetToolTip($cbKb, '绝大多数人选「默认」即可，能正常用电脑上的中文输入法。「游戏模式」让电脑键盘像真键盘一样直接控制游戏，但用不了电脑输入法——想打字就改用手机屏幕上的输入法。装过 ADBKeyboard 这类输入法时可在手机上正常打字。')
+    $tt.SetToolTip($chkTouches, '在画面中标出手指实际触摸手机的位置。')
+    $tt.SetToolTip($cbKb, '中文可以用 Ctrl+V 粘贴。想用手机输入法打字，可选「模拟实体键盘」。投屏时请选前两项。')
+    $tt.SetToolTip($cbMouse, '平时选「默认」。使用「模拟实体鼠标」后，按左 Alt 或左 Win 可把鼠标指针切回电脑。投屏时请选前两项。')
     $tt.SetToolTip($chkNoCtrl, '只看画面、禁止鼠标键盘操作手机；保持唤醒、投屏关屏、显示触摸点和关窗息屏暂不生效。开启「只投屏，不允许控制手机」时，独立窗口不可用。')
     $tt.SetToolTip($chkPowerOff, '结束投屏（关掉投屏窗口）时，顺手把手机屏幕熄灭，省电、防亮屏。')
-    $tt.SetToolTip($chkGamepad, '把连在电脑上的游戏手柄映射给手机，适合手游。')
+    $tt.SetToolTip($chkGamepad, '把接到电脑的手柄用在手机上。游戏也得支持手柄。')
     # 说明紧跟「键盘模式」，两行封顶：离得远用户不知道它讲的是哪一项，长段落还会折出孤儿字
-    $capKbCn = New-Caption "打不进中文？电脑里复制好，到投屏窗口按 Ctrl+V 粘贴。`n或选「游戏模式」，改用手机自己的输入法打字。" 14 44
+    $capKbCn = New-Caption "中文可用 Ctrl+V 粘贴。`n也可选「模拟实体键盘」，用手机输入法打字。" 14 44
     $capKbCn.MaximumSize = New-Object System.Drawing.Size(396, 0)   # 不限宽会裁出面板右缘；窄于 396 第一行就折出孤儿字
     $tabCtrl.Controls.AddRange(@(
         (New-Lbl '键盘模式：' 14 16), $cbKb,
@@ -2171,8 +2189,8 @@ function Show-Settings {
     $cbNdSize = New-Object System.Windows.Forms.ComboBox
     $cbNdSize.DropDownStyle = 'DropDown'
     $cbNdSize.Location = New-Object System.Drawing.Point(110, 15); $cbNdSize.Size = New-Object System.Drawing.Size(200, 26)
-    @('跟手机一致', '1280x720', '1600x900', '1920x1080') | ForEach-Object { [void]$cbNdSize.Items.Add($_) }
-    $cbNdSize.Text = if ($settings.ndSize) { $settings.ndSize } else { '跟手机一致' }
+    @('自动', '1280x720', '1600x900', '1920x1080') | ForEach-Object { [void]$cbNdSize.Items.Add($_) }
+    $cbNdSize.Text = if ($settings.ndSize) { $settings.ndSize } else { '自动' }
     $ndDpiLabels = @('自动', '小', '中', '大')
     $ndDpiValues = @('', '160', '240', '320')
     $ndDpiCurrent = [string]$settings.ndDpi
@@ -2182,13 +2200,13 @@ function Show-Settings {
         $ndDpiValues += $ndDpiCurrent
     }
     $cbNdDpi = New-Combo $ndDpiLabels $ndDpiValues $ndDpiCurrent 110 73 110
-    $chkNoDecor = New-Chk '隐藏独立窗口顶部的手机状态栏' $settings.ndNoDecor 14 110
-    $tt.SetToolTip($cbNdSize, '独立窗口（虚拟显示器）的分辨率。可直接输入自定义值，如 2560x1440。')
-    $tt.SetToolTip($cbNdDpi, '虚拟屏里界面元素的大小。手机 App 显示太大就选「小」。已保存的自定义 DPI 会保留在选项中。')
-    $tt.SetToolTip($chkNoDecor, '独立窗口顶部不再显示时间/电量那一条，App 内容顶到边；隐藏后通知栏也拉不出来。')
+    $chkNoDecor = New-Chk '隐藏独立窗口的系统栏' $settings.ndNoDecor 14 110
+    $tt.SetToolTip($cbNdSize, '一般选「自动」即可。需要指定尺寸时，可输入宽和高，例如 2560x1440。')
+    $tt.SetToolTip($cbNdDpi, '调节独立窗口里的字和按钮大小。显示太大时选「小」。')
+    $tt.SetToolTip($chkNoDecor, '隐藏独立窗口里的时间、电量和底部导航栏。想恢复时，取消勾选并重开窗口。')
     $tabNd.Controls.AddRange(@(
         (New-Lbl '分辨率：' 14 18), $cbNdSize,
-        (New-Caption '可直接输入，如 2560x1440；不填=跟手机一致' 110 46),
+        (New-Caption '可直接输入，如 2560x1440。不填=自动。' 110 46),
         (New-Lbl '界面缩放：' 14 76), $cbNdDpi,
         $chkNoDecor))
 
@@ -2197,9 +2215,9 @@ function Show-Settings {
     $cbRecFmt = New-Combo @('mp4', 'mkv') @('mp4', 'mkv') $settings.recFormat 110 15 110
     $nudTime = New-Nud $settings.recTimeLimit 0 86400 10 110 77
     $chkRecBg = New-Chk '后台录制（不显示画面，更省资源）' $settings.recBackground 14 114
-    $tt.SetToolTip($nudTime, '到达该秒数自动停止录制。0=不限时，手动关窗即停。')
+    $tt.SetToolTip($nudTime, '到达指定秒数自动停止录制。0=不限时。后台录制请在「设备管理」选中设备后点「停止投屏」。')
     $tt.SetToolTip($cbRecFmt, 'mp4 通用好打开；mkv 更稳——录制中途若被强退，mp4 可能整段丢失，mkv 一般能保住已录部分。')
-    $tt.SetToolTip($chkRecBg, '勾选后录制时不弹出投屏窗口，画面只写入文件，更省 CPU。')
+    $tt.SetToolTip($chkRecBg, '录制时电脑不显示画面、不播放声音。已开启且能采集的声音仍会写入录屏文件。')
     $tabRec.Controls.AddRange(@(
         (New-Lbl '保存格式：' 14 18), $cbRecFmt,
         (New-Caption 'mp4 好打开；担心中途被强退丢整段，选 mkv 更稳' 110 46),
@@ -2212,11 +2230,11 @@ function Show-Settings {
     $txtExtra = New-Txt 14 78 392
     $txtExtra.Text = $settings.extraArgs
     $lblExHint = New-Lbl '例如：--angle=90   --display-id=1   --time-limit=300' 14 108; $lblExHint.ForeColor = $cMuted
-    $tt.SetToolTip($chkLive, '开启后，窗口在前台时会定时刷新顶部的连接状态。切回窗口时也会刷新一次。')
+    $tt.SetToolTip($chkLive, '切回主界面会更新连接状态。开启自动刷新或无线重连后，主界面在最前面时也会定时检查。')
     $tt.SetToolTip($txtExtra, '高级用法（可选，一般不用填）：在这里追加 scrcpy 命令行参数，参数之间用空格分隔。含空格的值用双引号包住，例如 --window-title="Living Room"。')
 
     # 自定义 adb / scrcpy 路径（留空=用本助手同目录自带的）
-    $lblPathHdr = New-Lbl '自定义 adb / scrcpy 路径（不填=用自带的）：' 14 150; $lblPathHdr.ForeColor = $cMuted
+    $lblPathHdr = New-Lbl '自定义 adb / scrcpy 路径（可选）' 14 150; $lblPathHdr.ForeColor = $cMuted
     $lblAdbCap = New-Lbl 'adb' 14 181
     $txtAdbPath = New-Txt 66 177 248
     $txtAdbPath.Text = $settings.adbPath
@@ -2265,7 +2283,7 @@ function Show-Settings {
     $btnCancel.Add_Click({ $dlg.Close() })
     $btnSave.Add_Click({
         $ndText = $cbNdSize.Text.Trim()
-        if ($ndText -and $ndText -ne '跟手机一致' -and $ndText -notmatch '^\d{3,4}x\d{3,4}$') {
+        if ($ndText -and $ndText -ne '自动' -and $ndText -notmatch '^\d{3,4}x\d{3,4}$') {
             [System.Windows.Forms.MessageBox]::Show('独立窗口分辨率格式应为 宽x高，例如 1920x1080。', '设置') | Out-Null
             return
         }
@@ -2296,7 +2314,7 @@ function Show-Settings {
         $settings.onTop      = $chkTop.Checked
         $settings.borderless = $chkBorderless.Checked
         $settings.minToTray  = $chkMinTray.Checked
-        $settings.ndSize     = if ($ndText -eq '跟手机一致') { '' } else { $ndText }
+        $settings.ndSize     = if ($ndText -eq '自动') { '' } else { $ndText }
         $settings.ndDpi      = $cbNdDpi.Vals[$cbNdDpi.SelectedIndex]
         $settings.ndNoDecor  = $chkNoDecor.Checked
         $settings.recFormat  = $cbRecFmt.Vals[$cbRecFmt.SelectedIndex]
@@ -2345,10 +2363,14 @@ function Show-AppPicker {
     $owner.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     # 必须带 -s 指定设备：多设备连接时 scrcpy --list-apps 不指定设备会因「有多台设备」直接失败、列不出 App
     $listArgs = if ($serial) { @('-s', $serial, '--list-apps') } else { @('--list-apps') }
-    $command=Invoke-UiCommand $owner $exe $listArgs
-    if ($command.Cancelled) { $owner.Cursor=[System.Windows.Forms.Cursors]::Default; return $null }
-    $raw=if (Test-CommandSuccess $command) { $command.Stdout + "`n" + $command.Stderr } else { '' }
+    $command=Invoke-UiCommand $owner $exe $listArgs -StatusText '正在读取手机应用列表…'
     $owner.Cursor = [System.Windows.Forms.Cursors]::Default
+    if ($command.Cancelled) { return $null }
+    if (-not (Test-CommandSuccess $command)) {
+        [void](Show-ResultDialog $owner '选择 App' '读取手机应用列表失败' '请确认手机仍在线。若知道应用的包名，也可用「手动输入名字或包名」。' (Get-CommandDetail $command) @('ok'))
+        return $null
+    }
+    $raw = $command.Stdout + "`n" + $command.Stderr
     $list = @()
     foreach ($line in ($raw -split "`n")) {
         # 形如：「 - 微信                 com.tencent.mm」/「 * 设置  com.android.settings」
@@ -2357,7 +2379,7 @@ function Show-AppPicker {
         }
     }
     if (-not $list) {
-        [System.Windows.Forms.MessageBox]::Show("没能列出手机里的 App。请确认手机已连接并解锁后重试，或改用「手动输入名字或包名」。", '选择 App') | Out-Null
+        [void](Show-ResultDialog $owner '选择 App' '应用列表中没有可选项' '可用「手动输入名字或包名」，例如 com.tencent.mm。' $raw.Trim() @('ok'))
         return $null
     }
     $list = @($list | Sort-Object Name)
@@ -2463,14 +2485,14 @@ function Show-CustomDisplaySize {
     $l1 = New-Lbl '分辨率（宽x高）：' 16 21
     $t1 = New-Txt 150 17 190
     $t1.Text = $size
-    $c1 = New-Caption '不填=跟手机一致。例 1080x2340' 150 47
+    $c1 = New-Caption '不填=自动。例 1080x2340' 150 47
     $e1 = New-ErrCaption 16 65
     $l2 = New-Lbl 'DPI：' 16 96
     $t2 = New-Txt 150 92 190
     $t2.Text = $dpi
     $c2 = New-Caption '不填=默认。常见 160~640' 150 122
     $e2 = New-ErrCaption 16 140
-    $c3 = New-Caption '数值越大，界面越像手机版' 150 158
+    $c3 = New-Caption '相同分辨率下，DPI 越大字越大。' 150 158
     $ok = New-PrimaryBtn '确定' 150 194 96 34 10
     $cancel = New-SecondaryBtn '取消' 254 194 86 34
     # 校验写进字段下方红字，不再弹 MessageBox 打断（设计稿问题编号 G8）：填错时窗不跳、已填内容不清空，光标送回出错那一格
@@ -2504,7 +2526,7 @@ function Add-ErrorLog {
     try {
         $logPath = Join-Path $PSScriptRoot '投屏助手-错误日志.txt'
         if ((Test-Path -LiteralPath $logPath) -and ((Get-Item -LiteralPath $logPath).Length -gt 262144)) { Remove-Item -LiteralPath $logPath -Force }   # 与未处理异常共用一份，封顶 256KB
-        Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Tag`r`n$Text`r`n" -Encoding UTF8
+        Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Tag`r`n$Text`r`n" -Encoding UTF8 -ErrorAction Stop
         return $logPath
     } catch { return '' }
 }
@@ -2590,7 +2612,7 @@ function Show-NewDisplay {
     $dlg = New-Dialog '独立窗口' 320 330 $owner
 
     $l1 = New-Lbl '在电脑上单开一块屏，运行下面这个 App：' 16 14
-    $l2 = New-Lbl '（手机照常用，互不影响；需 Android 11+）' 16 38; $l2.ForeColor = $cMuted
+    $l2 = New-Lbl '需要 Android 11 或更新版本' 16 38; $l2.ForeColor = $cMuted
     $cb = New-Object System.Windows.Forms.ComboBox
     $cb.DropDownStyle = 'DropDownList'; $cb.Location = New-Object System.Drawing.Point(16, 64); $cb.Size = New-Object System.Drawing.Size(288, 28)
     $specialApps = @('更多应用…（从手机里挑）', '手动输入名字或包名…', '管理我的常用应用…')
@@ -2610,16 +2632,16 @@ function Show-NewDisplay {
     # 「自定义」这一项要把已填的尺寸带在标签上，否则选完就看不见自己填的是什么了
     $customLabel = if ($settings.ndSize) { "自定义 $($settings.ndSize)" } else { '自定义…' }
     $cbMode = New-Combo @('竖屏·手机版面（推荐微信/QQ）', '横屏·平板版面', '跟随「设置」里的尺寸', $customLabel) @('portrait', 'landscape', 'settings', 'custom') $settings.ndMode 84 107 220
-    $chkFixed = New-Chk '固定方向（最大化时画面不乱转）' $settings.ndFixed 16 143
+    $chkFixed = New-Chk '固定分辨率（窗口缩放时尺寸不变）' $settings.ndFixed 16 143
     # 限宽自动换行：两行说明都比固定宽度的窗宽，不限宽会被右边缘裁掉、看不全
-    $capMode = New-Caption "竖屏适合聊天/刷信息；横屏适合看视频。乱转就勾上「固定方向」。`n应用双开/分身在独立窗口常黑屏、点不到，建议改用普通投屏在手机上开分身。" 16 167
+    $capMode = New-Caption "勾选「固定分辨率」后，拖动窗口边缘只改变电脑上的显示大小。`n应用分身若黑屏，请改用普通投屏，在手机上打开分身。" 16 167
     $capMode.MaximumSize = New-Object System.Drawing.Size(288, 0)
 
     # 声音三态（记住上次选择）：自动=同设备只让第一个窗口出声；播放=这扇窗强制出声；静音=这扇窗不出声
     # 注意：上方 capMode 实际占 4 行（限宽 288 下两段各折两行），声音区必须排在 y≥235，否则会被盖住
     $lblAudio = New-Lbl '声音' 16 235
-    $cbAudio = New-Combo @('自动（只第一个窗出声）', '播放（这扇窗始终出声）', '静音（这扇窗不出声）') @('auto', 'on', 'off') $settings.ndAudio 84 232 220
-    $audioTt = '自动（推荐）：同一台手机只让第一个窗口出声，后开的窗口自动静音，避免重音；播放：这扇窗强制出声，可能与已有窗口重音；静音：这扇窗不发声。'
+    $cbAudio = New-Combo @('自动（同设备避免重音）', '播放（允许此窗口出声）', '静音（这扇窗不出声）') @('auto', 'on', 'off') $settings.ndAudio 84 232 220
+    $audioTt = '独立窗口播放手机的系统声音，需要 Android 11+。「自动」遵循声音总开关，并在已有窗口播放时静音。「播放」允许本窗口播放，即使总开关关闭。'
     if ($tt) { $tt.SetToolTip($cbAudio, $audioTt); $tt.SetToolTip($lblAudio, $audioTt) }   # $tt 是主窗体作用域的，动态查找；空值守卫
 
     $btnGo = New-PrimaryBtn '打开' 16 274 288 38 11
@@ -2746,7 +2768,7 @@ function Show-WirelessPair {
     $l4 = New-Lbl '配对码（同一个弹窗里的 6 位数字）' 16 122
     $txtCode = New-Txt 16 144 328; $txtCode.MaxLength = 6
 
-    $lblNote = New-Lbl '照抄即可，连接端口会自动识别。' 16 176; $lblNote.ForeColor = $cMuted
+    $lblNote = New-Lbl '配对后会尝试自动查找连接端口。' 16 176; $lblNote.ForeColor = $cMuted
 
     $btnGo = New-PrimaryBtn '配对并连接' 16 206 328 38 11
     $result = @{ addr = $null }
@@ -2757,18 +2779,18 @@ function Show-WirelessPair {
         if ($pairAddr -notmatch '^(\d{1,3}(\.\d{1,3}){3}):\d+$') { [System.Windows.Forms.MessageBox]::Show('配对地址格式应为 IP:端口，例如 192.168.1.5:37123。', '配对') | Out-Null; return }
         $ip = $matches[1]
         if ($code -notmatch '^\d{6}$') { [System.Windows.Forms.MessageBox]::Show('配对码应为 6 位数字。', '配对') | Out-Null; return }
-        $discovery=Wait-UiTask -Owner $dlg -Functions @('Invoke-PairDiscovery','Test-CommandSuccess','Get-CommandDetail') -Inputs @{
+        $discovery=Wait-UiTask -Owner $dlg -StatusText '正在配对并连接手机…' -Functions @('Invoke-PairDiscovery','Test-CommandSuccess','Get-CommandDetail') -Inputs @{
             Adb=$adb; PairAddress=$pairAddr; Code=$code; Ip=$ip
         } -Work { Invoke-PairDiscovery $Inputs.Adb $Inputs.PairAddress $Inputs.Code $Inputs.Ip $Control }
         if ($discovery.Cancelled) { return }
         if (-not $discovery.Paired) {
-            [void](Show-ResultDialog $dlg '用配对码连接' '配对失败' '多半是配对码过期或地址抄错。请在手机上重新生成配对码，把弹窗里的地址和 6 位数字一起照抄再试。' $discovery.Error @('ok'))
+            [void](Show-ResultDialog $dlg '用配对码连接' '配对失败' '请确认手机与电脑在同一 Wi-Fi。重新打开手机的配对码弹窗，填入新的地址和 6 位配对码。' $discovery.Error @('ok'))
             return
         }
         $connAddr=$discovery.Address
         # 自动没找到（mdns 不可用等）：退一步问端口号
         if (-not $connAddr) {
-            $port = [Microsoft.VisualBasic.Interaction]::InputBox("已配对成功！但没能自动识别连接端口。`n请在手机「无线调试」主界面看「IP 地址和端口」，把冒号后面的端口号填这里：", '用配对码连接', '')
+            $port = [Microsoft.VisualBasic.Interaction]::InputBox("已配对。请手动填写连接端口。`n在手机「无线调试」主界面的「IP 地址和端口」里，填入冒号后的数字。", '用配对码连接', '')
             if ([string]::IsNullOrWhiteSpace($port)) { return }
             $port = $port.Trim()
             if ($port -notmatch '^\d+$') { [System.Windows.Forms.MessageBox]::Show('端口应为纯数字。', '配对') | Out-Null; return }
@@ -2782,7 +2804,7 @@ function Show-WirelessPair {
             Touch-KnownDevice $connAddr (Get-FriendlyName $connAddr -CachedOnly)
             $dlg.Close()
         } else {
-            [void](Show-ResultDialog $dlg '用配对码连接' "已配对成功，但连接 $connAddr 失败" '可在手机「无线调试」主界面核对端口后重试。' $(if ($record) { $record.Error } else { $connection.Error }) @('ok'))
+            [void](Show-ResultDialog $dlg '用配对码连接' "已配对成功，但连接 $connAddr 失败" '到手机「无线调试」主界面核对 IP 和连接端口，再用「输入 IP 连接」重试。' $(if ($record) { $record.Error } else { $connection.Error }) @('ok'))
         }
     }) $dlg $connectionFlow })
     $dlg.Controls.AddRange(@($l1, $l2, $l3, $txtPair, $l4, $txtCode, $lblNote, $btnGo))
@@ -2812,6 +2834,7 @@ function Show-Shortcuts {
 — 手机操作 —
 回到桌面：Alt+h（或鼠标中键）
 返回：Alt+b（或鼠标右键）
+实体鼠标模式：按住 Shift 再点中键或右键，使用上述快捷操作
 多任务：Alt+s
 菜单：Alt+m
 音量 加/减：Alt+↑ / Alt+↓（投屏窗口里）
@@ -2828,8 +2851,9 @@ function Show-Shortcuts {
 暂停/恢复画面：Alt+z / Alt+Shift+z
 
 — 拖拽（拖进投屏窗口）—
-拖入 APK：安装到手机
-拖入其它文件：传到手机
+拖入 APK：请求手机安装
+拖入其它文件：默认传到手机的 Download
+安装或传输结果可在投屏日志窗口查看
 
 — 相机（手机当摄像头时）—
 补光灯 开/关：Alt+t / Alt+Shift+t
@@ -2881,7 +2905,7 @@ function Touch-KnownDevice {
 function Start-WirelessMirror {
     param($Owner, [string]$Serial)
     if (-not (Test-Wireless $Serial)) {
-        $connection = Wait-UiTask -Owner $Owner -Functions @(
+        $connection = Wait-UiTask -Owner $Owner -StatusText '正在将手机切换到无线连接…' -Functions @(
             'Invoke-UsbWirelessConnection','Invoke-ConnectDevices','Test-CommandSuccess','Get-CommandDetail','Get-AdbDeviceState'
         ) -Inputs @{ Adb = $adb; Serial = $Serial } -Work {
             Invoke-UsbWirelessConnection $Inputs.Adb $Inputs.Serial $Control
@@ -2889,7 +2913,7 @@ function Start-WirelessMirror {
         if ($connection.Cancelled) { return }
         $address = $connection.Address
         if (-not $address) {
-            [void](Show-ResultDialog $Owner '无线投屏' '无线连接失败' '请确认数据线仍连着、手机已允许 USB 调试，且电脑与手机在同一个 Wi-Fi。' $connection.Error @('ok'))
+            [void](Show-ResultDialog $Owner '无线投屏' '无线连接失败' '先别拔线。确认手机已允许 USB 调试，并和电脑连着同一个 Wi-Fi。可点「查看原因」看详情。' $connection.Error @('ok'))
             return
         }
         $name = Get-FriendlyName $address -CachedOnly
@@ -3049,8 +3073,8 @@ function Resolve-TargetForFeature {
 function Connect-ByIp {
     param($owner)
     $dlg = New-Dialog '输入 IP 连接' 360 182 $owner
-    $l1 = New-Lbl '用 IP 直接连接手机，不需要配对码。' 16 14; $l1.ForeColor = $cMuted
-    $l2 = New-Lbl '保底连法：开着「无线调试」就能连，重连也方便。' 16 36; $l2.ForeColor = $cMuted
+    $l1 = New-Lbl '已配对：填「无线调试」主页的 IP 和连接端口。' 16 14; $l1.ForeColor = $cMuted
+    $l2 = New-Lbl '插线转无线：填手机的 Wi-Fi IP，端口通常为 5555。' 16 36; $l2.ForeColor = $cMuted
     $l3 = New-Lbl 'IP 地址' 16 66
     $txtIp = New-Txt 16 88 208
     $l4 = New-Lbl '端口' 240 66
@@ -3062,7 +3086,7 @@ function Connect-ByIp {
         $ip = $txtIp.Text.Trim(); $port = $txtPort.Text.Trim()
         if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { [System.Windows.Forms.MessageBox]::Show('IP 地址格式应为 4 段数字，例如 192.168.1.7。', '输入 IP 连接') | Out-Null; return }
         if (-not $port) { $port = '5555' }
-        if ($port -notmatch '^\d+$') { [System.Windows.Forms.MessageBox]::Show('端口应为纯数字，常见是 5555。', '输入 IP 连接') | Out-Null; return }
+        if ($port -notmatch '^\d+$') { [System.Windows.Forms.MessageBox]::Show('请填写手机显示的连接端口。插线转无线通常用 5555。', '输入 IP 连接') | Out-Null; return }
         $addr = "${ip}:$port"
         $connection=Connect-DevicesUi $dlg @($addr) -Probe
         if ($connection.Cancelled) { return }
@@ -3073,15 +3097,15 @@ function Connect-ByIp {
             $result.addr = $addr; $dlg.Close()
         } elseif ($state -eq 'offline' -or $state -eq 'unauthorized') {
             $body = if ($state -eq 'unauthorized') {
-                '手机上还没允许这台电脑调试：点亮手机，在「允许 USB 调试」弹窗里点允许后再试。'
+                '手机还没允许这台电脑连接。插线的手机请解锁并确认授权。用配对码连过的手机，请在「无线调试」里检查这台电脑是否还在配对列表中。'
             } else {
-                '设备处于 offline 状态（常见于无线调试未完全就绪），已清理这次连接，请再试一次。'
+                '手机暂时没有回应。请确认手机和电脑连着同一个 Wi-Fi，核对连接端口后再试。'
             }
             [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" $body $out @('ok'))
         } elseif ($state -eq '') {
-            [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '手机没开「无线调试」或与电脑不在同一 Wi-Fi：Android 11+ 去开发者选项里打开；更早的手机先插一次线，点「无线投屏 → 插数据线连接」切换。' $out @('ok'))
+            [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '这个地址连不上手机。请到手机的「无线调试」核对 IP 和端口，并确认手机与电脑连着同一个 Wi-Fi。首次连接请先配对或用数据线。' $out @('ok'))
         } else {
-            [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '电脑上查询设备状态失败（adb 没返回设备列表），这次没有断开任何连接；请稍后重试。' $out @('ok'))
+            [void](Show-ResultDialog $owner '输入 IP 连接' "连不上 $addr" '暂时无法确认手机是否连上，请稍后重试。' $out @('ok'))
         }
     }) $dlg $connectionFlow })
     $dlg.Controls.AddRange(@($l1, $l2, $l3, $txtIp, $l4, $txtPort, $btnGo))
@@ -3135,15 +3159,15 @@ function Show-DeviceManager {
     $btnIp      = New-SecondaryBtn '输入 IP 连接…' 16 346 150 34
     $btnRefresh2= New-SecondaryBtn '刷新'    334 346 86  34
     $btnDone    = New-PrimaryBtn   '完成'    426 346 78  34 10
-    $tt.SetToolTip($btnConnect, '把选中的离线设备连上，只连不开窗。')
+    $tt.SetToolTip($btnConnect, '连接选中的已记住设备。连好后点「投屏」打开窗口。')
     $tt.SetToolTip($btnCast, '为选中的已连设备开一个镜像窗口。')
-    $tt.SetToolTip($btnStop, '只关选中那台的镜像窗口，其它设备不受影响。')
+    $tt.SetToolTip($btnStop, '停止所选设备的投屏、录屏（含后台录制）和摄像头。')
     $tt.SetToolTip($btnAll, '给每台已连接、还没开窗的设备各开一个窗口。')
-    $tt.SetToolTip($btnDefault, '多设备时，其它功能默认对这台做；再点一次取消。')
+    $tt.SetToolTip($btnDefault, '这台设备在功能的候选列表中时优先使用。再点一次取消默认。')
     $tt.SetToolTip($btnDisc, '断开这台的无线连接，并先关掉它的投屏窗口（其它设备不受影响）。它仍留在「已记住」里。要让助手跳过这台设备的自动连接，请用「不自动连」。USB 设备请直接拔数据线。')
     $tt.SetToolTip($btnRename, '起个好认的名字，窗口标题和设备列表都会用。')
     $tt.SetToolTip($btnForget, '从「已记住」里去掉，这台设备的自定义名字和「默认设备」标记也一并清掉；以后连上会重新记住。设备还连着时点不动——要先「断开」（或拔掉数据线），否则它会立刻被重新记住。')
-    $tt.SetToolTip($btnAuto, '「不自动连」会在助手启动、掉线重连和点击投屏、文件管理等主功能时跳过这台设备的自动连接。仍可手动连接，已连接的设备照常使用。再点「恢复自动连」可取消此设置。')
+    $tt.SetToolTip($btnAuto, '开启「不自动连」后，助手会跳过这台手机。已经配对的手机仍可能自己连上。要取消配对，请在手机的「无线调试」里忘记这台电脑。')
 
     # refresh 把「已连接设备」「正在投屏的序列号」算一次塞进 $state；updateButtons 只读它，不再每次点都跑 adb
     $state = @{ Active = @(); Connected = @(); SnapshotReady=$false }
@@ -3231,7 +3255,7 @@ function Show-DeviceManager {
             if ($record.Success) { Touch-KnownDevice $record.Address (Get-FriendlyName $record.Address -CachedOnly) }
             else { $fail += "$($record.Address)：$($record.Error)" }
         }
-        if ($fail) { [void](Show-ResultDialog $dlg '设备管理' ("有 " + $fail.Count + " 台没连上") '多半是手机不在线，或没开「无线调试」。确认手机和电脑连的同一个 Wi-Fi 后可重试，或先插一次线。' ($fail -join "`r`n") @('ok')) }
+        if ($fail) { [void](Show-ResultDialog $dlg '设备管理' ("有 " + $fail.Count + " 台没连上") '请确认手机与电脑在同一 Wi-Fi，并核对已记住的地址。地址已变时，用「输入 IP 连接」填手机当前地址。' ($fail -join "`r`n") @('ok')) }
         & $refresh
     }
     # 投屏选中的已连设备（只投，不连）：已在投的跳过不重复开，窗口保持打开方便继续管理
@@ -4533,7 +4557,7 @@ function Show-FileManager {
             if ($aborted -or $dlg.IsDisposed -or -not $dlg.Visible) { return }
             & $refresh
             if ($fail.Count -gt 0) {
-                [void](Show-ResultDialog $dlg '上传' "有 $($fail.Count) 项没传成功" '可能是手机存储空间不足，或当前目录不允许写入。换到「内部存储 > Download」再试。' ($fail -join "`r`n") @('ok'))
+                [void](Show-ResultDialog $dlg '上传' "有 $($fail.Count) 项没传成功" '点「查看原因」看哪些文件没传过去。手机不允许写入时，可换到「内部存储 > Download」再试。' ($fail -join "`r`n") @('ok'))
             } else {
                 $lblInfo.ForeColor = $cGreen
                 $lblInfo.Text = "已上传 $okN 项到 $batchPath"
@@ -4719,7 +4743,7 @@ function Show-FileManager {
             & $refresh
             $lblInfo.ForeColor = $cGreen; $lblInfo.Text = "已新建文件夹：$name"
         } else {
-            [void](Show-ResultDialog $dlg '新建文件夹' '没能新建这个文件夹' '多半是当前目录不允许写入，或手机存储已满。换个位置（如 内部存储 > Download）再试。' $out @('ok'))
+            [void](Show-ResultDialog $dlg '新建文件夹' '没能新建这个文件夹' '点「查看原因」查看手机返回的信息。若目录不可写，可切到「内部存储 > Download」再试。' $out @('ok'))
         }
     }
 
@@ -4755,7 +4779,7 @@ function Show-FileManager {
             & $refresh
             $lblInfo.ForeColor = $cGreen; $lblInfo.Text = "已重命名：$old → $new"
         } else {
-            [void](Show-ResultDialog $dlg '重命名' '没能重命名' '可能是当前目录不允许写入、文件正被占用，或手机存储已满。换个位置或名称再试。' $out @('ok'))
+            [void](Show-ResultDialog $dlg '重命名' '没能重命名' '请先点「刷新」确认原文件和新名称的状态。可点「查看原因」查看手机返回的信息。' $out @('ok'))
         }
     }
 
@@ -4840,10 +4864,10 @@ function Show-FileManager {
         }
         & $refresh
         if ($aborted -or $uncertain) {
-            $why = if ($aborted) { '删除过程中窗口被关闭，设备端命令已中止。' } else { '设备端没有返回明确的成功 / 失败结论。' }
-            [void](Show-ResultDialog $dlg '删除' '已停止继续删除' "$why 前面几项可能只删了一部分，现在不能保证状态一致。请先点「刷新」重新读取目录，确认后再决定，不要直接重试整批。" ($fail -join "`r`n") @('ok'))
+            $why = if ($aborted) { '删除时窗口被关掉，助手已停止继续删除。' } else { '设备端没有返回明确的成功 / 失败结论。' }
+            [void](Show-ResultDialog $dlg '删除' '已停止继续删除' "$why 部分文件可能已删除。请先点「刷新」确认当前目录，再选择仍需删除的项目。" ($fail -join "`r`n") @('ok'))
         } elseif ($fail.Count -gt 0) {
-            [void](Show-ResultDialog $dlg '删除' "有 $($fail.Count) 项没能删除" '其余项已处理。系统目录、正在使用的文件，或厂商限制的路径，ADB 也删不掉。' ($fail -join "`r`n") @('ok'))
+            [void](Show-ResultDialog $dlg '删除' "有 $($fail.Count) 项没能删除" '可点「查看原因」看哪些文件没删掉。手机可能限制了这个目录里的操作。' ($fail -join "`r`n") @('ok'))
         } else {
             $lblInfo.ForeColor = $cGreen; $lblInfo.Text = "已删除 $okN 项"
         }
@@ -5196,8 +5220,8 @@ try {
     $btnWired = New-PrimaryBtn '有线投屏' 28 120 220 64
     $btnWireless = New-PrimaryBtn '无线投屏' 264 120 220 64
     $form.Controls.AddRange(@($btnWired, $btnWireless))
-    $capWired = New-Caption '数据线连接 · 最稳定' 32 190
-    $capWireless = New-Caption '免数据线 · 一次配置' 268 190
+    $capWired = New-Caption '优先使用数据线连接' 32 190
+    $capWireless = New-Caption '通过 Wi-Fi 连接' 268 190
     $form.Controls.AddRange(@($capWired, $capWireless))
 
     # 更多功能（次要操作）
@@ -5273,9 +5297,9 @@ try {
     $form.Controls.Add($btnGh)
     $tt.SetToolTip($btnGh, '在 GitHub 查看源码 / 反馈问题')
 
-    $tt.SetToolTip($btnWired, '用数据线连接，最稳定、延迟最低。若当前没有数据线设备，这个按钮投的是已连上的那台无线设备。')
-    $tt.SetToolTip($btnWireless, '不用线。已连手机时直接开始；首次可选插一次线，或 Android 11+ 用配对码免插线。')
-    $tt.SetToolTip($btnCamera, '把手机摄像头当电脑摄像头用（需 Android 12+）；支持横屏、竖屏和「旋转 180°（倒置修正）」。')
+    $tt.SetToolTip($btnWired, '优先使用 USB 设备。没有 USB 设备时可投已连上的无线设备。')
+    $tt.SetToolTip($btnWireless, '优先使用已连上的无线设备。只有 USB 设备时尝试切到无线。首次也可用 Android 11+ 的配对码。')
+    $tt.SetToolTip($btnCamera, '在电脑窗口显示手机摄像头画面（Android 12+）。供会议软件使用时，请用 OBS 捕获窗口并启动虚拟摄像头。')
     $tt.SetToolTip($btnRecord, '把手机屏幕录制成视频文件。')
     $tt.SetToolTip($btnNd, '在电脑上单开一块屏运行某个 App，不影响手机（需 Android 11+）。')
     $tt.SetToolTip($btnShortcuts, 'scrcpy 常用快捷键速查（全屏、息屏、旋转、复制粘贴、拖文件装 APK 等）。')
@@ -5292,7 +5316,7 @@ try {
         if (-not $result.Success) {
             $lblStatus.BackColor=$cTagBg; $lblStatus.ForeColor=$cMuted
             $lblStatus.Text='○ 无法读取设备'
-            $tt.SetToolTip($lblStatus, "电脑上的 ADB 暂时无法提供设备列表。$statusTip")
+            $tt.SetToolTip($lblStatus, "暂时读不到手机连接状态。$statusTip")
             $lblDevInfo.Text=''
             return
         }
@@ -5324,7 +5348,7 @@ try {
             $lblDevInfo.Text = ''
             if ($result.UnavailableStates -contains 'unauthorized') {
                 $lblStatus.Text = '○ 等待手机授权'
-                $tt.SetToolTip($lblStatus, "请解锁手机，并在手机上点「允许 USB 调试」。$statusTip")
+                $tt.SetToolTip($lblStatus, "USB 连接：解锁手机并点「允许 USB 调试」。无线连接：确认手机仍记着这台电脑的配对记录。$statusTip")
             } elseif ($result.UnavailableStates -contains 'offline') {
                 $lblStatus.Text = '○ 手机离线'
                 $tt.SetToolTip($lblStatus, "手机暂未响应。请重新插拔数据线，或检查 Wi-Fi 后重新连接。$statusTip")
@@ -5498,12 +5522,12 @@ try {
             $pick = New-Dialog '无线投屏' 360 262 $form
 
             $pl = New-Lbl '没有检测到手机，选一种无线连接方式：' 16 14
-            $btnCable = New-PrimaryBtn '插数据线连接（推荐 · 最省事）' 16 42 328 46 11
+            $btnCable = New-PrimaryBtn '插数据线切到无线' 16 42 328 46 11
             $capCable = New-Caption '插一次线即可，连上后自动切无线、可拔线。' 20 94
             $btnPair = New-SecondaryBtn '用配对码连接（Android 11+ · 免插线）' 16 116 328 40
             $capPair = New-Caption '手机开「无线调试 → 使用配对码配对设备」。' 20 162
-            $btnIpc = New-SecondaryBtn '输入 IP 直接连接（保底 · 无需配对码）' 16 184 328 40
-            $capIp = New-Caption '手机开着无线调试（网络 adb）时，给个 IP 即可，新旧设备都行。' 20 230
+            $btnIpc = New-SecondaryBtn '输入 IP 连接' 16 184 328 40
+            $capIp = New-Caption '适用于已配对或已用数据线启用无线连接的手机。' 20 230
 
             $btnCable.Add_Click({ $pick.Tag = 'cable'; $pick.Close() })
             $btnPair.Add_Click({ $pick.Tag = 'pair'; $pick.Close() })
@@ -5526,7 +5550,7 @@ try {
                     if (-not $snapshot.Success) { Show-DeviceQueryFailure; return }
                     $devs = @($snapshot.Devices)
                     if ($devs.Count -gt 0) { break }
-                    $again = Show-ResultDialog $form '连接手机' '还是没检测到手机' "检查数据线是否插好、手机上是否点过「允许 USB 调试」。手机重启过也要重新插一次线；不想插线也可以直接输 IP。`n`n不会开 USB 调试？看同目录的「使用说明.txt」第一节。" '' @('retry', 'ip', 'cancel')
+                    $again = Show-ResultDialog $form '连接手机' '没有检测到可用的设备' "请用支持数据传输的 USB 线连接手机，解锁手机并点「允许 USB 调试」，再选「重试」。已配对的手机也可选「输入 IP 连接」。`n`n开启 USB 调试的步骤见「使用说明.txt」第一节。" '' @('retry', 'ip', 'cancel')
                     if ($again -eq 'ip') { $wantIp = $true; break }
                     if ($again -ne 'retry') { return }
                 }
@@ -5571,7 +5595,6 @@ try {
         $camSizes = Get-CameraSizes $serial $form
         if ($null -eq $camSizes) { return }
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
-        $camDetected = ((@($camSizes.back).Count + @($camSizes.front).Count) -gt 0)
         $dlg = New-Dialog '手机当摄像头' 264 404 $form
 
         $gb1 = New-Object System.Windows.Forms.GroupBox
@@ -5592,7 +5615,7 @@ try {
         # 下拉内容随「后置/前置」切换重填——两个摄像头支持的尺寸常常不一样。
         $lblRes = New-Lbl '分辨率' 16 168
         $cbRes = New-Combo @('自动') @('auto') 'auto' 78 165 170
-        $tt.SetToolTip($cbRes,'同一朝向只使用第一颗镜头的尺寸与变焦范围。')
+        $tt.SetToolTip($cbRes,'前置和后置各使用手机报告的第一颗镜头。分辨率和变焦范围随所选镜头变化。')
         # 说明文字顶格放、限宽自动换行：原先跟在下拉下方 x=78 起步，固定宽度的窗横向摆不下、尾巴被裁掉看不全
         $capRes = New-Caption '' 16 196
         $capRes.MaximumSize = New-Object System.Drawing.Size(230, 0)
@@ -5601,12 +5624,11 @@ try {
             $list = @($camSizes[$facing])
             $cbRes.Items.Clear()
             if ($list.Count -gt 0) {
-                for ($i = 0; $i -lt $list.Count; $i++) {
-                    $tag = if ($i -eq 0) { '  · 最清晰' } elseif ($i -eq $list.Count - 1) { '  · 最流畅' } else { '' }
-                    [void]$cbRes.Items.Add("$($list[$i])$tag")
-                }
+                $capRes.Text = '已列出手机提供的分辨率。画面打不开时，可以选低一档再试。'
+                foreach ($size in $list) { [void]$cbRes.Items.Add($size) }
                 $cbRes.Vals = [array]$list
             } else {
+                $capRes.Text = '暂时读不到这个镜头的分辨率，先试「中」档。'
                 [void]$cbRes.Items.Add('高（约 1080p，推荐）')
                 [void]$cbRes.Items.Add('中（更流畅）')
                 [void]$cbRes.Items.Add('原始最高')
@@ -5625,7 +5647,6 @@ try {
             }
             $cbRes.SelectedIndex = $idx
         }
-        $capRes.Text = if ($camDetected) { '✓ 已读取本机支持的尺寸；带不动会自动降一档重试' } else { '没读到支持列表，用通用档位；打不开会自动重试' }
         # 初始倍率：可填范围按这台设备实测的 zoom-range 定（读不到就 1~10 通用范围），倍率值让用户自己填并按设备+前后记住。
         # 控件摆在下面的复选框之后，但得赶在朝向事件之前定义好——前后置的变焦范围不一样，切朝向要跟着重填。
         $lblZoom = New-Lbl '初始倍率' 16 296
@@ -5768,7 +5789,7 @@ try {
             $newRec=Start-Scrcpy $a -Recording -PassThru
             $recStarted=($newRec -and -not (Test-ProcessExited $newRec))
             if ($recStarted) {
-                $recTip = if ($settings.recBackground) { '● 后台录制中 · 「设备」里可停止录制' } else { '● 录制中 · 关掉投屏窗口可停止录制' }
+                $recTip = if ($settings.recBackground) { '● 后台录制中 · 到「设备管理」点「停止投屏」' } else { '● 录制中 · 关掉投屏窗口可停止录制' }
                 & $script:showTempHint $recTip $cGreen
                 $script:hintKeepAfterFlow = $true
             }
@@ -5851,15 +5872,14 @@ try {
                     param($snapshot)
                     Resume-CameraSession $session $snapshot
                 }.GetNewClosure()) -OnFinally ({ $session.Reconnecting=$false }.GetNewClosure())
-            } elseif ($kind -eq 'cfg') {
-                # 编码器/配置类失败退出。已去掉 --no-downsize-on-error：scrcpy 4.1 能降档时会内部单步降档、进程不退；
-                # 走到这里 = 它把分级阶梯 {2560..800} 也试完了仍开不出 → 手动再降没意义，直接停并提示选更低分辨率。
-                Remove-CamSession $cs
-                & $script:showTempHint '摄像头没能打开，请选更低的分辨率' $cRed 12000
             } else {
-                # 不明原因退出（stderr 没有认识的报错）：宁可不折腾也别跟用户抢——自动重开才是更大的骚扰
+                # 会话清理会删掉临时日志，先保存 scrcpy 返回的错误供用户查看。
+                $logged = Add-ErrorLog '摄像头异常退出' "退出码：$code`r`n$errTxt"
                 Remove-CamSession $cs
-                & $script:showTempHint '摄像头已退出，未自动重连' $cMuted 8000
+                $hint = if ($kind -eq 'cfg') { '摄像头配置失败，请试更低的分辨率。' }
+                    elseif ($logged) { '摄像头异常退出，请查看「投屏助手-错误日志.txt」。' }
+                    else { '摄像头异常退出，请重新打开摄像头。' }
+                & $script:showTempHint $hint $cRed 12000
             }
           } catch { try { Remove-CamSession $cs } catch {} }   # 看门狗内部任何意外都只放弃这个会话，绝不让异常冒成弹窗
         }

@@ -119,7 +119,7 @@ foreach ($case in $results) {
         $snapshot = Wait-DeviceScan $form
         & $renderStatus $snapshot
         $expectedStatus = if ($case.Outcome -eq 'failed') { '○ 无法读取设备' } else { $case.Status }
-        $expectedTip = if ($case.Outcome -eq 'failed') { 'ADB 暂时无法提供设备列表' } else { $case.Tip }
+        $expectedTip = if ($case.Outcome -eq 'failed') { '暂时读不到手机连接状态' } else { $case.Tip }
         Check ($lblStatus.Text -ceq $expectedStatus -and $tt.Tip.Contains($expectedTip)) "Main window device status was wrong for $label"
     }
 
