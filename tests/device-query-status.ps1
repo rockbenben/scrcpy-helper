@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile(
@@ -29,6 +29,9 @@ $refreshButton = $fileManager.Find({ param($node)
 }, $true).Arguments[0].ScriptBlock.GetScriptBlock()
 $refresh = Get-FileManagerAction 'refresh'
 $updateButtons = Get-FileManagerAction 'updateButtons'
+$renderStatus = $ast.Find({ param($node)
+    $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$renderStatus'
+}, $true).Right.Expression.ScriptBlock.GetScriptBlock()
 
 $cableBranch = $ast.Find({ param($node)
     $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text -ceq '$pick.Tag -eq ''cable'''
@@ -41,16 +44,24 @@ $dlg = @{ Visible=$true; IsDisposed=$false }
 $script:fmFlow = @{ Busy=$false }
 $fixture = @{}
 $cRed = [Drawing.Color]::Red; $cMuted = [Drawing.Color]::Gray
+$cTagBg = [Drawing.Color]::Beige; $cGreenBg = [Drawing.Color]::Honeydew; $cGreen = [Drawing.Color]::Green
+$settings = @{ autoConnect=$false }
+$lblStatus = @{ Text='' }; $lblDevInfo = @{ Text='' }
+$statusTip = '点击打开「设备管理」。切回窗口时会自动刷新。'
+$tt = [pscustomobject]@{ Tip='' }
+$tt | Add-Member ScriptMethod SetToolTip { param($Control, $Text) $this.Tip = $Text }
 $script:devInfo = @{ 'old-usb'=@{}; 'new-usb'=@{} }
 $header = "List of devices attached`r`n"
 $results = @(
     @{ Name='cancel'; Command=@{ Cancelled=$true }; Outcome='cancel' }
-    @{ Name='timeout'; Command=@{ TimedOut=$true; Stdout="${header}old-usb`tdevice`r`n" }; Outcome='failed' }
-    @{ Name='command failure'; Command=@{ ExitCode=1; Stderr='ADB startup failed'; Stdout=$header }; Outcome='failed' }
-    @{ Name='invalid response'; Command=@{ Stdout="unrelated output`r`nold-usb`tdevice`r`n" }; Outcome='failed' }
-    @{ Name='no online devices'; Command=@{ Stdout="${header}old-usb`toffline`r`nunauth`tunauthorized`r`n" }; Outcome='empty' }
-    @{ Name='selected device still online'; Command=@{ Stdout="${header}new-usb`tdevice`r`nold-usb`tdevice`r`n" }; Outcome='online'; Serial='old-usb' }
-    @{ Name='only a new device remains'; Command=@{ Stdout="${header}old-usb`toffline`r`nnew-usb`tdevice`r`n" }; Outcome='online'; Serial='new-usb' }
+    @{ Name='timeout'; Command=@{ TimedOut=$true; Stdout="${header}old-usb`tdevice`r`n" }; Outcome='failed'; Detail='等待 ADB 返回设备列表超时。' }
+    @{ Name='command failure'; Command=@{ ExitCode=1; Stderr='ADB startup failed'; Stdout=$header }; Outcome='failed'; Detail='ADB startup failed' }
+    @{ Name='invalid response'; Command=@{ Stdout="unrelated output`r`nold-usb`tdevice`r`n" }; Outcome='failed'; Detail='ADB 返回的设备列表格式异常。' }
+    @{ Name='no attached devices'; Command=@{ Stdout=$header }; Outcome='empty'; Status='○ 未连接'; Tip=$statusTip }
+    @{ Name='only offline'; Command=@{ Stdout="${header}old-usb`toffline`r`n" }; Outcome='empty'; Status='○ 手机离线'; Tip='检查 Wi-Fi' }
+    @{ Name='authorization takes precedence over offline'; Command=@{ Stdout="${header}old-usb`toffline`r`nunauth`tunauthorized`r`n" }; Outcome='empty'; Status='○ 等待手机授权'; Tip='允许 USB 调试' }
+    @{ Name='selected device still online'; Command=@{ Stdout="${header}new-usb`tdevice`r`nold-usb`tdevice`r`nunauth`tunauthorized`r`n" }; Outcome='online'; Serial='old-usb'; Status='● 已连接 USB'; Tip=$statusTip }
+    @{ Name='only a new device remains'; Command=@{ Stdout="${header}old-usb`toffline`r`nnew-usb`tdevice`r`n" }; Outcome='online'; Serial='new-usb'; Status='● 已连接 USB'; Tip=$statusTip }
 )
 
 function Wait-UiTask {
@@ -88,6 +99,7 @@ function Show-ResultDialog {
 function Select-Device { param($Owner, $Devices, $Title) return $Devices[-1] }
 function Start-WirelessMirror { param($Owner, $Serial) $fixture.WirelessTarget = $Serial }
 function Get-FriendlyName { param($Serial, [switch]$CachedOnly) return $Serial }
+function Get-DevInfo { param($Serial, [switch]$CachedOnly) return $script:devInfo[$Serial] }
 function Fm-ListDir {
     param($Owner, $Serial, $Path)
     [void]$fixture.Reads.Add($Serial)
@@ -102,6 +114,14 @@ foreach ($case in $results) {
     Check ($fixture.NoDevicePrompts -eq [int]($case.Outcome -eq 'empty')) "Cable wizard showed the wrong no-device prompt for $label"
     Check ($fixture.WirelessTarget -ceq $case.Serial) "Cable wizard chose an unexpected target for $label"
     Check ([object]::ReferenceEquals($fixture.Owner,$form)) "Cable wizard ran under the wrong owner for $label"
+
+    if ($case.Outcome -ne 'cancel') {
+        $snapshot = Wait-DeviceScan $form
+        & $renderStatus $snapshot
+        $expectedStatus = if ($case.Outcome -eq 'failed') { '○ 无法读取设备' } else { $case.Status }
+        $expectedTip = if ($case.Outcome -eq 'failed') { 'ADB 暂时无法提供设备列表' } else { $case.Tip }
+        Check ($lblStatus.Text -ceq $expectedStatus -and $tt.Tip.Contains($expectedTip)) "Main window device status was wrong for $label"
+    }
 
     $fixture = @{ Command=$case.Command; QueryErrors=0; Reads=[Collections.ArrayList]::new() }
     $state = @{ Serial='old-usb'; Serials=@('old-usb'); Path='/sdcard'; Rebuilding=$false }
@@ -134,8 +154,8 @@ foreach ($case in $results) {
         Check ($fixture.Reads.Count -eq 0 -and $state.Serial -ceq 'old-usb' -and $cmbDev.Items[0] -ceq 'old device') "File manager refreshed the stale device after $label"
         Check ([object]::ReferenceEquals($lv.Items[0],$oldRow) -and $script:fmShellMode -ceq 'cached') "File manager mutated a previous snapshot after $label"
     }
-    if ($case.Name -ceq 'command failure') {
-        Check ($fixture.Detail -ceq 'ADB startup failed') 'File manager lost the ADB failure diagnostic'
+    if ($case.Outcome -ceq 'failed') {
+        Check ($fixture.Detail -ceq $case.Detail) "File manager lost the ADB failure diagnostic for $label"
     }
 }
 

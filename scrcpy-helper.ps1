@@ -245,7 +245,7 @@ function Invoke-Hidden {
 # worker 只使用快照和取消标志，绝不读写控件或实时设置。
 function Invoke-DeviceScan {
     param($AdbPath, [string[]]$Candidates, [bool]$ConnectAlways, $InfoCache, $Control, [int]$BudgetMs = 15000)
-    $scan = [pscustomobject]@{ Success = $false; Cancelled = $false; Devices = @(); Connected = @(); Info = @{}; Error = '' }
+    $scan = [pscustomobject]@{ Success = $false; Cancelled = $false; Devices = @(); UnavailableStates = @(); Connected = @(); Info = @{}; Error = '' }
     $clock = [Diagnostics.Stopwatch]::StartNew()
     function Run-Adb {
         param([string[]]$Arguments, [int]$Limit = 3000)
@@ -257,10 +257,18 @@ function Invoke-DeviceScan {
         $r = Run-Adb @('devices')
         if ($r.Cancelled) { $scan.Cancelled = $true; return $false }
         if (-not $r.Started -or $r.ExitCode -ne 0 -or $r.TimedOut -or $r.Stdout -notmatch '(?m)^List of devices attached[ \t]*\r?$') {
-            $scan.Error = if ($r.Error) { $r.Error } elseif ($r.Stderr) { $r.Stderr } else { 'adb devices 未在时限内返回有效设备列表' }
+            $scan.Error = if ($r.Error) { $r.Error }
+                elseif ($r.TimedOut) { '等待 ADB 返回设备列表超时。' }
+                elseif ($r.Stderr) { $r.Stderr }
+                elseif (-not $r.Started) { '无法启动 ADB。' }
+                elseif ($r.ExitCode -ne 0) { "ADB 查询设备列表失败（退出码 $($r.ExitCode)）。" }
+                else { 'ADB 返回的设备列表格式异常。' }
             return $false
         }
-        $scan.Devices = @($r.Stdout -split "`r?`n" | Where-Object { $_ -match "`tdevice`r?$" } | ForEach-Object { ($_ -split "`t")[0] })
+        $lines = @($r.Stdout -split "`r?`n")
+        $scan.Devices = @($lines | Where-Object { $_ -match "`tdevice`r?$" } | ForEach-Object { ($_ -split "`t")[0] })
+        # 保留 ADB 的待授权和离线状态供主界面提示，功能入口仍只接收在线设备。
+        $scan.UnavailableStates = @($lines | Where-Object { $_ -match "`t(?:unauthorized|offline)$" } | ForEach-Object { ($_ -split "`t")[1] })
         return $true
     }
     if (-not (Read-Devices)) { return $scan }
@@ -2204,7 +2212,7 @@ function Show-Settings {
     $txtExtra = New-Txt 14 78 392
     $txtExtra.Text = $settings.extraArgs
     $lblExHint = New-Lbl '例如：--angle=90   --display-id=1   --time-limit=300' 14 108; $lblExHint.ForeColor = $cMuted
-    $tt.SetToolTip($chkLive, '它只决定窗口顶部「已连接/未连接」多久自动更新一次，不影响投屏。开着时仅在窗口处于前台才每几秒刷一次；关掉后不再定时刷新，切回窗口时仍会更新一次，更省资源。')
+    $tt.SetToolTip($chkLive, '开启后，窗口在前台时会定时刷新顶部的连接状态。切回窗口时也会刷新一次。')
     $tt.SetToolTip($txtExtra, '高级用法（可选，一般不用填）：在这里追加 scrcpy 命令行参数，参数之间用空格分隔。含空格的值用双引号包住，例如 --window-title="Living Room"。')
 
     # 自定义 adb / scrcpy 路径（留空=用本助手同目录自带的）
@@ -3169,7 +3177,7 @@ function Show-DeviceManager {
         $snapshot=Wait-DeviceScan $dlg
         if ($snapshot.Cancelled) { return }
         if (-not $snapshot.Success) {
-            [void](Show-ResultDialog $dlg '设备管理' '查询设备失败，请稍后重试' '设备列表暂未更新，可以稍后重试。' $snapshot.Error @('ok'))
+            [void](Show-ResultDialog $dlg '设备管理' '无法读取设备列表' '请稍后重试。' $snapshot.Error @('ok'))
             return
         }
         foreach ($key in $snapshot.Info.Keys) { $script:devInfo[$key]=$snapshot.Info[$key] }
@@ -4131,7 +4139,7 @@ function Fm-Transfer {
 function Show-FileManager {
     param($owner, [string[]]$devices)
     # 新版 main 的 Ensure-Devices 只启动后台扫描、靠 OnDone / OnFinally 交付结果，不再同步返回数组。
-    # 入口用 Invoke-MainFlow -WithDevices 接好：查询失败由它提示「查询设备失败，请稍后重试」，
+    # 入口用 Invoke-MainFlow -WithDevices 接好：查询失败由它统一提示，
     # 取消时根本不会进本函数、由 OnFinally 里的 Complete-MainFlow 复位忙态和光标。
     # 所以能走到这里、且 $devs 为空，含义是「扫描成功但确实没连手机」，不是「没查到设备」。
     $devs = @($devices | Where-Object { $_ })
@@ -5045,7 +5053,7 @@ function Show-FileManager {
         $snapshot = Wait-DeviceScan $dlg
         if ($dlg.IsDisposed -or -not $dlg.Visible -or $snapshot.Cancelled) { return }
         if (-not $snapshot.Success) {
-            [void](Show-ResultDialog $dlg '文件管理' '查询设备失败，请稍后重试' '设备列表暂未更新，可以稍后重试。' $snapshot.Error @('ok'))
+            [void](Show-ResultDialog $dlg '文件管理' '无法读取设备列表' '请稍后再点「刷新」。' $snapshot.Error @('ok'))
             return
         }
         # 同时清掉 shell 写法缓存：上次探测若正好赶上设备重连失败，会一直用错写法直到关窗。
@@ -5274,7 +5282,8 @@ try {
     $tt.SetToolTip($btnSettings, '画质、声音、控制、窗口、独立窗口、录制等都可在这里自定义。')
     $tt.SetToolTip($btnFiles, '浏览手机上的文件：上传、下载、新建文件夹、重命名、删除（直接走 ADB，不用装 App）。')
     $tt.SetToolTip($btnDevices, '管理多台设备：切换、断开、设默认、忘记，或输入 IP 直连。')
-    $tt.SetToolTip($lblStatus, '点击管理设备：切换 / 断开 / 输入 IP 连接（状态会在切回窗口时自动刷新）。')
+    $statusTip = '点击打开「设备管理」。切回窗口时会自动刷新。'
+    $tt.SetToolTip($lblStatus, $statusTip)
 
     # ---------------- 行为 ----------------
     $renderStatus = {
@@ -5282,7 +5291,8 @@ try {
         if ($script:mainFlow -and $script:mainFlow.Busy) { return }
         if (-not $result.Success) {
             $lblStatus.BackColor=$cTagBg; $lblStatus.ForeColor=$cMuted
-            $lblStatus.Text='○ 状态查询失败'
+            $lblStatus.Text='○ 无法读取设备'
+            $tt.SetToolTip($lblStatus, "电脑上的 ADB 暂时无法提供设备列表。$statusTip")
             $lblDevInfo.Text=''
             return
         }
@@ -5304,14 +5314,24 @@ try {
             $type = if (Test-Wireless $dev) { '无线' } else { 'USB' }
             $lblStatus.BackColor = $cGreenBg; $lblStatus.ForeColor = $cGreen
             $lblStatus.Text = "● 已连接 $type"
+            $tt.SetToolTip($lblStatus, $statusTip)
             $info = Get-DevInfo $dev -CachedOnly
             $ver = if ($info.Ver -gt 0) { " · Android $($info.Ver)" } else { '' }
             $star = if ($isDefault -and $devs.Count -gt 1) { '★ ' } else { '' }   # 多设备时标出当前是默认那台
             $lblDevInfo.Text = "$star$(Get-FriendlyName $dev -CachedOnly)$ver"
         } else {
             $lblStatus.BackColor = $cTagBg; $lblStatus.ForeColor = $cMuted
-            $lblStatus.Text = '○ 未连接'
             $lblDevInfo.Text = ''
+            if ($result.UnavailableStates -contains 'unauthorized') {
+                $lblStatus.Text = '○ 等待手机授权'
+                $tt.SetToolTip($lblStatus, "请解锁手机，并在手机上点「允许 USB 调试」。$statusTip")
+            } elseif ($result.UnavailableStates -contains 'offline') {
+                $lblStatus.Text = '○ 手机离线'
+                $tt.SetToolTip($lblStatus, "手机暂未响应。请重新插拔数据线，或检查 Wi-Fi 后重新连接。$statusTip")
+            } else {
+                $lblStatus.Text = '○ 未连接'
+                $tt.SetToolTip($lblStatus, $statusTip)
+            }
         }
     }
     $updateStatus = {
@@ -5417,7 +5437,7 @@ try {
         try { & $Body } finally { Complete-MainFlow $flow }
     }
     function Show-DeviceQueryFailure {
-        & $script:showTempHint '查询设备失败，请稍后重试' $cRed 8000
+        & $script:showTempHint '无法读取设备列表，请重试。' $cRed 8000
         $script:hintKeepAfterFlow=$true
     }
     function Complete-MainFlow {
