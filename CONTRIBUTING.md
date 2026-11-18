@@ -28,9 +28,13 @@ $err | ForEach-Object { $_.Message }
 
 没有输出就是没语法错。但语法过了不等于界面对了——改了控件坐标或文案，还得双击 `投屏助手-双击运行.bat` 起真程序看一遍。
 
-## 文件管理回归
+## 回归测试
 
-在 Windows 上分别运行以下命令，CI 也会在这两个 PowerShell 版本中执行同一入口。
+测试脚本位于 `tests/` 目录下，不依赖 Python 或外部测试框架，不需要连接真实手机。CI 在 Windows PowerShell 5.1 与 PowerShell 7 (pwsh) 中均完整运行全部回归。
+
+### 文件管理回归
+
+文件管理回归的统一入口是 `tests/run-file-manager-regression.ps1`，在 Windows 上分别运行以下命令，CI 也会在这两个 PowerShell 版本中执行同一入口：
 
 ```powershell
 powershell -NoProfile -File tests/run-file-manager-regression.ps1
@@ -46,6 +50,29 @@ pwsh -NoProfile -File tests/run-file-manager-regression.ps1
 子进程身份在实际 `Process.Start()` 返回后立即原子写入，不等待解释器就绪或关窗事件；测试只给载入的函数副本增加启动观察点，取消、等待和 `Kill()` 仍执行原有实现。另有延迟启动且父级在关窗前超时的回归：父级必须清理仍存活的子进程，外层测试持有该进程句柄，验证父级确实超时失败、未触发关窗、对应子进程已经退出。外层失败兜底另用子进程自己发布的就绪身份回收进程，避免登记逻辑损坏时连回归本身也留下进程。
 
 `tests/file-manager-cancellation-mutations.ps1` 还会分别在临时副本中禁用主动取消、`Fm-Transfer` 的 `Kill()`、启动身份登记和父级清理。四种故障都必须被相应用例检出：要求测试进程非零退出、报错原因符合预期，并在外层兜底清理前通过进程句柄以及 PID、启动时间确认没有残留子进程。故障副本意外通过、因无关错误退出或留下进程，都会使统一入口失败。该脚本不依赖 Python 或外部测试框架，CI 在 PowerShell 5.1 与 7 中均运行。
+
+### 独立功能回归
+
+除文件管理外，各独立功能回归同样可分别在 Windows PowerShell 5.1 与 PowerShell 7 中运行：
+
+```powershell
+# 有线切无线投屏
+powershell -NoProfile -File tests/usb-wireless-mirror.ps1
+# 独立虚拟窗口及控制模式约束
+powershell -NoProfile -File tests/independent-window.ps1
+# 设置加载、保存与异常备份（.bak）
+powershell -NoProfile -File tests/settings-persistence.ps1
+# 关闭助手断开无线连接与超时预算
+powershell -NoProfile -File tests/exit-disconnect.ps1
+# 命令行参数解析与引号保留
+powershell -NoProfile -File tests/scrcpy-arguments.ps1
+# 摄像头被抢重连与变焦记忆
+powershell -NoProfile -File tests/camera-reconnect-zoom.ps1
+# 设备状态查询、失败处理与取消
+powershell -NoProfile -File tests/device-query-status.ps1
+# 自动重连排除名单（不自动连）
+powershell -NoProfile -File tests/auto-connect-exclusion.ps1
+```
 
 ## 打包发行版
 

@@ -20,12 +20,12 @@ THIRD-PARTY-NOTICES.md       # 第三方组件声明（许可证义务，别乱�
 LICENSE                      # 本项目三个文件的 MIT
 assets/                      # README 引用的截图与图标
 .github/workflows/           # ci.yml（检查）+ release.yml（推 v* 标签即发版）
-tests/                      # 无框架的文件管理回归，统一入口 run-file-manager-regression.ps1
+tests/                      # 无框架回归测试集合：文件管理统一入口 run-file-manager-regression.ps1 及独立功能回归脚本
 ```
 
 - 仓库**不含** scrcpy 二进制：`.gitignore` 排掉了 `scrcpy.exe` / `adb.exe` / `*.dll` / `scrcpy-server` / scrcpy 官方包自带的 `LICENSE.txt` 等。
-- `docs/superpowers/`、`design-preview/`、`.qoder*`、`投屏助手-设置.json`、`投屏助手-错误日志.txt` 都是本地产物，**不入库**。
-- **有 CI，没有测试框架，也没有本地构建脚本。** `ci.yml` 查语法、UTF-8 BOM、行尾与那三个文件在不在，并在 PowerShell 5.1 与 7 中运行文件管理回归；`release.yml` 在推 `v*` 标签时自动打发行包、建 Release、传资产。唯一的「构建」是复制三个文件压 zip——现在由 CI 做，规则见 `CONTRIBUTING.md`。
+- `docs/superpowers/`、`design-preview/`、`.qoder*`、`投屏助手-设置.json`、`投屏助手-设置.json.unreadable-*.bak`、`投屏助手-错误日志.txt` 都是本地产物，**不入库**。
+- **有 CI，没有测试框架，也没有本地构建脚本。** `ci.yml` 查语法、UTF-8 BOM、行尾与那三个文件在不在，并在 PowerShell 5.1 与 7 中运行文件管理回归及独立功能回归；`release.yml` 在推 `v*` 标签时自动打发行包、建 Release、传资产。唯一的「构建」是复制三个文件压 zip——现在由 CI 做，规则见 `CONTRIBUTING.md`。
 
 ## 2. 已确定的事（不要重新讨论）
 
@@ -71,12 +71,13 @@ $err | ForEach-Object { $_.Message }
 ```
 
 - 文件管理回归的统一入口是 `tests/run-file-manager-regression.ps1`，可分别用 `powershell -NoProfile -File tests/run-file-manager-regression.ps1` 和 `pwsh -NoProfile -File tests/run-file-manager-regression.ps1` 运行。CI 在这两个版本中均执行合并、传输、逐项覆盖授权、链接保存目录、关窗取消、超时余量负向回归与故障注入突变回归（mutation）。用例使用模拟 ADB、隔离文件和真实本地子进程，不连接手机；CI 通过只代表这些检查通过，实机验证仍按改动范围执行。
+- 独立功能回归脚本位于 `tests/` 下（如 `usb-wireless-mirror.ps1`、`independent-window.ps1`、`settings-persistence.ps1`、`exit-disconnect.ps1`、`scrcpy-arguments.ps1`、`camera-reconnect-zoom.ps1`、`device-query-status.ps1`、`auto-connect-exclusion.ps1`），覆盖有线切无线、独立虚拟屏、设置加载/保存/备份、退出断开、命令行参数解析、摄像头重连变焦、设备状态与自动重连排除名单。CI 同样在 PowerShell 5.1 与 7 中全部执行。
 
 ## 6. 工作树与提交
 
 - **先看 `git status` 和 `git diff`。** 工作树常常是脏的：可能是另一个人/另一个会话留的未提交改动。**别把别人的改动当垃圾清掉**，也别把自己的改动混进不相关的提交。
 - 提交按功能域分组，一个 commit 一个逻辑单元；commit message 用英文（Conventional Commits），不写 AI 署名。
-- 不要提交 `投屏助手-设置.json`、`投屏助手-错误日志.txt`、`design-preview/`、`.qoder*`、`docs/superpowers/`。
+- 不要提交 `投屏助手-设置.json`、`投屏助手-设置.json.unreadable-*.bak`、`投屏助手-错误日志.txt`、`design-preview/`、`.qoder*`、`docs/superpowers/`。
 - 不要 push、不要打 tag、不要发 Release，除非用户明确要求。
 
 ## 7. 做完的标准

@@ -21,8 +21,9 @@ function Fm-ListDir {
     ) }
 }
 function Fm-ConfirmOverwrite {
+    param($Owner, $Action, $Names, $Where)
     $fixture.Prompts++
-    if ($fixture.Prompts -eq 1) { return 'overwrite' }
+    Check ($Names.Count -eq 1 -and [IO.Path]::GetFileName($Names[0]) -eq 'late.txt') 'Confirmation must name the conflicting child only'
     return 'skip'
 }
 function Show-ResultDialog { $fixture.Errors++; return 'ok' }
@@ -41,14 +42,18 @@ function Fm-Transfer {
     [IO.File]::WriteAllText((Join-Path $stage 'extra.txt'), 'remote-extra')
     return @{ Ok=$true; Aborted=$false; Detail='' }
 }
-$selected = Join-Path $root 'skip-child'
-[void][IO.Directory]::CreateDirectory((Join-Path $selected 'album'))
-$fixture.Late = $true
-& $download
-Check ($fixture.Prompts -eq 2 -and $fixture.Errors -eq 0) 'Late conflict was not reconfirmed'
-Check ([IO.File]::ReadAllText((Join-Path $selected 'album/late.txt')) -eq 'local') 'Skipped file changed'
-Check ([IO.File]::ReadAllText((Join-Path $selected 'album/extra.txt')) -eq 'remote-extra') 'Nonconflicting sibling not saved'
-Check (@(Get-ChildItem -LiteralPath $selected -Filter '__scrcpy_pull_*' -Force).Count -eq 0) 'Stage leaked'
+foreach ($case in @('initial-child-conflict', 'late-child-conflict')) {
+    $selected = Join-Path $root $case
+    [void][IO.Directory]::CreateDirectory((Join-Path $selected 'album'))
+    $fixture.Prompts=0; $fixture.Errors=0; $fixture.Transfers=0
+    $fixture.Late = $case -eq 'late-child-conflict'
+    if (-not $fixture.Late) { [IO.File]::WriteAllText((Join-Path $selected 'album/late.txt'), 'local') }
+    & $download
+    Check ($fixture.Prompts -eq 1 -and $fixture.Errors -eq 0) "Unexpected confirmation or error: $case"
+    Check ([IO.File]::ReadAllText((Join-Path $selected 'album/late.txt')) -eq 'local') 'Skipped file changed'
+    Check ([IO.File]::ReadAllText((Join-Path $selected 'album/extra.txt')) -eq 'remote-extra') 'Nonconflicting sibling not saved'
+    Check (@(Get-ChildItem -LiteralPath $selected -Filter '__scrcpy_pull_*' -Force).Count -eq 0) 'Stage leaked'
+}
 $outside = Join-Path $root 'outside'
 [void][IO.Directory]::CreateDirectory($outside)
 [IO.File]::WriteAllText((Join-Path $outside 'sentinel.txt'), 'original')
@@ -57,7 +62,7 @@ $selected = Join-Path $root 'unrelated-link'
 [void](New-Item -ItemType Junction -Path (Join-Path $selected 'album/unrelated') -Target $outside)
 $fixture.Prompts=0; $fixture.Errors=0; $fixture.Transfers=0; $fixture.Late=$false
 & $download
-Check ($fixture.Transfers -eq 1 -and $fixture.Errors -eq 0) 'Unrelated link blocked merge'
+Check ($fixture.Transfers -eq 1 -and $fixture.Errors -eq 0 -and $fixture.Prompts -eq 0) 'Unrelated link blocked merge'
 Check ([IO.File]::ReadAllText((Join-Path $selected 'album/extra.txt')) -eq 'remote-extra') 'Merge missing output'
 Check ([IO.File]::ReadAllText((Join-Path $outside 'sentinel.txt')) -eq 'original' -and @(Get-ChildItem -LiteralPath $outside).Count -eq 1) 'Outside directory changed'
 $selected = Join-Path $root 'matched-link'
@@ -86,5 +91,5 @@ function Fm-ListDir {
     return @{ Ok=$true; Hidden=0; Items=$entries }
 }
 $manifest = @(Assert-FmRemoteTree $dlg 'fixture' '/sdcard/album')
-Check ($manifest.Count -eq 2 -and $manifest -contains 'sub' -and $manifest -contains 'sub/leaf.txt') 'Nested remote manifest lost paths'
+Check ($manifest.Count -eq 2 -and $manifest[0].Relative -eq 'sub' -and $manifest[0].IsDir -and $manifest[1].Relative -eq 'sub/leaf.txt' -and -not $manifest[1].IsDir) 'Nested remote manifest lost paths or types'
 'PASS file manager merge regression on PowerShell ' + $PSVersionTable.PSVersion

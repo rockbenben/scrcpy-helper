@@ -1,5 +1,6 @@
 # 用户运行时生成的设置
 投屏助手-设置.json
+投屏助手-设置.json.unreadable-*.bak
 settings.json
 
 # 用户运行时生成的错误日志（脚本旁，下一次未处理异常会追加）

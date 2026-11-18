@@ -1,6 +1,6 @@
 name: CI
 
-# 每次 push 到 main、提 PR，或被 release.yml 复用时，检查脚本约束并运行文件管理回归。
+# 每次 push 到 main、提 PR，或被 release.yml 复用时，检查脚本约束并运行回归。
 #
 # 文件管理回归使用隔离文件和模拟 ADB，后台取消另验证真实本地子进程；不需要手机。
 # 基础检查负责这些会静默影响启动和发行包的问题：
@@ -95,3 +95,67 @@ jobs:
       - name: File manager regressions with PowerShell 7
         shell: pwsh
         run: ./tests/run-file-manager-regression.ps1
+
+      - name: USB-to-wireless mirroring regression with Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/usb-wireless-mirror.ps1
+
+      - name: USB-to-wireless mirroring regression with PowerShell 7
+        shell: pwsh
+        run: ./tests/usb-wireless-mirror.ps1
+
+      - name: Independent window regression with Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/independent-window.ps1
+
+      - name: Independent window regression with PowerShell 7
+        shell: pwsh
+        run: ./tests/independent-window.ps1
+
+      - name: Settings persistence regression with Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/settings-persistence.ps1
+
+      - name: Settings persistence regression with PowerShell 7
+        shell: pwsh
+        run: ./tests/settings-persistence.ps1
+
+      - name: Exit disconnect regression with Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/exit-disconnect.ps1
+
+      - name: Exit disconnect regression with PowerShell 7
+        shell: pwsh
+        run: ./tests/exit-disconnect.ps1
+
+      - name: Scrcpy argument regression with Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/scrcpy-arguments.ps1
+
+      - name: Scrcpy argument regression with PowerShell 7
+        shell: pwsh
+        run: ./tests/scrcpy-arguments.ps1
+
+      - name: Camera reconnect zoom regression with Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/camera-reconnect-zoom.ps1
+
+      - name: Camera reconnect zoom regression with PowerShell 7
+        shell: pwsh
+        run: ./tests/camera-reconnect-zoom.ps1
+
+      - name: Device query status regression with Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/device-query-status.ps1
+
+      - name: Device query status regression with PowerShell 7
+        shell: pwsh
+        run: ./tests/device-query-status.ps1
+
+      - name: Automatic connection exclusion regression with Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/auto-connect-exclusion.ps1
+
+      - name: Automatic connection exclusion regression with PowerShell 7
+        shell: pwsh
+        run: ./tests/auto-connect-exclusion.ps1

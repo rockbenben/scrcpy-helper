@@ -245,7 +245,7 @@ function Invoke-Hidden {
 # worker 只使用快照和取消标志，绝不读写控件或实时设置。
 function Invoke-DeviceScan {
     param($AdbPath, [string[]]$Candidates, [bool]$ConnectAlways, $InfoCache, $Control, [int]$BudgetMs = 15000)
-    $scan = [pscustomobject]@{ Success = $false; Devices = @(); Connected = @(); Info = @{}; Error = '' }
+    $scan = [pscustomobject]@{ Success = $false; Cancelled = $false; Devices = @(); Connected = @(); Info = @{}; Error = '' }
     $clock = [Diagnostics.Stopwatch]::StartNew()
     function Run-Adb {
         param([string[]]$Arguments, [int]$Limit = 3000)
@@ -255,7 +255,8 @@ function Invoke-DeviceScan {
     }
     function Read-Devices {
         $r = Run-Adb @('devices')
-        if (-not $r.Started -or $r.ExitCode -ne 0 -or $r.TimedOut -or $r.Cancelled -or $r.Stdout -notmatch 'List of devices attached') {
+        if ($r.Cancelled) { $scan.Cancelled = $true; return $false }
+        if (-not $r.Started -or $r.ExitCode -ne 0 -or $r.TimedOut -or $r.Stdout -notmatch '(?m)^List of devices attached[ \t]*\r?$') {
             $scan.Error = if ($r.Error) { $r.Error } elseif ($r.Stderr) { $r.Stderr } else { 'adb devices 未在时限内返回有效设备列表' }
             return $false
         }
@@ -440,6 +441,13 @@ function Wait-UiTask {
         return $box.Result
     } finally { $wait.Dispose() }
 }
+# 手动刷新只查询当前设备，保留等待框的取消结果和后台扫描的错误信息。
+function Wait-DeviceScan {
+    param($Owner)
+    return (Wait-UiTask -Owner $Owner -Inputs @{ Adb=$adb } -Work {
+        Invoke-DeviceScan -AdbPath $Inputs.Adb -Candidates @() -ConnectAlways $false -InfoCache $InfoCache -Control $Control
+    })
+}
 function Invoke-UiCommand {
     param($Owner, [string]$FilePath, [string[]]$ArgumentList = @(), [int]$TimeoutMs = 15000)
     return (Wait-UiTask -Owner $Owner -Inputs @{ FilePath = $FilePath; ArgumentList = $ArgumentList; TimeoutMs = $TimeoutMs } -Work {
@@ -500,6 +508,62 @@ function Connect-DevicesUi {
     } -Work {
         Invoke-ConnectDevices -Adb $Inputs.Adb -Addresses $Inputs.Addresses -Probe:$Inputs.Probe -Control $Control
     }
+}
+function Invoke-UsbWirelessConnection {
+    param($Adb, [string]$Serial, $Control)
+    $result = [pscustomobject]@{ Address = $null; Error = '' }
+    if ($Control.Cancelled) { return $result }
+    $route = Invoke-ShortCommand $Adb @('-s',$Serial,'shell','ip','route') -TimeoutMs 3000 -Control $Control
+    if (-not (Test-CommandSuccess $route)) {
+        $result.Error = Get-CommandDetail $route
+        return $result
+    }
+    # 从选中的 USB 设备取 WLAN 地址，不能用设备列表中新出现的第一台无线设备。
+    $ip = $null
+    foreach ($line in ($route.Stdout -split "`r?`n")) {
+        if ($line -match '\bdev[ \t]+wlan\S*[ \t]+.*\bsrc[ \t]+(\d{1,3}(?:\.\d{1,3}){3})(?=\s|$)' -and
+            (Test-TcpAddress ($matches[1] + ':5555'))) {
+            $ip = $matches[1]
+            break
+        }
+    }
+    if (-not $ip) { $result.Error = '没能读取手机的 Wi-Fi 地址。'; return $result }
+    if ($Control.Cancelled) { return $result }
+
+    $portArgs = @('-s',$Serial,'shell','getprop','service.adb.tcp.port')
+    $readPort = Invoke-ShortCommand $Adb $portArgs -TimeoutMs 2000 -Control $Control
+    $port = 0
+    if ($Control.Cancelled) { return $result }
+    # 已启用的端口可能并非 5555，重复 tcpip 会重启 adbd，影响已有会话。
+    if (-not (Test-CommandSuccess $readPort) -or
+        -not [int]::TryParse($readPort.Stdout.Trim(), [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+        $port = 5555
+        $restart = Invoke-ShortCommand $Adb @('-s',$Serial,'tcpip',"$port") -TimeoutMs 5000 -Control $Control
+        if (-not (Test-CommandSuccess $restart)) {
+            $result.Error = Get-CommandDetail $restart
+            return $result
+        }
+        $ready = $false
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        # tcpip 返回时 adbd 可能还在重启，等设备确认端口再尝试连接。
+        while (-not $Control.Cancelled -and $clock.ElapsedMilliseconds -lt 10000) {
+            $left = 10000 - [int]$clock.ElapsedMilliseconds
+            $readPort = Invoke-ShortCommand $Adb $portArgs -TimeoutMs ([Math]::Max(1,[Math]::Min(1000,$left))) -Control $Control
+            if ((Test-CommandSuccess $readPort) -and $readPort.Stdout.Trim() -eq "$port") {
+                $ready = $true
+                break
+            }
+            if (-not $Control.Cancelled) { Start-Sleep -Milliseconds 250 }
+        }
+        if (-not $ready) { $result.Error = '等待手机启用网络 ADB 超时。'; return $result }
+    }
+
+    $address = "${ip}:$port"
+    $connection = Invoke-ConnectDevices $Adb @($address) $Control
+    $record = $connection.Records | Select-Object -First 1
+    if ($record.Success -and -not $connection.Cancelled) { $result.Address = $record.Address }
+    else { $result.Error = $record.Error }
+    return $result
 }
 function Invoke-PairDiscovery {
     param($Adb,$PairAddress,$Code,$Ip,$Control)
@@ -670,7 +734,35 @@ function Stop-DevicesUi {
     }
 }
 
-$script:closeState=@{ InProgress=$false }
+function Invoke-ExitDisconnect {
+    param($Adb, [string[]]$Addresses, $Control, [int]$BudgetMs=15000)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $failed = @()
+    $attempted = 0
+    foreach ($addr in $Addresses) {
+        $left = $BudgetMs - [int]$clock.ElapsedMilliseconds
+        if ($Control.Cancelled -or $left -le 0) { break }
+        $command = Invoke-ShortCommand $Adb @('disconnect',$addr) -TimeoutMs ([Math]::Min(3000,$left)) -Control $Control
+        if ($command.Cancelled) { break }
+        $attempted++
+        if ((Test-CommandSuccess $command) -and -not $command.Error) { continue }
+        $detail = Get-CommandDetail $command
+        # 已记住的设备可以早已离线。ADB 明确找不到这条连接时，断开目标已经达成。
+        $reportedAddress = [regex]::Escape($addr)
+        if (Test-MdnsSerial $addr) { $reportedAddress += '(?::5555)?' }
+        if ($command.Started -and -not $command.TimedOut -and
+            $detail -match ("(?m)^error: no such device '" + $reportedAddress + "'\s*$")) { continue }
+        if (-not $detail) { $detail = 'ADB 未返回有效的断开结果。' }
+        $failed += [pscustomobject]@{ Address=$addr; Error=$detail }
+    }
+    $unprocessed = @($Addresses | Select-Object -Skip $attempted)
+    [pscustomobject]@{
+        Success=($failed.Count -eq 0 -and $unprocessed.Count -eq 0 -and -not $Control.Cancelled)
+        Failed=$failed; Unprocessed=$unprocessed; Cancelled=[bool]$Control.Cancelled
+    }
+}
+
+$script:closeState=@{ InProgress=$false; DisconnectAddresses=@() }
 function Confirm-AppExit {
     param($Owner)
     return ([System.Windows.Forms.MessageBox]::Show($Owner,"正在录屏。关闭助手会先尝试正常停止录制。`n`n确定要关闭吗？`n（想继续录、只收起助手，点最小化即可）",'正在录屏','YesNo','Warning') -eq 'Yes')
@@ -685,25 +777,41 @@ function Request-AppClose {
     try {
         Update-ProcessLifecycle
         if ((Test-Recording) -and -not (Confirm-AppExit $Owner)) { return }
-        $addresses=@(@($script:knownDevices.Keys) + @($scrcpyProcs | ForEach-Object { $_.Serial }) |
+        $addresses=@(@($script:knownDevices.Keys) + @($scrcpyProcs | ForEach-Object { $_.Serial }) + @($script:closeState.DisconnectAddresses) |
             Where-Object { Test-Wireless $_ } | Select-Object -Unique)
         Stop-DeviceScans
         $quiesced=$true
         # 旧查询已取消；只允许 shutdown 任务运行，用户取消退出后可重新发起普通查询。
         $script:deviceScanState.Closing=$false
         $script:deviceScanState.Paused=$false
+        # 停止投屏会清掉进程表；用户取消退出后仍要能重试这些地址。
+        if ($settings.disconnectOnClose) { $script:closeState.DisconnectAddresses = $addresses }
         $stopped=Stop-AllScrcpy $Owner
         if (-not $stopped.Success) { return }
         if ($settings.disconnectOnClose -and $addresses.Count) {
-            $disconnected=Wait-UiTask -Owner $Owner -Kind 'shutdown' -Inputs @{ Adb=$adb; Addresses=$addresses } -Work {
-                $clock=[Diagnostics.Stopwatch]::StartNew()
-                foreach ($addr in $Inputs.Addresses) {
-                    if ($Control.Cancelled -or $clock.ElapsedMilliseconds -ge 15000) { break }
-                    [void](Invoke-ShortCommand $Inputs.Adb @('disconnect',$addr) -TimeoutMs ([Math]::Max(1,[Math]::Min(3000,15000-[int]$clock.ElapsedMilliseconds))) -Control $Control)
-                }
-                [pscustomobject]@{ Cancelled=[bool]$Control.Cancelled }
+            $disconnected=Wait-UiTask -Owner $Owner -Kind 'shutdown' -Functions @(
+                'Invoke-ExitDisconnect','Test-CommandSuccess','Get-CommandDetail'
+            ) -Inputs @{ Adb=$adb; Addresses=$addresses } -Work {
+                Invoke-ExitDisconnect $Inputs.Adb $Inputs.Addresses $Control
             }
             if ($disconnected.Cancelled) { return }
+            if (-not $disconnected.Success) {
+                if ($disconnected.Failed.Count -or $disconnected.Unprocessed.Count) {
+                    $failed = @($disconnected.Failed | ForEach-Object { "$($_.Address) · $($_.Error)" })
+                    $unprocessed = @($disconnected.Unprocessed)
+                    $script:closeState.DisconnectAddresses = @($disconnected.Failed | ForEach-Object { $_.Address }) + $unprocessed
+                    $summary = "断开失败 $($failed.Count) 台，尚未处理 $($unprocessed.Count) 台。"
+                    $detail = (@(if ($failed.Count) { '断开失败'; $failed }
+                                 if ($unprocessed.Count) { '尚未处理'; $unprocessed }) -join "`r`n")
+                } else {
+                    # 后台任务未返回报告时，不能推断哪些地址已处理。
+                    $summary = '无法确认无线设备的断开结果。'
+                    $detail = (@('未确认结果') + $addresses + @($disconnected.Error)) -join "`r`n"
+                }
+                $choice = Show-ResultDialog $Owner '关闭助手' '无线连接未全部断开' "$summary 可以选择「仍然退出」或「取消」。" $detail @('exit','cancel') -ExpandDetail -CancelByDefault
+                if ($choice -ne 'exit') { return }
+            }
+            $script:closeState.DisconnectAddresses = @()
         }
         if ($Owner.WindowState -eq [System.Windows.Forms.FormWindowState]::Normal) {
             if ($settings.winX -ne $Owner.Location.X -or $settings.winY -ne $Owner.Location.Y) {
@@ -774,47 +882,88 @@ $defaults = [ordered]@{
 }
 $settings = [ordered]@{}
 foreach ($k in $defaults.Keys) { $settings[$k] = $defaults[$k] }
+$script:preserveUnreadableSettings = $false
 
+function Test-SettingsZoom {
+    param([string]$Value)
+    $zoom = 0.0
+    return ([double]::TryParse($Value, [Globalization.NumberStyles]::Float, [cultureinfo]::InvariantCulture, [ref]$zoom) -and
+        $zoom -gt 0 -and $zoom -lt [double][decimal]::MaxValue)
+}
+function Convert-SettingsValue {
+    param([string]$Name, $Value, $Default)
+    if ($Default -is [bool]) {
+        if ($Value -is [bool]) { return $Value }
+        $flag = $false
+        # PowerShell 把非空字符串 "false" 转成布尔值时会得到 true。
+        if ($Value -is [string] -and [bool]::TryParse($Value, [ref]$flag)) { return $flag }
+        return $Default
+    }
+    if ($Default -is [int]) {
+        $number = 0
+        if (($Value -is [int] -or $Value -is [long] -or $Value -is [string]) -and
+            [int]::TryParse([string]$Value, [ref]$number) -and ($number -ge 0 -or $Name -in @('winX','winY'))) {
+            return $number
+        }
+        return $Default
+    }
+    # 早期版本把摄像头最大边长档位保存成 JSON 数字。
+    if ($Name -eq 'camResMax' -and ($Value -is [int] -or $Value -is [long])) { $Value = [string]$Value }
+    # 旧版 pwsh 没有 DateKind，沿用原先的字符串转换，避免丢掉被解析器自动转成日期的文本。
+    if ($Value -is [datetime]) { $Value = [string]$Value }
+    if ($Value -isnot [string]) { return $Default }
+    switch ($Name) {
+        'camResMax' { if ($Value -notmatch '^(?:[0-9]+|[0-9]+x[0-9]+)$') { return $Default } }
+        'camZoom' { if (-not (Test-SettingsZoom $Value)) { return $Default } }
+        'ndSize' { if ($Value -and $Value -notmatch '^[0-9]+x[0-9]+$') { return $Default } }
+        'ndDpi' {
+            $dpi = 0
+            if ($Value -and (-not [int]::TryParse($Value, [ref]$dpi) -or $dpi -le 0)) { return $Default }
+        }
+        'crop' { if ($Value -and $Value -notmatch '^[0-9]+:[0-9]+:[0-9]+:[0-9]+$') { return $Default } }
+        'recFormat' { if ($Value -cnotin @('mp4','mkv')) { return $Default } }
+        'ndAudio' { if ($Value -cnotin @('auto','on','off')) { return $Default } }
+    }
+    return $Value
+}
 function Load-Settings {
     if (-not (Test-Path -LiteralPath $cfgPath)) { return }
     try {
-        $j = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        foreach ($k in @($settings.Keys)) {
-            if ($null -ne $j.$k) {
-                if ($settings[$k] -is [bool]) { $settings[$k] = [bool]$j.$k }
-                elseif ($settings[$k] -is [int]) { $settings[$k] = [int]$j.$k }
-                else { $settings[$k] = [string]$j.$k }
+        $raw = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 -ErrorAction Stop
+        # ConvertFrom-Json 会展开单元素数组，先确认文件本身的根节点是对象。
+        if (-not $raw -or -not $raw.TrimStart().StartsWith('{')) { throw '无效的设置文件' }
+        $jsonArgs = @{ InputObject=$raw; ErrorAction='Stop' }
+        # 设备备注可能恰好长得像日期，支持该选项的 PowerShell 要按字符串保留。
+        if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) { $jsonArgs.DateKind = 'String' }
+        $j = ConvertFrom-Json @jsonArgs
+        $script:preserveUnreadableSettings = $false
+    } catch {
+        $script:preserveUnreadableSettings = $true
+        return
+    }
+
+    foreach ($key in $defaults.Keys) {
+        $settings[$key] = Convert-SettingsValue $key $j.PSObject.Properties[$key].Value $defaults[$key]
+    }
+    # 各表独立恢复，坏条目不能挡住同一张表里后面的有效记忆。
+    $maps = @{
+        customApps=$script:customApps; knownDevices=$script:knownDevices
+        deviceNames=$script:deviceNames; camResByDevice=$script:camResByDevice
+    }
+    foreach ($key in $maps.Keys) {
+        $map = $j.PSObject.Properties[$key].Value
+        if ($map -isnot [pscustomobject]) { continue }
+        foreach ($entry in $map.PSObject.Properties) {
+            $settingName = if ($key -eq 'camResByDevice') {
+                if ($entry.Name -like '*|zoom') { 'camZoom' } else { 'camResMax' }
             }
+            $value = Convert-SettingsValue $settingName $entry.Value $null
+            if ($entry.Name -and $value) { $maps[$key][$entry.Name] = $value }
         }
-        # 自定义常用 App 也存在同一个设置文件里：customApps 是个「名称=>包名」对象，不走上面的类型转换
-        if ($j.customApps) {
-            foreach ($p in $j.customApps.PSObject.Properties) {
-                if ($p.Name -and $p.Value) { $script:customApps[[string]$p.Name] = [string]$p.Value }
-            }
-        }
-        # 记住的无线设备同理：knownDevices 是「地址=>备注名」对象
-        if ($j.knownDevices) {
-            foreach ($p in $j.knownDevices.PSObject.Properties) {
-                if ($p.Name -and $p.Value) { $script:knownDevices[[string]$p.Name] = [string]$p.Value }
-            }
-        }
-        # 自定义显示名：deviceNames 是「序列号/地址=>名称」对象
-        if ($j.deviceNames) {
-            foreach ($p in $j.deviceNames.PSObject.Properties) {
-                if ($p.Name -and $p.Value) { $script:deviceNames[[string]$p.Name] = [string]$p.Value }
-            }
-        }
-        # 不自动连接名单：autoConnectExclude 是地址数组
-        if ($j.autoConnectExclude) {
-            foreach ($a in @($j.autoConnectExclude)) { if ($a) { [void]$script:autoConnectExclude.Add([string]$a) } }
-        }
-        # 摄像头尺寸记忆：camResByDevice 是「序列号|前后 => 尺寸」对象
-        if ($j.camResByDevice) {
-            foreach ($p in $j.camResByDevice.PSObject.Properties) {
-                if ($p.Name -and $p.Value) { $script:camResByDevice[[string]$p.Name] = [string]$p.Value }
-            }
-        }
-    } catch { }
+    }
+    foreach ($address in @($j.PSObject.Properties['autoConnectExclude'].Value)) {
+        if ($address -is [string] -and $address) { [void]$script:autoConnectExclude.Add($address) }
+    }
 }
 
 # 把 JSON 重排成规整的 2 空格缩进（Windows PowerShell 5.1 的 ConvertTo-Json 缩进很丑：值对齐在键后、
@@ -851,25 +1000,21 @@ function Save-Settings {
     try {
         $o = [ordered]@{}
         foreach ($k in $settings.Keys) { $o[$k] = $settings[$k] }
-        $ca = [ordered]@{}
-        foreach ($k in $script:customApps.Keys) { $ca[$k] = $script:customApps[$k] }
-        $o['customApps'] = $ca
-        $kd = [ordered]@{}
-        foreach ($k in $script:knownDevices.Keys) { $kd[$k] = $script:knownDevices[$k] }
-        $o['knownDevices'] = $kd
-        $dn = [ordered]@{}
-        foreach ($k in $script:deviceNames.Keys) { $dn[$k] = $script:deviceNames[$k] }
-        $o['deviceNames'] = $dn
+        $o['customApps'] = $script:customApps
+        $o['knownDevices'] = $script:knownDevices
+        $o['deviceNames'] = $script:deviceNames
         $o['autoConnectExclude'] = @($script:autoConnectExclude)
-        $cr = [ordered]@{}
-        foreach ($k in $script:camResByDevice.Keys) { $cr[$k] = $script:camResByDevice[$k] }
-        $o['camResByDevice'] = $cr
-        # 原子写：先写临时文件再替换，避免写到一半崩溃/断电把设置文件截断——那会让 Load-Settings 解析失败、
-        # 静默回退默认值，用户记住的设备/常用 App/备注名全丢。崩在临时文件上则原文件完好，下次照常读。
+        $o['camResByDevice'] = $script:camResByDevice
+        # 原子写：先写临时文件再替换，避免写到一半中断把设置文件截断。
         $tmp = "$cfgPath.tmp"
         (Format-Json ($o | ConvertTo-Json -Depth 5)) | Set-Content -LiteralPath $tmp -Encoding UTF8
-        if (Test-Path -LiteralPath $cfgPath) { [System.IO.File]::Replace($tmp, $cfgPath, [NullString]::Value) }   # 原子替换（第三参给 $null 会被当空路径报错，须用 [NullString]::Value）
-        else { Move-Item -LiteralPath $tmp -Destination $cfgPath -Force }
+        if (Test-Path -LiteralPath $cfgPath) {
+            $backupPath = [NullString]::Value
+            # 整份文件没能读取时，首次保存需要留下原件，防止自动保存抹掉可手动恢复的数据。
+            if ($script:preserveUnreadableSettings) { $backupPath = "$cfgPath.unreadable-$([guid]::NewGuid().ToString('N')).bak" }
+            [System.IO.File]::Replace($tmp, $cfgPath, $backupPath)
+        } else { Move-Item -LiteralPath $tmp -Destination $cfgPath -Force }
+        $script:preserveUnreadableSettings = $false
     } catch {
         $detail = $_.Exception.Message
         try {
@@ -930,10 +1075,15 @@ if (-not (Test-Path -LiteralPath $exe)) {
 # ---------------- 参数拼接 ----------------
 # 解码方式：不选就什么都不传（scrcpy 自己优先用显卡解码，显卡解不了它会回落软件解码）。
 # 选「软件解码」= --hwdec=disabled，是画面花屏/偏色/黑屏时排除显卡兼容问题的开关。
-# 摄像头、独立窗口两段自己拼参数数组、不走 Get-VideoArgs，所以它们要单独带上这个（录制走 Get-VideoArgs，已覆盖）。
 function Get-HwDecArgs {
     if ($settings.hwDec) { return @("--hwdec=$($settings.hwDec)") }
     return @()
+}
+function Get-DisplayCompatibilityArgs {
+    $a = @(Get-HwDecArgs)
+    # 普通投屏与独立窗口都可能遇到机型上报的编码器分辨率限制不准。
+    if ($settings.ignoreEncoderConstraints) { $a += '--ignore-video-encoder-constraints' }
+    return @($a)
 }
 function Get-VideoArgs {
     $a = @()
@@ -942,9 +1092,7 @@ function Get-VideoArgs {
     if ([int]$settings.bitRate -gt 0) { $a += "--video-bit-rate=$($settings.bitRate)M" }
     if ($settings.videoCodec)         { $a += "--video-codec=$($settings.videoCodec)" }
     if ($settings.crop)               { $a += "--crop=$($settings.crop)" }
-    $a += @(Get-HwDecArgs)
-    # 忽略机型上报的编码器分辨率约束(含对齐)：某些机型上报值不准，导致分辨率/独立窗口选不对时的兜底。scrcpy 4.1+ 参数。
-    if ($settings.ignoreEncoderConstraints) { $a += '--ignore-video-encoder-constraints' }
+    $a += @(Get-DisplayCompatibilityArgs)
     return $a
 }
 function Get-AudioArgs {
@@ -1154,7 +1302,52 @@ function Get-NulStdin {
     return $pth
 }
 
-# 启动 scrcpy（不阻塞界面；自动过滤空参数）
+# 高级参数是 Windows 命令行文本。先还原每个参数，之后才能识别标题、录屏等选项。
+function Split-WindowsArguments {
+    param([string]$CommandLine)
+    $arguments = [Collections.Generic.List[string]]::new()
+    $word = [Text.StringBuilder]::new()
+    $quoted = $false
+    $started = $false
+    $slashes = 0
+    for ($i = 0; $i -lt $CommandLine.Length; $i++) {
+        $ch = $CommandLine[$i]
+        if ($ch -eq [char]92) { $slashes++; $started=$true; continue }
+        if ($ch -eq '"') {
+            $started = $true
+            # 只有紧贴双引号的反斜杠才参与转义；引号内的连续两个双引号表示字面引号。
+            [void]$word.Append([char]92, [int][Math]::Floor($slashes / 2))
+            if ($slashes % 2) {
+                [void]$word.Append($ch)
+            } elseif ($quoted -and $i + 1 -lt $CommandLine.Length -and $CommandLine[$i + 1] -eq '"') {
+                [void]$word.Append($ch)
+                $i++
+            } else {
+                $quoted = -not $quoted
+            }
+            $slashes = 0
+            continue
+        }
+        if ($slashes) { [void]$word.Append([char]92, $slashes); $slashes=0 }
+        if (-not $quoted -and [char]::IsWhiteSpace($ch)) {
+            if ($started) {
+                $arguments.Add($word.ToString())
+                [void]$word.Clear()
+                $started = $false
+            }
+            continue
+        }
+        $started = $true
+        [void]$word.Append($ch)
+    }
+    if ($started) {
+        if ($slashes) { [void]$word.Append([char]92, $slashes) }
+        $arguments.Add($word.ToString())
+    }
+    return @($arguments.ToArray())
+}
+
+# 启动器生成的空占位参数应过滤，用户显式输入的 "" 则需要原样传下去。
 function Start-Scrcpy {
     param(
         [string[]]$Options,
@@ -1163,21 +1356,33 @@ function Start-Scrcpy {
         [string]$StderrFile,
         [string]$StdoutFile,
         # 本窗口声音：Auto=同设备已有出声窗口时自动静音（默认）；On=强制出声；Off=强制静音
-        [ValidateSet('Auto', 'On', 'Off')][string]$AudioMode = 'Auto'
+        [ValidateSet('Auto', 'On', 'Off')][string]$AudioMode = 'Auto',
+        [string]$ReconnectCameraZoom
     )
-    $extra = @(); if ($settings.extraArgs) { $extra = @($settings.extraArgs -split '\s+' | Where-Object { $_ }) }
-    $clean = @(($Options + $extra) | Where-Object { $_ -ne '' -and $null -ne $_ })
+    $clean = @($Options | Where-Object { $_ -ne '' -and $null -ne $_ }) + @(Split-WindowsArguments $settings.extraArgs)
+    if ($ReconnectCameraZoom) {
+        # scrcpy 以最后一个 --camera-zoom 为准，恢复值放在面板和自定义参数之后才会生效。
+        $clean += "--camera-zoom=$ReconnectCameraZoom"
+    }
     $Recording=[switch]($Recording -or @($clean | Where-Object { $_ -eq '-r' -or $_ -eq '--record' -or $_ -like '--record=*' }).Count -gt 0)
     $isCamera = @($clean | Where-Object { $_ -like '--video-source=camera*' }).Count -gt 0
     # 解析目标设备序列号（来自 -s），用于「投屏中」标记 / 「停止这台」，并据此给窗口起友好标题
     $serial = ''
-    for ($i = 0; $i -lt $clean.Count - 1; $i++) { if ($clean[$i] -eq '-s') { $serial = $clean[$i + 1]; break } }
-    $winTitle = ''
-    $hadTitle = @($clean | Where-Object { $_ -like '--window-title=*' })
-    if ($hadTitle.Count) {
-        $winTitle = [string]$hadTitle[0] -replace '^--window-title=', ''
-    } elseif ($serial) {
-        # 标题去空格（Windows PowerShell 的 Start-Process 数组传参对带空格的参数引号处理不可靠）
+    $winTitle = $null
+    for ($i = 0; $i -lt $clean.Count; $i++) {
+        $arg = $clean[$i]
+        if ($arg -ceq '-s' -and $i + 1 -lt $clean.Count) {
+            if (-not $serial) { $serial = $clean[$i + 1] }
+            $i++
+        } elseif ($arg.StartsWith('--window-title=', [StringComparison]::Ordinal)) {
+            $winTitle = $arg.Substring('--window-title='.Length)
+        } elseif ($arg -ceq '--window-title' -and $i + 1 -lt $clean.Count) {
+            $i++
+            $winTitle = $clean[$i]
+        }
+    }
+    # 后面的自定义标题会覆盖默认标题，检测窗口时要用 scrcpy 最终收到的值。
+    if ($null -eq $winTitle -and $serial) {
         $title = (Get-FriendlyName $serial) -replace '\s+', '-'
         if ($title) {
             # 设备名/App 名可能含引号或换行；标题最终进命令行，先去掉不可控字符
@@ -1214,7 +1419,7 @@ function Start-Scrcpy {
     }
     # Start-Process 数组传参不会给「含空格的参数」加引号——会把录屏路径 C:\My Videos\x.mp4 拆成多段、
     # 让 scrcpy 收到的 -r 路径残缺、录屏失败。这里自己给含空格/引号的参数补引号，整体作为命令行串传。
-    $cmd = (@($clean | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
+    $cmd = (@($clean | ForEach-Object { if ($_ -eq '' -or $_ -match '[\s"]') { Fm-WinArg $_ } else { $_ } }) -join ' ')
     # StderrFile：摄像头看门狗要靠 stderr 里的报错分类「被抢 / 带不动 / 不明原因」，只对摄像头会话把 stderr 落到文件。
     # scrcpy 是控制台程序：一旦 -RedirectStandardError（=UseShellExecute 关）就会继承本助手的控制台，退出时触发它
     # Windows 版自带的「Press Enter to continue…」暂停——进程卡着不退、还冒出黑窗，看门狗误判成异常又反复重开。
@@ -1299,9 +1504,9 @@ function Wait-ScrcpyWindow {
 # 启动一个 scrcpy 并把 Process 对象拿回来（摄像头看门狗要盯它的退出码和 stderr）；启动失败返回 $null。
 # Start-Scrcpy 默认不输出进程对象，避免返回值漏入事件处理器输出流；显式传 -PassThru 获取进程。
 function Start-CamProc {
-    param([string[]]$argv, [string]$errFile, [string]$outFile)
+    param([string[]]$argv, [string]$errFile, [string]$outFile, [string]$ReconnectCameraZoom)
     $camMode=if ($argv -contains '--no-audio') { 'Off' } else { 'On' }
-    return (Start-Scrcpy $argv -StderrFile $errFile -StdoutFile $outFile -AudioMode $camMode -PassThru)
+    return (Start-Scrcpy $argv -StderrFile $errFile -StdoutFile $outFile -AudioMode $camMode -ReconnectCameraZoom $ReconnectCameraZoom -PassThru)
 }
 function Resume-CameraSession {
     param($Session,$Snapshot)
@@ -1312,28 +1517,29 @@ function Resume-CameraSession {
         & $script:showTempHint '设备已断开，摄像头未自动重连' $cRed 12000
         return
     }
+    # 重启会清空输出日志；单独保留上次有效值，供尚未写出新倍率就再次断流时使用。
     $zoom=Read-CamZoom $Session.OutFile
     if ($null -ne $zoom) { $Session.LastZoom=$zoom }
     $previous=$Session.Proc
     $Session.Proc=$null
     Release-ExitedProcess $previous
-    $Session.Proc=Start-CamProc $Session.Args $Session.ErrFile $Session.OutFile
+    $Session.Proc=Start-CamProc $Session.Args $Session.ErrFile $Session.OutFile -ReconnectCameraZoom $Session.LastZoom
     $Session.StartedAt=Get-Date
     if ($Session.Proc) { & $script:showTempHint '摄像头被亮屏打断，已自动重连；关窗即停' $cGreen }
 }
 
 # 从 scrcpy 的 stdout 日志里取「最后一次生效的倍率」：投屏中每按一下 MOD+↑/↓ 都会打一行 "Set camera zoom: 3.1640973"。
-# 按住不放会自动重复刷几十行、到端点后还会重复打同一个夹住值，所以只认最后一条。
-# 值是 3.1640973 这种脏浮点（每按一步约 +6%），四舍五入到 0.1 就够——面板的步进也是 0.1。
+# 原样保留有效数字，避免重连时随面板步进舍入倍率。
 function Read-CamZoom {
     param([string]$file)
     if (-not $file) { return $null }
     try { $txt = [System.IO.File]::ReadAllText($file) } catch { return $null }
-    $m = [regex]::Matches($txt, 'Set camera zoom:\s*([\d.]+)')
-    if ($m.Count -eq 0) { return $null }
-    $zoom=0.0
-    if (-not [double]::TryParse($m[$m.Count - 1].Groups[1].Value,[Globalization.NumberStyles]::Float,[cultureinfo]::InvariantCulture,[ref]$zoom)) { return $null }
-    return [Math]::Round($zoom,1)
+    $entries = [regex]::Matches($txt, '(?m)Set camera zoom:[ \t]*(\S+)[ \t]*\r?$')
+    for ($i = $entries.Count - 1; $i -ge 0; $i--) {
+        $zoom = $entries[$i].Groups[1].Value
+        if (Test-SettingsZoom $zoom) { return $zoom }
+    }
+    return $null
 }
 function Release-ExitedProcess {
     param($Process)
@@ -1375,7 +1581,7 @@ function Remove-CamSession {
         $zoom=Read-CamZoom $cs.OutFile
         if ($null -eq $zoom) { $zoom=$cs.LastZoom }
         if ($null -ne $zoom -and $cs.Serial -and -not $cs.SkipZoom) {
-            Set-CamZoom $cs.Serial $cs.Facing (Format-Zoom $zoom)
+            Set-CamZoom $cs.Serial $cs.Facing (Format-Zoom ([Math]::Round([double]$zoom,1)))
             Save-Settings
         }
         $previous=$cs.Proc
@@ -1444,16 +1650,6 @@ function Get-ActiveSerials {
         if ($it.Serial -and $it.Proc -and -not $it.Proc.HasExited) { $res += $it.Serial }
     }
     return $res
-}
-# 读取已连接设备序列号列表（state=device）
-function Get-DeviceList {
-    try {
-        $command=Invoke-UiCommand $form $adb @('devices') -TimeoutMs 3000
-        if (-not (Test-CommandSuccess $command)) { return @() }
-        $out=@($command.Stdout -split "`r?`n")
-        $lines = $out | Select-Object -Skip 1 | Where-Object { $_ -match "`tdevice$" }
-        return @($lines | ForEach-Object { ($_ -split "`t")[0] })
-    } catch { return @() }
 }
 # 读取单个地址的 adb 状态：device / offline / unauthorized。查询本身失败返回 $null，地址不在列表返回空串。
 function Get-AdbDeviceState {
@@ -1879,8 +2075,8 @@ function Show-Settings {
     $tt.SetToolTip($chkAudio, '取消勾选则完全不传声音（等同 --no-audio）。')
     $tt.SetToolTip($chkStay, '保持手机不锁屏，避免无线投屏中途断开。想更省电可关掉，让手机自然休眠。')
     $tt.SetToolTip($chkScreenOff, '投屏时关掉手机屏幕，明显省电、还能防偷看（投屏照常进行）。无线投屏想省电首选它。')
-    $tt.SetToolTip($chkReconnect, '开机自动连上附近记住的无线设备；掉线后也会自动连回。会略增耗电，按需开启。')
-    $tt.SetToolTip($chkDisconnect, '不勾（默认）：关掉助手后仍保持手机连接，重开即用、几乎不耗电。勾上：关助手时定向断开助手记住或启动过的无线设备，重开需重新连。')
+    $tt.SetToolTip($chkReconnect, '助手启动时尝试连接附近记住的无线设备，掉线后尝试连回。会跳过标记「不自动连」的设备。会略增耗电，按需开启。')
+    $tt.SetToolTip($chkDisconnect, '不勾（默认）：关掉助手后仍保持手机连接，重开即用、几乎不耗电。勾上：关助手时定向断开助手记住或启动过的无线设备。若提示「无线连接未全部断开」，可查看「断开失败」和「尚未处理」的设备，再选「仍然退出」或「取消」。')
     $tt.SetToolTip($chkShowConsole, '勾上后投屏时会弹出一个黑色控制台窗口，里面显示 scrcpy 的运行日志。默认关闭，不影响正常使用。')
     $tabCommon.Controls.AddRange(@(
         (New-Lbl '清晰度：' 14 16), $nudSize, (New-Caption '越大越清晰，0=不限制' 210 19),
@@ -1939,7 +2135,7 @@ function Show-Settings {
     $chkGamepad = New-Chk '启用手柄（把电脑手柄映射到手机）' $settings.gamepad 14 210
     $tt.SetToolTip($chkTouches, '手机画面上触点处显示小白点，演示时让别人看清你点了哪里。')
     $tt.SetToolTip($cbKb, '绝大多数人选「默认」即可，能正常用电脑上的中文输入法。「游戏模式」让电脑键盘像真键盘一样直接控制游戏，但用不了电脑输入法——想打字就改用手机屏幕上的输入法。装过 ADBKeyboard 这类输入法时可在手机上正常打字。')
-    $tt.SetToolTip($chkNoCtrl, '只看画面、禁止鼠标键盘操作手机；保持唤醒、投屏关屏、显示触摸点和关窗息屏暂不生效。')
+    $tt.SetToolTip($chkNoCtrl, '只看画面、禁止鼠标键盘操作手机；保持唤醒、投屏关屏、显示触摸点和关窗息屏暂不生效。开启「只投屏，不允许控制手机」时，独立窗口不可用。')
     $tt.SetToolTip($chkPowerOff, '结束投屏（关掉投屏窗口）时，顺手把手机屏幕熄灭，省电、防亮屏。')
     $tt.SetToolTip($chkGamepad, '把连在电脑上的游戏手柄映射给手机，适合手游。')
     # 说明紧跟「键盘模式」，两行封顶：离得远用户不知道它讲的是哪一项，长段落还会折出孤儿字
@@ -2009,7 +2205,7 @@ function Show-Settings {
     $txtExtra.Text = $settings.extraArgs
     $lblExHint = New-Lbl '例如：--angle=90   --display-id=1   --time-limit=300' 14 108; $lblExHint.ForeColor = $cMuted
     $tt.SetToolTip($chkLive, '它只决定窗口顶部「已连接/未连接」多久自动更新一次，不影响投屏。开着时仅在窗口处于前台才每几秒刷一次；关掉后不再定时刷新，切回窗口时仍会更新一次，更省资源。')
-    $tt.SetToolTip($txtExtra, '高级用法（可选，一般不用填）：在这里追加 scrcpy 命令行参数，会拼到启动命令末尾，多个用空格分隔。例如 --crop=1080:1920:0:0（裁剪画面）、--angle=90（旋转）、--display-id=1（指定屏幕）。')
+    $tt.SetToolTip($txtExtra, '高级用法（可选，一般不用填）：在这里追加 scrcpy 命令行参数，参数之间用空格分隔。含空格的值用双引号包住，例如 --window-title="Living Room"。')
 
     # 自定义 adb / scrcpy 路径（留空=用本助手同目录自带的）
     $lblPathHdr = New-Lbl '自定义 adb / scrcpy 路径（不填=用自带的）：' 14 150; $lblPathHdr.ForeColor = $cMuted
@@ -2309,15 +2505,16 @@ function Add-ErrorLog {
 # 系统 MessageBox 是白底黑框，和助手的暖米色自绘窗两副面孔；按钮只有「确定」，失败时等于把人弹回起点重做。
 # $Buttons 按主次顺序传（第一个是深色主按钮，最后一个兼作 Esc/取消），返回被点按钮的键。
 function Show-ResultDialog {
-    param($owner, $Title, $Heading, $Body, $Detail = '', $Buttons = @('ok'))
-    $labels = @{ wait='继续等待'; force='强制结束'; ok = '确定'; continue = '继续'; retry = '重试'; ip = '输入 IP 连接'; cancel = '取消' }
-    $widths = @{ wait=96; force=96; ok = 96; continue = 96; retry = 96; ip = 112; cancel = 84 }
+    param($owner, $Title, $Heading, $Body, $Detail = '', $Buttons = @('ok'), [switch]$ExpandDetail, [switch]$CancelByDefault)
+    $labels = @{ wait='继续等待'; force='强制结束'; ok = '确定'; continue = '继续'; retry = '重试'; ip = '输入 IP 连接'; exit = '仍然退出'; cancel = '取消' }
+    $widths = @{ wait=96; force=96; ok = 96; continue = 96; retry = 96; ip = 112; exit = 96; cancel = 84 }
     # 正文按限宽量一次真实高度再定窗高：写死高度会在长文案时把最后一行裁掉
     $capFont = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
     $sz = [System.Windows.Forms.TextRenderer]::MeasureText([string]$Body, $capFont, (New-Object System.Drawing.Size(388, 0)), [System.Windows.Forms.TextFormatFlags]::WordBreak)
     $bodyH = [Math]::Max([int]$sz.Height, 18)
     $linkTop = 44 + $bodyH + 8
     $btnTop = $linkTop + $(if ($Detail) { 28 } else { 8 })
+    if ($Detail -and $ExpandDetail) { $btnTop += 102 }
     $baseH = $btnTop + 50
     $d = New-Dialog $Title 420 $baseH $owner
     $lHead = New-Lbl $Heading 16 16
@@ -2327,13 +2524,14 @@ function Show-ResultDialog {
     $link = $null; $txt = $null
     if ($Detail) {
         $link = New-Object System.Windows.Forms.LinkLabel
-        $link.Text = '查看原因'; $link.AutoSize = $true
+        $link.Text = if ($ExpandDetail) { '收起原因' } else { '查看原因' }
+        $link.AutoSize = $true
         $link.Font = $capFont
         $link.LinkColor = $cMuted; $link.VisitedLinkColor = $cMuted; $link.LinkVisited = $true
         $link.Location = New-Object System.Drawing.Point(16, $linkTop)
         $txt = New-Object System.Windows.Forms.TextBox
         $txt.Multiline = $true; $txt.ReadOnly = $true; $txt.ScrollBars = 'Vertical'
-        $txt.Text = $Detail; $txt.Visible = $false; $txt.TabStop = $false
+        $txt.Text = $Detail; $txt.Visible = [bool]$ExpandDetail; $txt.TabStop = $false
         $txt.Font = New-Object System.Drawing.Font('Consolas', 8.5)
         $txt.Size = New-Object System.Drawing.Size(388, 92)
         $txt.BackColor = $cWhite
@@ -2373,6 +2571,7 @@ function Show-ResultDialog {
     $d.Controls.AddRange($ctl)
     $d.AcceptButton = $created[-1]
     $d.CancelButton = $created[0]
+    if ($CancelByDefault) { $d.AcceptButton = $d.CancelButton; $d.ActiveControl = $d.CancelButton }
     [void]$d.ShowDialog($owner)
     return [string]$d.Tag
 }
@@ -2518,7 +2717,7 @@ function Show-NewDisplay {
         # 虚拟屏保留系统装饰（状态栏/导航栏）：去掉 --no-vd-system-decorations 后，像微信这种 App 会把自己的顶栏
         # 同时画进「状态栏预留区」和正常位置，出现「两条一样的顶栏」；保留系统栏则是正常的「状态栏+单顶栏」手机观感。
         # @() 防单元素退化粘连（同 Get-MirrorArgs 处的坑）：$pre 为空时 $null+单元素串 会变字符串拼接
-        Start-Scrcpy ($pre + @(Get-HwDecArgs) + @(Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + $titleArg + "--start-app=$target") -AudioMode $effAudio
+        Start-Scrcpy ($pre + @(Get-DisplayCompatibilityArgs) + @(Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + $titleArg + "--start-app=$target") -AudioMode $effAudio
     }
 }
 
@@ -2671,9 +2870,36 @@ function Touch-KnownDevice {
     Save-Settings
 }
 
-# 启动自动连接的候选：记住的无线设备(最近在前) 去掉排除名单, 封顶 Max; 默认/上次设备保证纳入并靠前。
+function Start-WirelessMirror {
+    param($Owner, [string]$Serial)
+    if (-not (Test-Wireless $Serial)) {
+        $connection = Wait-UiTask -Owner $Owner -Functions @(
+            'Invoke-UsbWirelessConnection','Invoke-ConnectDevices','Test-CommandSuccess','Get-CommandDetail','Get-AdbDeviceState'
+        ) -Inputs @{ Adb = $adb; Serial = $Serial } -Work {
+            Invoke-UsbWirelessConnection $Inputs.Adb $Inputs.Serial $Control
+        }
+        if ($connection.Cancelled) { return }
+        $address = $connection.Address
+        if (-not $address) {
+            [void](Show-ResultDialog $Owner '无线投屏' '无线连接失败' '请确认数据线仍连着、手机已允许 USB 调试，且电脑与手机在同一个 Wi-Fi。' $connection.Error @('ok'))
+            return
+        }
+        $name = Get-FriendlyName $address -CachedOnly
+        if ($name -eq $address) {
+            $usbName = Get-FriendlyName $Serial -CachedOnly
+            if ($usbName -ne $Serial) { $name = $usbName }
+        }
+        if ($settings.lastWirelessAddr -ne $address) { $settings.lastWirelessAddr = $address; Save-Settings }
+        Touch-KnownDevice $address $name
+        $Serial = $address
+    }
+    # 进程登记和设备管理共用 adb devices 中已确认的无线序列号。
+    Start-Scrcpy (@('-s', $Serial) + (Get-MirrorArgs -Wireless:$true))
+}
+
+# 启动和主功能共用排除名单。默认和上次设备只有在允许自动连接时才优先尝试。
 function Get-AutoConnectCandidates {
-    param([int]$Max = 16)
+    param([int]$Max = [int]::MaxValue)
     $all = @($script:knownDevices.Keys | Where-Object { (Test-Wireless $_) -and (-not (Test-AutoConnectExcluded $_)) })
     if ($all.Count -eq 0) { return @() }
     $priority = @()
@@ -2776,7 +3002,7 @@ function Get-ReachableAddrs {
 # 查询完成后继续原功能；等待只发生在 worker，主流程的 Busy 直到回调完成才释放。
 function Ensure-Devices {
     param($owner, [scriptblock]$OnDone, [scriptblock]$OnFinally)
-    Start-DeviceScan -Owner $owner -Candidates @($script:knownDevices.Keys) -Kind 'ensure' -OnDone $OnDone -OnFinally $OnFinally
+    Start-DeviceScan -Owner $owner -Candidates @(Get-AutoConnectCandidates) -Kind 'ensure' -OnDone $OnDone -OnFinally $OnFinally
 }
 
 function Resolve-Target {
@@ -2906,10 +3132,10 @@ function Show-DeviceManager {
     $tt.SetToolTip($btnStop, '只关选中那台的镜像窗口，其它设备不受影响。')
     $tt.SetToolTip($btnAll, '给每台已连接、还没开窗的设备各开一个窗口。')
     $tt.SetToolTip($btnDefault, '多设备时，其它功能默认对这台做；再点一次取消。')
-    $tt.SetToolTip($btnDisc, '断开这台的无线连接，并先关掉它的投屏窗口（其它设备不受影响）。它仍留在「已记住」里，下次打开助手会自动连回，但断开后不会立刻自己偷偷连回来。想让它以后都不自动连，用「不自动连」。USB 设备请直接拔数据线。')
+    $tt.SetToolTip($btnDisc, '断开这台的无线连接，并先关掉它的投屏窗口（其它设备不受影响）。它仍留在「已记住」里。要让助手跳过这台设备的自动连接，请用「不自动连」。USB 设备请直接拔数据线。')
     $tt.SetToolTip($btnRename, '起个好认的名字，窗口标题和设备列表都会用。')
     $tt.SetToolTip($btnForget, '从「已记住」里去掉，这台设备的自定义名字和「默认设备」标记也一并清掉；以后连上会重新记住。设备还连着时点不动——要先「断开」（或拔掉数据线），否则它会立刻被重新记住。')
-    $tt.SetToolTip($btnAuto, '不自动连：助手启动和掉线时都不再自动连这台（再点恢复自动连）。')
+    $tt.SetToolTip($btnAuto, '「不自动连」会在助手启动、掉线重连和点击投屏、文件管理等主功能时跳过这台设备的自动连接。仍可手动连接，已连接的设备照常使用。再点「恢复自动连」可取消此设置。')
 
     # refresh 把「已连接设备」「正在投屏的序列号」算一次塞进 $state；updateButtons 只读它，不再每次点都跑 adb
     $state = @{ Active = @(); Connected = @(); SnapshotReady=$false }
@@ -2940,9 +3166,7 @@ function Show-DeviceManager {
     }
     $refresh = {
         $state.SnapshotReady=$false
-        $snapshot=Wait-UiTask -Owner $dlg -Inputs @{ Adb=$adb } -Work {
-            Invoke-DeviceScan -AdbPath $Inputs.Adb -Candidates @() -ConnectAlways $false -InfoCache $InfoCache -Control $Control
-        }
+        $snapshot=Wait-DeviceScan $dlg
         if ($snapshot.Cancelled) { return }
         if (-not $snapshot.Success) {
             [void](Show-ResultDialog $dlg '设备管理' '查询设备失败，请稍后重试' '设备列表暂未更新，可以稍后重试。' $snapshot.Error @('ok'))
@@ -3226,7 +3450,8 @@ function Fm-TimeText {
 
 function Fm-NormPath {
     param([string]$p)
-    $t = ([string]$p).Trim()
+    # 空格可能属于设备目录名，内部路径只归一化分隔符和方向段。
+    $t = [string]$p
     if (-not $t) { return '/' }
     $t = $t -replace '/+', '/'
     if (-not $t.StartsWith('/')) { $t = '/' + $t }
@@ -3355,8 +3580,7 @@ function Invoke-FmShell {
     return $r
 }
 
-# 兼容既有调用方：只回文本行。失败 / 超时 / 取消一律回空数组——目录协议缺 FM_DONE 会判「读不到」，
-# 同名检查缺 FM_DONE 会取消上传，绝不会把「没拿到结果」当成「空文件夹」或「没有同名文件」。
+# 简单 shell 调用方需要同时看到标准输出和诊断。目录清单直接用 Invoke-FmShell 读取各自的结果。
 function Fm-Shell {
     param($serial, [string]$Command, $Owner)
     $o = if ($Owner) { $Owner } else { $form }
@@ -3453,11 +3677,6 @@ cd __PATH__ 2>/dev/null || { printf 'ERR\t%s\t-\t-\n' cannot-enter; exit 1; }; f
 # 这时目录内容不完整，必须报「读不到」，不能当成空文件夹。
 function Fm-ParseListLines {
     param($Lines, [string]$path)
-    # 设备掉线 / offline 时 adb 只吐一句英文、没有任何结构化行，若不挡住会被当成「空文件夹」，
-    # 用户还以为手机里真没东西。宁可显示「读不到」，也不要给出假结论。
-    if ((@($Lines) -join "`n") -match '(?i)device (offline|not found)|no devices/emulators|adb: error') {
-        return @{ Ok = $false; Items = @(); Hidden = 0; NeedLegacy = $false }
-    }
     $items = New-Object System.Collections.ArrayList
     $attrs = New-Object System.Collections.ArrayList
     # 设备端为「每一个」遍历到的条目都 stat 了一次，被隐藏的条目也照样占一格属性。
@@ -3538,59 +3757,42 @@ function Fm-ParseListLines {
 function Fm-ListDir {
     param($Owner, $serial, [string]$path)
     $q = Fm-ShQuote $path
-    $lines = @(Fm-Shell $serial ($fmListTemplate.Replace('__PATH__', $q)) $Owner)
-    $r = Fm-ParseListLines $lines $path
-    if ($r.NeedLegacy) {
-        $lines = @(Fm-Shell $serial ($fmListTemplateLegacy.Replace('__PATH__', $q)) $Owner)
-        $r = Fm-ParseListLines $lines $path
+    # 读取失败由命令结果和目录协议判定，文件名可以包含与 ADB 诊断相同的字样。
+    foreach ($template in @($fmListTemplate, $fmListTemplateLegacy)) {
+        $shell = Invoke-FmShell $Owner $serial ($template.Replace('__PATH__', $q))
+        if (-not $shell.Ok) { break }
+        $listing = Fm-ParseListLines $shell.Lines $path
+        if (-not $listing.NeedLegacy) { return $listing }
     }
-    return $r
+    return @{ Ok = $false; Items = @(); Hidden = 0; NeedLegacy = $false }
 }
 
-# 批量查「当前目录下哪些名字已存在」：只回传序号，不回传文件名。
-# 用序号而不是名字，是因为文件名里可能有 Tab/换行，回传名字又会把协议撕开一次。
-$fmExistsTemplate = @'
-i=0; for n in __NAMES__; do i=$((i+1)); if [ -e "./$n" ] || [ -L "./$n" ]; then printf 'EXISTS\t%s\n' "$i"; fi; done; printf 'FM_DONE\n'
-'@
-function Fm-ExistingIndexes {
-    param($Owner, $serial, [string]$path, [string[]]$names)
-    if ($names.Count -eq 0) { return @{ Ok = $true; Indexes = @() } }
-    $qNames = (@($names | ForEach-Object { Fm-ShQuote $_ })) -join ' '
-    # 只替换模板里那一个占位符，路径用拼接塞进去：若路径或文件名里恰好含有占位符字样，
-    # 两次 Replace 会把已经填好的那段再改一次，命令当场变形。
-    $cmd = 'cd ' + (Fm-ShQuote $path) + ' 2>/dev/null || exit 1; ' + $fmExistsTemplate.Replace('__NAMES__', $qNames)
-    $hit = New-Object System.Collections.ArrayList
-    $done = $false
-    foreach ($ln in @(Fm-Shell $serial $cmd $Owner)) {
-        if (([string]$ln).Trim() -eq 'FM_DONE') { $done = $true; continue }
-        $p = ([string]$ln) -split "`t", 2
-        if ($p.Count -eq 2 -and $p[0] -eq 'EXISTS') {
-            $k = 0
-            if ([int]::TryParse($p[1], [ref]$k) -and $k -ge 1 -and $k -le $names.Count) { [void]$hit.Add($k - 1) }
-        }
-    }
-    # 没有 FM_DONE 就说明检查根本没跑完（设备掉线 / cd 失败 / 输出被截断）。
-    # 这时「没有同名项」是不可信的结论，必须让调用方取消操作，而不是照常 push 把原件覆盖掉。
-    return @{ Ok = $done; Indexes = $(if ($done) { $hit.ToArray() } else { @() }) }
-}
-
-# 同名冲突确认：默认落在「取消」上（Button3）。是=覆盖继续，否=跳过同名只处理其余，取消=什么都不做。
+# 完整路径可滚动查看，授权只覆盖这份清单里的文件。
 function Fm-ConfirmOverwrite {
     param($owner, [string]$action, [string[]]$names, [string]$where)
-    $show = @($names | Select-Object -First 12)
-    $list = (@($show | ForEach-Object { '· ' + $_ }) -join "`n")
-    if ($names.Count -gt $show.Count) { $list += "`n· …以及另外 $($names.Count - $show.Count) 项" }
-    $msg = "$where 已经有 $($names.Count) 个同名项，${action}会覆盖它们，覆盖后无法恢复：`n`n$list`n`n「是」= 覆盖并继续（其余项照常处理）`n「否」= 跳过这些同名项，只处理其余的`n「取消」= 什么都不做"
-    # 显式转成 IWin32Window + 强类型枚举：6 个参数的 Show 有两个重载，只靠字符串让 PowerShell
-    # 自己挑，有可能误落到 (String, ..., MessageBoxOptions) 那个上，把窗体当字符串塞进去。
-    $r = [System.Windows.Forms.MessageBox]::Show(
-        [System.Windows.Forms.IWin32Window]$owner, [string]$msg, '发现同名文件',
-        [System.Windows.Forms.MessageBoxButtons]::YesNoCancel,
-        [System.Windows.Forms.MessageBoxIcon]::Warning,
-        [System.Windows.Forms.MessageBoxDefaultButton]::Button3)
-    if ($r -eq [System.Windows.Forms.DialogResult]::Yes) { return 'overwrite' }
-    if ($r -eq [System.Windows.Forms.DialogResult]::No) { return 'skip' }
-    return 'cancel'
+    $dialog = New-Dialog '发现同名文件' 480 300 $owner
+    try {
+        $heading = New-Lbl "$action · 发现 $($names.Count) 个同名项" 16 14
+        $location = New-Txt 16 42 448
+        $location.ReadOnly = $true
+        $location.Text = $where
+        $list = New-Object System.Windows.Forms.TextBox
+        $list.Location = '16,80'; $list.Size = '448,124'
+        $list.Multiline = $true; $list.ReadOnly = $true; $list.ScrollBars = 'Vertical'
+        $list.Text = $names -join [Environment]::NewLine
+        $caption = New-Caption '仅覆盖或跳过列出的冲突项，其余文件继续传输。覆盖后无法恢复。' 16 214
+        $yes = New-SecondaryBtn '覆盖' 160 250 96 34
+        $no = New-SecondaryBtn '跳过' 264 250 96 34
+        $cancel = New-SecondaryBtn '取消' 368 250 96 34
+        $yes.DialogResult = 'Yes'; $no.DialogResult = 'No'; $cancel.DialogResult = 'Cancel'
+        $dialog.Controls.AddRange(@($heading, $location, $list, $caption, $yes, $no, $cancel))
+        $dialog.AcceptButton = $cancel; $dialog.CancelButton = $cancel
+        $dialog.ActiveControl = $cancel
+        $result = $dialog.ShowDialog($owner)
+        if ($result -eq 'Yes') { return 'overwrite' }
+        if ($result -eq 'No') { return 'skip' }
+        return 'cancel'
+    } finally { $dialog.Dispose() }
 }
 
 # adb push / pull：不设总超时（大文件可能传几分钟），靠 DoEvents 保持界面可用；
@@ -3669,57 +3871,95 @@ function Test-FmOverwrite {
 }
 # 授权只记录确认框出现之前实际存在的路径，避免给整批中新出现的目标顺带授权。
 function Get-FmExistingTargets {
-    param([string]$Path, $Control)
+    param([string]$Path, $Control, [bool]$SourceIsDir)
     if ($Control -and $Control.Cancelled) { throw '操作已取消' }
     Assert-FmLocalPath $Path
     if (-not (Test-Path -LiteralPath $Path)) { return @() }
-    return @((Get-Item -LiteralPath $Path -Force -ErrorAction Stop).FullName)
+    $target = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($SourceIsDir -and $target.PSIsContainer) { return @() }
+    return @([IO.Path]::GetFullPath($Path))
 }
 function Get-FmUnapprovedTargets {
-    param([string]$From, [string]$To, $Approved, $Control)
+    param([string]$From, [string]$To, $Approved, $Control, $Skipped)
     if ($Control -and $Control.Cancelled) { throw '操作已取消' }
+    if ($Skipped.ContainsKey([IO.Path]::GetFullPath($To))) { return @() }
     Assert-FmLocalPath $From
-    Assert-FmLocalPath $To
-    $paths = @()
-    if ((Test-Path -LiteralPath $To) -and -not (Test-FmOverwrite $Approved $To)) { $paths += [IO.Path]::GetFullPath($To) }
-    if ((Get-Item -LiteralPath $From -Force -ErrorAction Stop).PSIsContainer) {
+    $sourceIsDir = (Get-Item -LiteralPath $From -Force -ErrorAction Stop).PSIsContainer
+    $existing = @(Get-FmExistingTargets $To $Control $sourceIsDir)
+    if ($existing.Count) {
+        if (-not (Test-FmOverwrite $Approved $To)) { return @($existing) }
+        return @()
+    }
+    if ($sourceIsDir) {
         foreach ($child in @(Get-ChildItem -LiteralPath $From -Force -ErrorAction Stop)) {
-            $paths += @(Get-FmUnapprovedTargets $child.FullName (Join-Path $To $child.Name) $Approved $Control)
+            Get-FmUnapprovedTargets $child.FullName (Join-Path $To $child.Name) $Approved $Control $Skipped
         }
     }
-    return @($paths)
 }
 function Get-FmTargetPaths {
-    param($Owner, [string]$Path, [string]$From = '', $Approved = @{}, [string[]]$Paths = @())
-    return (Invoke-FmTask $Owner -Functions @('Get-FmExistingTargets','Get-FmUnapprovedTargets','Test-FmOverwrite','Assert-FmLocalPath') -Inputs @{ Path=$Path; From=$From; Approved=$Approved; Paths=$Paths } -Work {
+    param($Owner, [string]$Path, [string]$From = '', $Approved = @{}, [hashtable]$Paths = @{}, $Skipped = @{})
+    return (Invoke-FmTask $Owner -Functions @('Get-FmExistingTargets','Get-FmUnapprovedTargets','Test-FmOverwrite','Assert-FmLocalPath') -Inputs @{ Path=$Path; From=$From; Approved=$Approved; Paths=$Paths; Skipped=$Skipped } -Work {
         try {
-            $paths = if ($Inputs.From) { @(Get-FmUnapprovedTargets $Inputs.From $Inputs.Path $Inputs.Approved $Control) }
+            $paths = @(if ($Inputs.From) { Get-FmUnapprovedTargets $Inputs.From $Inputs.Path $Inputs.Approved $Control $Inputs.Skipped }
                      else {
                          # 只扫描远端清单对应的目标，已有目录中的无关内容不会被访问。
-                         $targets = if ($Inputs.Paths.Count) { @($Inputs.Paths) } else { @($Inputs.Path) }
-                         foreach ($target in $targets) { Get-FmExistingTargets $target $Control }
-                     }
+                         if ($Inputs.Paths.Count) {
+                             foreach ($target in $Inputs.Paths.Keys) { Get-FmExistingTargets $target $Control $Inputs.Paths[$target] }
+                         } else { Get-FmExistingTargets $Inputs.Path $Control }
+                     })
             [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$true; Paths=@($paths) }
         } catch {
             [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$false; Cancelled=[bool]$Control.Cancelled; Error=$_.Exception.Message }
         }
     })
 }
-function Assert-FmUploadTarget {
-    param($Owner, $Serial, [string]$Local, [string]$Remote)
-    $q = Fm-ShQuote $Remote
-    $type = @(Fm-Shell $Serial "if [ -L $q ]; then echo FM_LINK; elif [ -d $q ]; then echo FM_DIR; elif [ -e $q ]; then echo FM_FILE; else echo FM_NEW; fi" $Owner | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
-    if ($Owner.IsDisposed -or -not $Owner.Visible) { throw '操作已取消' }
-    if ($type -contains 'FM_LINK') { throw "上传目标是链接：$Remote" }
-    $isDirectory = (Get-Item -LiteralPath $Local -Force -ErrorAction Stop).PSIsContainer
-    if ($type.Count -ne 1 -or $type[0] -notin @('FM_DIR','FM_FILE','FM_NEW')) { throw "无法确认目标类型：$Remote" }
-    if ($type[0] -eq 'FM_NEW') { return }
-    if (($type[0] -eq 'FM_DIR') -ne $isDirectory) { throw "目标类型不符：$Remote" }
-    if ($isDirectory) {
-        foreach ($child in @(Get-ChildItem -LiteralPath $Local -Force -ErrorAction Stop)) {
-            Assert-FmUploadTarget $Owner $Serial $child.FullName (Fm-ChildPath $Remote $child.Name)
+function Get-FmUploadTree {
+    param($Item, [string]$Relative, $Control)
+    if ($Control.Cancelled) { throw '操作已取消' }
+    if ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "路径包含链接：$($Item.FullName)" }
+    return @(
+        @{ Relative = $Relative; IsDir = [bool]$Item.PSIsContainer }
+        if ($Item.PSIsContainer) {
+            $children = @(Get-ChildItem -LiteralPath $Item.FullName -Force -ErrorAction Stop)
+            Assert-FmNames @($children | ForEach-Object { $_.Name })
+            foreach ($child in $children) {
+                Get-FmUploadTree $child ($Relative + '/' + $child.Name) $Control
+            }
         }
+    )
+}
+function Invoke-FmUploadEntry {
+    param($Owner, $Serial, [string]$Base, $Entry, [string]$Stage, [bool]$Overwrite, $Status)
+    $parts = $Entry.Relative.Split('/')
+    $q = './' + (Fm-ShQuote $parts[-1])
+    # 逐级进入已检查的父目录，避免让上传沿着合并树里的链接走到别处。
+    $commands = @("cd $(Fm-ShQuote $Base) || exit 1")
+    for ($i = 0; $i -lt $parts.Count - 1; $i++) {
+        $parent = './' + (Fm-ShQuote $parts[$i])
+        $commands += "[ ! -L $parent ] && cd $parent || exit 1"
     }
+    $guard = "if [ -L $q ]; then echo FM_FAIL;"
+    if (-not $Stage) {
+        $commands += "$guard elif [ -d $q ]; then echo FM_DIR; elif [ -f $q ]; then echo FM_FILE; elif [ -e $q ]; then echo FM_FAIL; else echo FM_NEW; fi"
+    } elseif ($Entry.IsDir) {
+        $commands += "$guard elif [ -d $q ] || mkdir $q; then echo FM_OK; else echo FM_FAIL; fi"
+    } else {
+        $source = Fm-ShQuote (Fm-ChildPath $Stage $Entry.Relative)
+        # 已授权文件按原名移入已定位的父目录。新文件用独占创建，覆盖检查到真正写入之间也不能覆盖原件。
+        $replace = if ($Overwrite) { "mv -f $source ./ && echo FM_OK" } else { 'echo FM_FILE' }
+        $commands += "$guard elif [ ! -f $source ] || [ -L $source ]; then echo FM_FAIL; elif [ -f $q ]; then $replace; elif [ -e $q ]; then echo FM_FAIL; elif (set -C; cat $source > $q); then touch -r $source $q 2>/dev/null; echo FM_OK; else echo FM_FAIL; fi"
+    }
+    $command = $commands -join '; '
+    if ($Stage -and -not $Entry.IsDir) {
+        $result = Fm-ShellLong $Serial $command $Owner $Status "正在上传：$($Entry.Relative)"
+        if ($result.Aborted -or $result.Code -ne 0) { return 'FM_FAIL' }
+        $lines = @($result.Output -split "`r?`n")
+    } else {
+        $lines = @(Fm-Shell $Serial $command $Owner)
+    }
+    $markers = @($lines | Where-Object { $_ -cmatch '^FM_(NEW|DIR|FILE|OK|FAIL)$' })
+    if ($markers.Count -eq 1) { return $markers[0] }
+    return 'FM_FAIL'
 }
 function Assert-FmLocalPath {
     param([string]$Path)
@@ -3752,7 +3992,7 @@ function Assert-FmTree {
     if (Test-Path -LiteralPath $To) {
         $b = Get-Item -LiteralPath $To -Force -ErrorAction Stop
         if ($a.PSIsContainer -ne $b.PSIsContainer) { throw "文件与文件夹同名：$To" }
-        if (-not (Test-FmOverwrite $Overwrite $To)) { throw "目标已存在：$To" }
+        if (-not $a.PSIsContainer -and -not (Test-FmOverwrite $Overwrite $To)) { throw "目标已存在：$To" }
     }
     if ($a.PSIsContainer) {
         $children = @(Get-ChildItem -LiteralPath $From -Force -ErrorAction Stop)
@@ -3810,21 +4050,18 @@ function Move-FmPulledItem {
     } catch { return $false }
 }
 function Assert-FmRemoteTree {
-    param($Owner, $Serial, [string]$Path)
+    param($Owner, $Serial, [string]$Path, [string]$Prefix = '')
     $listing = Fm-ListDir $Owner $Serial $Path
     if (-not $listing.Ok -or $listing.Hidden -gt 0) { throw "目录未能完整检查：$Path" }
     Assert-FmNames @($listing.Items | ForEach-Object { $_.Name })
-    $paths = @()
-    foreach ($entry in $listing.Items) {
+    return @(foreach ($entry in $listing.Items) {
         if ($entry.IsLink) { throw "下载目录含链接：$($entry.Path)" }
-        $paths += $entry.Name
+        $relative = $Prefix + $entry.Name
+        @{ Relative = $relative; IsDir = [bool]$entry.IsDir }
         if ($entry.IsDir) {
-            foreach ($relative in @(Assert-FmRemoteTree $Owner $Serial $entry.Path)) {
-                $paths += $entry.Name + '/' + $relative
-            }
+            Assert-FmRemoteTree $Owner $Serial $entry.Path ($relative + '/')
         }
-    }
-    return @($paths)
+    })
 }
 
 function Fm-Transfer {
@@ -4011,8 +4248,8 @@ function Show-FileManager {
     $btnDel      = New-SecondaryBtn '删除'        496 376 72  34
     $btnDel.ForeColor = $cRed
     $btnClose    = New-PrimaryBtn   '关闭'        576 376 88  34 10
-    $fmtip.SetToolTip($btnUpload, '选电脑上的文件传到手机当前目录（可多选），也可以直接把文件拖进列表。')
-    $fmtip.SetToolTip($btnDownload, '把选中的文件 / 文件夹下载到电脑（可多选，会让你挑保存位置）。合并文件夹时，仅跳过确认框列出的冲突子项，其余文件继续保存；链接检查仅覆盖本次实际写入的路径。')
+    $fmtip.SetToolTip($btnUpload, '选电脑上的文件传到手机当前目录（可多选），也可以直接把文件拖进列表。合并文件夹时，仅覆盖或跳过列出的冲突项，其余文件继续传输。覆盖后无法恢复。')
+    $fmtip.SetToolTip($btnDownload, '把选中的文件 / 文件夹下载到电脑（可多选，会让你挑保存位置）。合并文件夹时，仅覆盖或跳过列出的冲突项，其余文件继续传输。覆盖后无法恢复。')
     $fmtip.SetToolTip($btnRename, '给选中的一个文件 / 文件夹改名（F2）。只在当前目录里改名字，遇到同名会提示换名，不会覆盖。')
     $fmtip.SetToolTip($btnRefresh, '重新读取当前目录，并刷新设备列表。')
     $fmtip.SetToolTip($btnNew, '在手机当前目录里新建一个文件夹。')
@@ -4067,12 +4304,18 @@ function Show-FileManager {
     $updateButtons = {
         # 框选松手时会批量改 Selected，会逐项触发 SelectedIndexChanged；那期间跳过重算，结束后手动调一次。
         if ($state.RubberBusy) { return }
+        # 刷新确认没有设备后仍可留在窗口等待重连，但此时没有文件操作目标。
+        $hasDevice = [bool]$state.Serial
+        foreach ($control in @($btnUpload,$btnNew,$btnGo,$txtPath,$lnkHome,$lnkDl,$lnkDcim,$lnkPic,$lnkRoot)) {
+            $control.Enabled = $hasDevice
+        }
+        $lv.AllowDrop = $hasDevice
         $sel = @($lv.SelectedItems | Where-Object { $_.Tag })
         $btnDownload.Enabled = ($sel.Count -gt 0)
         $btnDel.Enabled = ($sel.Count -gt 0)
         # 重命名只认恰好一项：多选时没有一个明确的「旧名字」，按钮和 F2 一起禁用。
         $btnRename.Enabled = ($sel.Count -eq 1)
-        $btnUp.Enabled = ($state.Path -ne '/')
+        $btnUp.Enabled = ($hasDevice -and $state.Path -ne '/')
     }
 
     # —— 读目录 ——
@@ -4082,6 +4325,13 @@ function Show-FileManager {
         # 读一次就固定住：整次读取（包括失败重试）都用同一台设备、同一个目录。
         $snapSerial = [string]$state.Serial
         $snapPath = [string]$state.Path
+        if (-not $snapSerial) {
+            $lv.Items.Clear()
+            $lblInfo.ForeColor = $cMuted
+            $lblInfo.Text = '没检测到手机，请先连接手机再点刷新。'
+            & $updateButtons
+            return
+        }
         # 列目录要起 adb、设备端还要遍历文件；先把状态行刷出来，别让窗口看着像卡死。
         $lblInfo.ForeColor = $cMuted
         $lblInfo.Text = '正在读取…'
@@ -4133,7 +4383,10 @@ function Show-FileManager {
     }
 
     $enter = {
-        param($p)
+        param([string]$p, [switch]$FromPathBox)
+        if (-not $state.Serial) { return }
+        # 继续容忍手输时贴进来的外侧空白，但路径框原样回车应重新打开当前目录。
+        if ($FromPathBox -and $p -cne $state.Path) { $p = $p.Trim() }
         $state.Path = Fm-NormPath $p
         & $refresh
     }
@@ -4168,67 +4421,105 @@ function Show-FileManager {
             if ($t -and (Test-Path -LiteralPath $t) -and [System.IO.Path]::GetFileName($t)) { $t }
         })
         if ($list.Count -eq 0) { return }
-        # 同名检查要把所有名字拼进一条 adb 命令；超过上限宁可让用户分批，也不能漏检后闷头覆盖。
-        if ($list.Count -gt 200) {
-            [void](Show-ResultDialog $dlg '上传' '一次最多处理 200 项' '同名检查需要把所有文件名放进一条设备端命令里。为避免命令过长导致漏检、进而覆盖手机上的原文件，请分几次上传。' '' @('ok'))
-            return
-        }
-        # adb push 会把手机上的同名文件直接覆盖掉，且不问一声。先在设备端批量查一次同名项，
-        # 让用户选「覆盖 / 跳过 / 取消」；不查就等同于把手机上的原件无声地弄丢。
         $names = @($list | ForEach-Object { [System.IO.Path]::GetFileName($_) })
         try { Assert-FmNames $names } catch {
             [void](Show-ResultDialog $dlg '上传' '请先处理重名或不支持的名称' $_.Exception.Message '' @('ok'))
             return
         }
-        $chk = Fm-ExistingIndexes $dlg $batchSerial $batchPath $names
-        if ($dlg.IsDisposed -or -not $dlg.Visible) { return }
-        if (-not $chk.Ok) {
-            [void](Show-ResultDialog $dlg '上传' '没能确认手机上有没有同名文件' '为避免悄悄覆盖已有文件，本次上传已取消。请确认手机仍连着，点「刷新」后再试。' '' @('ok'))
-            return
-        }
-        $existing = @($chk.Indexes)
-        $approved = @()
-        if ($existing.Count -gt 0) {
-            $choice = Fm-ConfirmOverwrite $dlg '上传' @($existing | ForEach-Object { $names[$_] }) "手机上的 $batchPath"
-            if ($choice -eq 'cancel') { return }
-            if ($choice -eq 'overwrite') { $approved = @($existing | ForEach-Object { $names[$_] }) }
-            if ($choice -eq 'skip') {
-                $keep = @()
-                for ($k = 0; $k -lt $list.Count; $k++) { if ($existing -notcontains $k) { $keep += $list[$k] } }
-                $list = @($keep)
-                if ($list.Count -eq 0) { $lblInfo.ForeColor = $cMuted; $lblInfo.Text = '同名项都跳过了，没有上传任何文件'; return }
-            }
-        }
+        $fail = @(); $aborted = $false
         & $beginProgress $list.Count
         try {
             & $setDeviceLock $true
-            $okN = 0; $fail = @(); $i = 0; $aborted = $false
+            $plans = @()
             foreach ($f in $list) {
-                # 每项开始前先看窗口：关窗后一项都不再启动，短传输来不及进等待循环也照样拦住。
+                $name = [System.IO.Path]::GetFileName($f)
+                if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; return }
+                $snapshot = Invoke-FmTask $dlg -Functions @('Fm-ValidName','Assert-FmNames','Get-FmUploadTree') -Inputs @{ Local=$f; Name=$name } -Work {
+                    try {
+                        $item = Get-Item -LiteralPath $Inputs.Local -Force -ErrorAction Stop
+                        $entries = @(Get-FmUploadTree $item $Inputs.Name $Control)
+                        [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$true; Entries=$entries }
+                    } catch { [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$false; Error=$_.Exception.Message } }
+                }
+                if ($dlg.IsDisposed -or -not $dlg.Visible -or $snapshot.Cancelled) { $aborted = $true; return }
+                if (-not $snapshot.Ok) { $fail += "$name → $($snapshot.Error)"; continue }
+                $conflicts = @()
+                $missingDirs = @{}
+                $badTarget = $null
+                foreach ($entry in $snapshot.Entries) {
+                    $slash = $entry.Relative.LastIndexOf('/')
+                    $parent = if ($slash -ge 0) { $entry.Relative.Substring(0, $slash) } else { '' }
+                    $type = if ($missingDirs.ContainsKey($parent)) { 'FM_NEW' } else {
+                        Invoke-FmUploadEntry $dlg $batchSerial $batchPath $entry
+                    }
+                    if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; return }
+                    if ($type -eq 'FM_NEW') {
+                        if ($entry.IsDir) { $missingDirs[$entry.Relative] = $true }
+                    } elseif ($type -eq 'FM_FILE' -and -not $entry.IsDir) {
+                        $conflicts += $entry.Relative
+                    } elseif ($type -ne 'FM_DIR' -or -not $entry.IsDir) {
+                        $badTarget = $entry.Relative
+                        break
+                    }
+                }
+                if ($badTarget) { $fail += "$badTarget → 无法安全写入目标"; continue }
+                $plans += @{ Local=$f; Name=$name; Entries=$snapshot.Entries; Conflicts=$conflicts }
+            }
+            $approved = @{}
+            $skipped = @{}
+            $allConflicts = @($plans | ForEach-Object { $_.Conflicts })
+            if ($allConflicts.Count) {
+                $choice = Fm-ConfirmOverwrite $dlg '上传' $allConflicts "手机上的 $batchPath"
+                if ($choice -eq 'cancel' -or $dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; return }
+                $decisions = if ($choice -eq 'overwrite') { $approved } else { $skipped }
+                foreach ($path in $allConflicts) { $decisions[$path] = $true }
+            }
+            $okN = 0; $i = 0
+            foreach ($plan in $plans) {
                 if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
                 $i++
-                $name = [System.IO.Path]::GetFileName($f)
-                $remote = Fm-ChildPath $batchPath $name
-                # 批量确认后目录仍可能变化；未获授权的新同名项必须再次确认。
-                $check = Fm-ExistingIndexes $dlg $batchSerial $batchPath @($name)
-                if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
-                if (-not $check.Ok) { $fail += "$name → 无法复查目标，已跳过"; continue }
-                if (@($check.Indexes).Count -gt 0 -and $approved -notcontains $name) {
-                    $answer = Fm-ConfirmOverwrite $dlg '上传' @($name) "手机上的 $batchPath"
-                    if ($answer -eq 'cancel') { $aborted = $true; break }
-                    if ($answer -eq 'skip') { continue }
-                }
-                try { Assert-FmUploadTarget $dlg $batchSerial $f $remote } catch {
+                $name = $plan.Name
+                if ($skipped.ContainsKey($name)) { continue }
+                # push 只写入本次独占的暂存目录，ADB 自带的目录合并不会直接碰到用户文件。
+                $stage = Fm-ChildPath $batchPath ('.scrcpy-upload-' + [guid]::NewGuid().ToString('N'))
+                $qStage = Fm-ShQuote $stage
+                $created = @(Fm-Shell $batchSerial "mkdir $qStage && echo FM_OK" $dlg)
+                if ($created -cnotcontains 'FM_OK') {
                     if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
-                    $fail += "$name → $($_.Exception.Message)"; continue
+                    $fail += "$name → 无法建立上传暂存目录"; continue
                 }
-                # adb 以父目录为目的地时，目录上传合并到同名目录，避免产生 name/name。
-                $remote = $batchPath.TrimEnd('/') + '/'
-                # push 的方向是「电脑→手机」，本地文件大小不变，没有可用的字节信号，按项数步进。
-                $progState.Index = $i; $progState.WatchPath = ''; $progState.TotalBytes = 0L
-                $r = Fm-Transfer (@('-s', $batchSerial, 'push', $f, $remote)) $dlg $lblInfo "正在上传 ($i/$($list.Count))：$name" $progState
-                if ($r.Aborted) { $aborted = $true; break }
-                if ($r.Ok) { $okN++ } else { $fail += "$name → $($r.Detail)" }
+                try {
+                    $progState.Index = $i; $progState.WatchPath = ''; $progState.TotalBytes = 0L
+                    $r = Fm-Transfer (@('-s', $batchSerial, 'push', $plan.Local, ($stage + '/'))) $dlg $lblInfo "正在上传 ($i/$($list.Count))：$name" $progState
+                    if ($r.Aborted -or $dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                    if (-not $r.Ok) { $fail += "$name → $($r.Detail)"; continue }
+                    $itemOk = $true
+                    foreach ($entry in $plan.Entries) {
+                        if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                        $path = $entry.Relative
+                        if ($skipped.ContainsKey($path)) { continue }
+                        $result = Invoke-FmUploadEntry $dlg $batchSerial $batchPath $entry $stage ($approved.ContainsKey($path)) $lblInfo
+                        if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                        if ($result -eq 'FM_FILE') {
+                            $choice = Fm-ConfirmOverwrite $dlg '上传' @($path) "手机上的 $batchPath"
+                            if ($choice -eq 'cancel' -or $dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                            if ($choice -eq 'skip') { continue }
+                            $result = Invoke-FmUploadEntry $dlg $batchSerial $batchPath $entry $stage $true $lblInfo
+                            if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                        }
+                        if ($result -ne 'FM_OK') {
+                            $fail += "$path → 无法安全写入目标"
+                            $itemOk = $false
+                            break
+                        }
+                    }
+                    if ($aborted) { break }
+                    if ($itemOk) { $okN++ }
+                } finally {
+                    # 暂存文件由本批拥有，关掉文件窗口后也要尝试清理。
+                    $cleanup = Invoke-FmShell $null $batchSerial "rm -rf $qStage"
+                    if (-not $cleanup.Ok -and -not $aborted) { $fail += "$stage → 无法清理上传暂存目录" }
+                }
             }
             # 关窗 / 中止后整批到此为止：不刷新、不弹结果框，窗体可能已经没了。
             if ($aborted -or $dlg.IsDisposed -or -not $dlg.Visible) { return }
@@ -4282,14 +4573,14 @@ function Show-FileManager {
             return
         }
         $approvedTargets = @{}
-        $existingTargets = @{}
-        # adb pull 同样会覆盖电脑上已有的同名文件，且不问一声。纯本地检查，不需要 adb。
-        $overlap = @()
-        for ($k = 0; $k -lt $sel.Count; $k++) {
-            $target = Join-Path $dest ([string]$sel[$k].Tag.Name)
-            $targets = @($target)
-            foreach ($relative in @($relativeTargets[[string]$sel[$k].Tag.Name])) {
-                if ($relative) { $targets += Join-Path $target $relative }
+        $skippedTargets = @{}
+        # 同名目录可以共存，只有将被替换或挡住写入的具体路径才算冲突。
+        $conflicts = @(foreach ($item in $sel) {
+            $target = Join-Path $dest $item.Tag.Name
+            $targets = @{}
+            $targets[$target] = [bool]$item.Tag.IsDir
+            foreach ($entry in $relativeTargets[$item.Tag.Name]) {
+                $targets[(Join-Path $target $entry.Relative)] = $entry.IsDir
             }
             $check = Get-FmTargetPaths $dlg $target -Paths $targets
             if ($dlg.IsDisposed -or -not $dlg.Visible -or $check.Cancelled) { return }
@@ -4297,22 +4588,17 @@ function Show-FileManager {
                 [void](Show-ResultDialog $dlg '下载' '无法安全保存这批文件' $check.Error '' @('ok'))
                 return
             }
-            $existingTargets[$k] = @($check.Paths)
-            if ($existingTargets[$k].Count -gt 0) { $overlap += $k }
-        }
-        if ($overlap.Count -gt 0) {
-            $choice = Fm-ConfirmOverwrite $dlg '下载' @($overlap | ForEach-Object { [string]$sel[$_].Tag.Name }) "电脑上的 $dest"
+            $check.Paths
+        })
+        if ($conflicts.Count -gt 0) {
+            $choice = Fm-ConfirmOverwrite $dlg '下载' $conflicts "电脑上的 $dest"
             if ($choice -eq 'cancel') { return }
-            if ($choice -eq 'overwrite') {
-                foreach ($k in $overlap) {
-                    foreach ($path in $existingTargets[$k]) { $approvedTargets[$path] = $true }
-                }
-            }
             if ($choice -eq 'skip') {
-                $keep = @()
-                for ($k = 0; $k -lt $sel.Count; $k++) { if ($overlap -notcontains $k) { $keep += $sel[$k] } }
-                $sel = @($keep)
+                foreach ($path in $conflicts) { $skippedTargets[$path] = $true }
+                $sel = @($sel | Where-Object { -not $skippedTargets.ContainsKey([IO.Path]::GetFullPath((Join-Path $dest $_.Tag.Name))) })
                 if ($sel.Count -eq 0) { $lblInfo.ForeColor = $cMuted; $lblInfo.Text = '同名项都跳过了，没有下载任何文件'; return }
+            } else {
+                foreach ($path in $conflicts) { $approvedTargets[$path] = $true }
             }
         }
         & $beginProgress $sel.Count
@@ -4347,8 +4633,7 @@ function Show-FileManager {
                     if (-not $r.Aborted) {
                         $commit = $null
                         if ($r.Ok) {
-                            $skippedTargets = @{}
-                            $check = Get-FmTargetPaths $dlg $local $stage $approvedTargets
+                            $check = Get-FmTargetPaths $dlg $local $stage $approvedTargets -Skipped $skippedTargets
                             if ($dlg.IsDisposed -or -not $dlg.Visible -or $check.Cancelled) { $aborted=$true; break }
                             if (-not $check.Ok) { $fail += "$($e.Name) → $($check.Error)"; continue }
                             $conflicts = @($check.Paths)
@@ -4710,12 +4995,12 @@ function Show-FileManager {
     })
 
     $btnUp.Add_Click({ Invoke-MainFlow ($goUp) $dlg $script:fmFlow })
-    $btnGo.Add_Click({ Invoke-MainFlow ({ & $enter $txtPath.Text }) $dlg $script:fmFlow })
+    $btnGo.Add_Click({ Invoke-MainFlow ({ & $enter $txtPath.Text -FromPathBox }) $dlg $script:fmFlow })
     $txtPath.Add_KeyDown({
         param($s, $e)
         if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
             $e.SuppressKeyPress = $true
-            Invoke-MainFlow ({ & $enter $txtPath.Text }) $dlg $script:fmFlow
+            Invoke-MainFlow ({ & $enter $txtPath.Text -FromPathBox }) $dlg $script:fmFlow
             # 跳到新目录后把焦点交还列表，否则方向键会一直被路径框当成移动光标吃掉。
             try { [void]$lv.Focus() } catch {}
         }
@@ -4757,20 +5042,24 @@ function Show-FileManager {
     $btnNew.Add_Click({ Invoke-MainFlow ({ & $doNew }) $dlg $script:fmFlow })
     $btnDel.Add_Click({ Invoke-MainFlow ({ & $doDelete }) $dlg $script:fmFlow })
     $btnRefresh.Add_Click({ Invoke-MainFlow ({
-        # 顺带刷新设备列表：刷新时手机可能刚插上 / 刚掉线，下拉框要跟着变。
+        $snapshot = Wait-DeviceScan $dlg
+        if ($dlg.IsDisposed -or -not $dlg.Visible -or $snapshot.Cancelled) { return }
+        if (-not $snapshot.Success) {
+            [void](Show-ResultDialog $dlg '文件管理' '查询设备失败，请稍后重试' '设备列表暂未更新，可以稍后重试。' $snapshot.Error @('ok'))
+            return
+        }
         # 同时清掉 shell 写法缓存：上次探测若正好赶上设备重连失败，会一直用错写法直到关窗。
         $script:fmShellMode = $null
-        $now = @(Get-DeviceList)
-        if ($now.Count -gt 0) {
-            $state.Rebuilding = $true
-            try {
-                $keep = $state.Serial
-                $state.Serials = @($now); $cmbDev.Items.Clear()
-                foreach ($s in $now) { [void]$cmbDev.Items.Add("$(Get-FriendlyName $s)   ·   $s") }
-                $j = [array]::IndexOf($state.Serials, $keep); if ($j -lt 0) { $j = 0; $state.Serial = $now[0]; $script:fmShellMode = $null }
-                $cmbDev.SelectedIndex = $j
-            } finally { $state.Rebuilding = $false }
-        }
+        $state.Rebuilding = $true
+        try {
+            $state.Serials = @($snapshot.Devices)
+            $cmbDev.Items.Clear()
+            foreach ($s in $state.Serials) { [void]$cmbDev.Items.Add("$(Get-FriendlyName $s -CachedOnly)   ·   $s") }
+            $j = [array]::IndexOf($state.Serials, $state.Serial)
+            if ($j -lt 0 -and $state.Serials.Count -gt 0) { $j = 0 }
+            $state.Serial = if ($j -ge 0) { $state.Serials[$j] } else { '' }
+            $cmbDev.SelectedIndex = $j
+        } finally { $state.Rebuilding = $false }
         & $refresh
     }) $dlg $script:fmFlow })
     $btnClose.Add_Click({ $dlg.Close() })
@@ -5177,12 +5466,12 @@ try {
         if ($wl.Count -ge 1) {
             # 已是无线连接：单台直接投；多台优先默认设备，否则让用户挑
             $t = if ($wl.Count -eq 1) { $wl[0] } elseif ($settings.defaultDevice -and ($wl -contains $settings.defaultDevice)) { $settings.defaultDevice } else { Select-Device $form $wl }
-            if ($t) { Start-Scrcpy (@('-s', $t) + (Get-MirrorArgs -Wireless:$true)) }
+            if ($t) { Start-WirelessMirror $form $t }
         }
         elseif ($usb.Count -ge 1) {
             # 只有数据线连着：切到无线（连上后可拔线）。多台先选一台再切
             $t = if ($usb.Count -eq 1) { $usb[0] } else { Select-Device $form $usb }
-            if ($t) { Start-Scrcpy (@('-s', $t, '--tcpip') + (Get-MirrorArgs -Wireless:$true)) }
+            if ($t) { Start-WirelessMirror $form $t }
         }
         else {
             # 没检测到设备：三条路——插线切无线（最省事）/ 配对码（11+）/ 输入 IP 直连（保底·无需配对码）
@@ -5212,7 +5501,10 @@ try {
                     # 点完继续必须重新数一遍设备：不带 -s 的 scrcpy 遇到「还没插线」会报 Could not find any
                     # ADB device、遇到「插着两台」会报 Multiple (2) ADB devices 然后退出，而控制台默认隐藏——
                     # 用户看到的就是「点了继续什么都没发生」。
-                    $devs = @(Get-DeviceList)
+                    $snapshot = Wait-DeviceScan $form
+                    if ($snapshot.Cancelled) { return }
+                    if (-not $snapshot.Success) { Show-DeviceQueryFailure; return }
+                    $devs = @($snapshot.Devices)
                     if ($devs.Count -gt 0) { break }
                     $again = Show-ResultDialog $form '连接手机' '还是没检测到手机' "检查数据线是否插好、手机上是否点过「允许 USB 调试」。手机重启过也要重新插一次线；不想插线也可以直接输 IP。`n`n不会开 USB 调试？看同目录的「使用说明.txt」第一节。" '' @('retry', 'ip', 'cancel')
                     if ($again -eq 'ip') { $wantIp = $true; break }
@@ -5230,7 +5522,7 @@ try {
                 $t = if ($usb.Count -eq 1) { $usb[0] }
                      elseif ($devs.Count -eq 1) { $devs[0] }
                      else { Select-Device $form $devs '无线投屏 · 选择设备' }
-                if ($t) { Start-Scrcpy (@('-s', $t, '--tcpip') + (Get-MirrorArgs -Wireless:$true)) }
+                if ($t) { Start-WirelessMirror $form $t }
             }
             elseif ($pick.Tag -eq 'pair') {
                 $addr = Show-WirelessPair $form
@@ -5358,7 +5650,7 @@ try {
             $facing = if ($rbFront.Checked) { 'front' } else { 'back' }
             $zs = Format-Zoom $nudZoom.Value
             Set-CamRemembered $serial $facing $selVal                  # 分辨率按设备+前后记
-            Set-CamZoom $serial $facing $zs                            # 初始倍率同理（看门狗重连沿用同一份参数，倍率不会丢）
+            Set-CamZoom $serial $facing $zs                            # 初始倍率同理
             # 面板其余选择记成全局偏好，下次打开沿用：前后置 / 横竖屏 / 倒置修正 / 补光灯 / 麦克风
             $settings.camFacing = $facing
             $settings.camOrientation = if ($rbPort.Checked) { 'port' } else { 'land' }
@@ -5463,12 +5755,21 @@ try {
         }
     }) })
 
-    $btnNd.Add_Click({ Invoke-MainFlow -WithDevices -Source $btnNd ({
-        param($devices)
-        $serial = Resolve-TargetForFeature $form 11 '独立窗口' -Devices $devices   # 点击即定设备、查版本，不够直接弹提示并中止
-        if (-not $serial) { return }
-        Show-NewDisplay $form $serial
-    }) })
+    $btnNd.Add_Click({
+        # scrcpy 的 --start-app 和 --flex-display 都需要控制通道，禁用控制时无需连接设备。
+        if ($settings.noControl) {
+            Invoke-MainFlow ({
+                [void](Show-ResultDialog $form '独立窗口' '独立窗口需要在手机上启动应用' '开启「只投屏，不允许控制手机」时，独立窗口不可用。可以用有线投屏或无线投屏只看画面。' '' @('ok'))
+            }) -Source $btnNd
+            return
+        }
+        Invoke-MainFlow -WithDevices -Source $btnNd ({
+            param($devices)
+            $serial = Resolve-TargetForFeature $form 11 '独立窗口' -Devices $devices   # 点击即定设备、查版本，不够直接弹提示并中止
+            if (-not $serial) { return }
+            Show-NewDisplay $form $serial
+        })
+    })
 
     # 设备状态轮询：仅在窗口处于前台时进行；最小化/失焦自动暂停，省电省资源
     $timer = New-Object System.Windows.Forms.Timer
@@ -5478,7 +5779,7 @@ try {
     # 摄像头看门狗：手机亮屏/人脸解锁时，Android 相机服务会把摄像头从 scrcpy（shell 优先级低）手里抢走——
     # 这是系统级仲裁，scrcpy 挡不住。只能事后自救。退出后按「退出码 + stderr 报错」分类（病因串核对自 scrcpy 4.x）：
     # ① 退出码 0 = 用户自己关窗 / Stopped 标记 = 助手主动停止 → 不重连；
-    # ② stderr 有被抢病因（CAMERA_IN_USE / Camera disconnected 等）= 被抢 → 原参数重连（退避递增，连 12 次失败才罢手）；
+    # ② stderr 有被抢病因（CAMERA_IN_USE / Camera disconnected 等）= 被抢 → 带上最后有效倍率重连（退避递增，连 12 次失败才罢手）；
     # ③ stderr 有配置/编码器病因（Camera configuration error / MediaCodec 栈等）= 分辨率带不动。
     #    已去掉 --no-downsize-on-error，scrcpy 4.1 能降档时会内部单步降档、进程不退；真走到这里 = 它把分级阶梯也试完了仍开不出
     #    → 直接停并提示选更低分辨率（不再手动换档，那套已交给 4.1 原生）；
