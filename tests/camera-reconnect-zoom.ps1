@@ -42,12 +42,18 @@ function Start-Process {
     $launches.Add($ArgumentList)
     # The real launch truncates the same log, so subsequent reconnects cannot read the previous value from disk.
     [IO.File]::WriteAllText($RedirectStandardOutput, '')
-    return [pscustomobject]@{ HasExited=$true }
+    $process = [pscustomobject]@{ HasExited=$true; HandleCaptured=$false }
+    $process | Add-Member ScriptProperty Handle {
+        $this.HandleCaptured = $true
+        return [IntPtr]1
+    }
+    return $process
 }
 function Assert-Reconnect($Session, [string]$Zoom, [string]$Label) {
     $before = $launches.Count
     Resume-CameraSession $Session $snapshot
     Check ($launches.Count -eq ($before + 1)) "$Label did not launch scrcpy exactly once"
+    Check $Session.Proc.HandleCaptured "$Label did not retain the process handle needed to read the exit code"
     $actual = @(Split-WindowsArguments $launches[$before])
     $zoomArgs = @($actual | Where-Object { $_ -eq '--camera-zoom' -or $_ -like '--camera-zoom=*' })
     Check ($zoomArgs[-1] -ceq "--camera-zoom=$Zoom") (

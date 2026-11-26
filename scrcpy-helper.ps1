@@ -1471,6 +1471,10 @@ function Start-Scrcpy {
             if ($StdoutFile) { $launch.RedirectStandardOutput = $StdoutFile }
         }
         $p = Start-Process @launch
+        if ($p -and $StderrFile -and $StdoutFile) {
+            # Windows PowerShell 5.1 的重定向启动可能不保留进程句柄，进程退出后看门狗就读不到退出码。
+            try { $null = $p.Handle } catch {}
+        }
     } catch {
         $detail = $_.Exception.Message
         # 摄像头看门狗也走这个入口，启动失败时不能用对话框阻塞自动重连回调。
