@@ -4,7 +4,7 @@ $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path (Split-Path $PSScriptRoot) 'scrcpy-helper.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join "`n") }
-foreach ($name in @('Wait-DeviceScan','Invoke-DeviceScan','Test-Wireless','Test-TcpAddress','Test-MdnsSerial')) {
+foreach ($name in @('Start-DeviceScan','Wait-DeviceScan','Invoke-DeviceScan','Test-Wireless','Test-TcpAddress','Test-MdnsSerial')) {
     $definition = $ast.Find({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true)
@@ -29,9 +29,15 @@ $refreshButton = $fileManager.Find({ param($node)
 }, $true).Arguments[0].ScriptBlock.GetScriptBlock()
 $refresh = Get-FileManagerAction 'refresh'
 $updateButtons = Get-FileManagerAction 'updateButtons'
-$renderStatus = $ast.Find({ param($node)
-    $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$renderStatus'
-}, $true).Right.Expression.ScriptBlock.GetScriptBlock()
+function Get-MainStatusAction([string]$Name) {
+    $assignment = $ast.Find({ param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq ('$' + $Name)
+    }, $true)
+    return $assignment.Right.Expression.ScriptBlock.GetScriptBlock()
+}
+$renderStatus = Get-MainStatusAction 'renderStatus'
+$updateStatus = Get-MainStatusAction 'updateStatus'
+$openDevices = Get-MainStatusAction 'openDevices'
 
 $cableBranch = $ast.Find({ param($node)
     $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text -ceq '$pick.Tag -eq ''cable'''
@@ -78,7 +84,8 @@ function Invoke-ShortCommand {
     param($FilePath, [string[]]$ArgumentList, [int]$TimeoutMs, $Control)
     Check ($FilePath -ceq $adb -and ($ArgumentList -join ' ') -ceq 'devices') 'Unexpected ADB command'
     $result = @{ Started=$true; ExitCode=0; TimedOut=$false; Cancelled=$false; Stdout=''; Stderr=''; Error='' }
-    foreach ($key in $fixture.Command.Keys) { $result[$key] = $fixture.Command[$key] }
+    $command = if ($fixture.Commands) { $fixture.Commands.Dequeue() } else { $fixture.Command }
+    foreach ($key in $command.Keys) { $result[$key] = $command[$key] }
     $Control.Cancelled = $result.Cancelled
     return [pscustomobject]$result
 }
@@ -106,6 +113,54 @@ function Fm-ListDir {
     return @{ Ok=$true; Items=@(); Hidden=0 }
 }
 
+# Closing the modal window restores the old status before the current device list is requested.
+& {
+    $script:mainFlow = @{ Busy=$false }
+    $lblStatus.Text = '● 已连接 无线'
+    $lblDevInfo.Text = 'old wireless phone'
+    function Invoke-MainFlow {
+        param($Body)
+        $previous = $lblStatus.Text
+        $script:mainFlow.Busy = $true
+        try { & $Body } finally { $lblStatus.Text = $previous; $script:mainFlow.Busy = $false }
+    }
+    function Show-DeviceManager { param($Owner) $fixture.ManagerOpened = $true }
+    function Start-UiTask {
+        param($Owner, $Kind, $OnDone, $OnFinally, $Inputs)
+        Check (-not $script:mainFlow.Busy) 'Status refresh was requested while the main flow was busy'
+        Check ($Kind -ceq 'status-refresh') 'Closing device management must queue a fresh status even if another scan is busy'
+        Check ($lblStatus.Text -ceq '◌ 检测中…' -and -not $lblDevInfo.Text) 'Stale connection remained visible while refreshing'
+        $fixture.Scan = $OnDone
+    }
+    & $openDevices
+    Check ($fixture.ManagerOpened -and $fixture.Scan) 'Closing device management never requested a new status'
+    & $fixture.Scan @{ Success=$true; Devices=@() }
+    Check ($lblStatus.Text -ceq '○ 未连接') 'Main window stayed connected after the only device was disconnected'
+    & $fixture.Scan @{ Success=$true; Devices=@('new-usb') }
+    Check ($lblStatus.Text -ceq '● 已连接 USB' -and $lblDevInfo.Text -ceq 'new-usb') 'Main window did not show the other connected device'
+}
+
+& {
+    function Start-UiTask {
+        param($Owner, $Kind, $OnDone, $OnFinally, $Inputs)
+        $fixture.ScanInputs = $Inputs
+    }
+    Start-DeviceScan -Owner $form -Kind 'status'
+    foreach ($second in @(@{ Stdout=$header }, @{ ExitCode=1; Stderr='still unavailable' })) {
+        $fixture.Commands = [Collections.Queue]::new()
+        $fixture.Commands.Enqueue(@{ TimedOut=$true })
+        $fixture.Commands.Enqueue($second)
+        $scanInputs = $fixture.ScanInputs
+        $result = Invoke-DeviceScan @scanInputs -InfoCache $script:devInfo -Control @{ Cancelled=$false }
+        Check ($fixture.Commands.Count -eq 0) 'Status query did not retry once'
+        Check ($result.Success -eq [bool]$second.Stdout) 'Status query did not use the retry result'
+    }
+    $fixture.Commands.Enqueue(@{ Cancelled=$true })
+    $fixture.Commands.Enqueue(@{ Stdout=$header })
+    $result = Invoke-DeviceScan @scanInputs -InfoCache $script:devInfo -Control @{ Cancelled=$false }
+    Check ($result.Cancelled -and $fixture.Commands.Count -eq 1) 'Status query retried after cancellation'
+}
+
 foreach ($case in $results) {
     $fixture = @{ Command=$case.Command; QueryErrors=0; NoDevicePrompts=0 }
     & $continueByCable
@@ -118,8 +173,8 @@ foreach ($case in $results) {
     if ($case.Outcome -ne 'cancel') {
         $snapshot = Wait-DeviceScan $form
         & $renderStatus $snapshot
-        $expectedStatus = if ($case.Outcome -eq 'failed') { '○ 无法读取设备' } else { $case.Status }
-        $expectedTip = if ($case.Outcome -eq 'failed') { '暂时读不到手机连接状态' } else { $case.Tip }
+        $expectedStatus = if ($case.Outcome -eq 'failed') { '○ 状态待确认' } else { $case.Status }
+        $expectedTip = if ($case.Outcome -eq 'failed') { '暂时无法确认手机连接状态' } else { $case.Tip }
         Check ($lblStatus.Text -ceq $expectedStatus -and $tt.Tip.Contains($expectedTip)) "Main window device status was wrong for $label"
     }
 

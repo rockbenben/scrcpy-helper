@@ -244,7 +244,7 @@ function Invoke-Hidden {
 
 # worker 只使用快照和取消标志，绝不读写控件或实时设置。
 function Invoke-DeviceScan {
-    param($AdbPath, [string[]]$Candidates, [bool]$ConnectAlways, $InfoCache, $Control, [int]$BudgetMs = 15000)
+    param($AdbPath, [string[]]$Candidates, [bool]$ConnectAlways, $InfoCache, $Control, [int]$BudgetMs = 15000, [bool]$RetryDeviceList = $false)
     $scan = [pscustomobject]@{ Success = $false; Cancelled = $false; Devices = @(); UnavailableStates = @(); Connected = @(); Info = @{}; Error = '' }
     $clock = [Diagnostics.Stopwatch]::StartNew()
     function Run-Adb {
@@ -265,13 +265,17 @@ function Invoke-DeviceScan {
                 else { 'ADB 返回的设备列表格式异常。' }
             return $false
         }
+        $scan.Error = ''
         $lines = @($r.Stdout -split "`r?`n")
         $scan.Devices = @($lines | Where-Object { $_ -match "`tdevice`r?$" } | ForEach-Object { ($_ -split "`t")[0] })
         # 保留 ADB 的待授权和离线状态供主界面提示，功能入口仍只接收在线设备。
         $scan.UnavailableStates = @($lines | Where-Object { $_ -match "`t(?:unauthorized|offline)$" } | ForEach-Object { ($_ -split "`t")[1] })
         return $true
     }
-    if (-not (Read-Devices)) { return $scan }
+    if (-not (Read-Devices)) {
+        # ADB 冷启动可能错过第一次查询，后台状态刷新先确认一次再提示。
+        if (-not $RetryDeviceList -or $scan.Cancelled -or $Control.Cancelled -or -not (Read-Devices)) { return $scan }
+    }
     if ($ConnectAlways -or $scan.Devices.Count -eq 0) {
         foreach ($addr in @(Get-ReachableAddrs $Candidates 700)) {
             if ($Control.Cancelled -or $clock.ElapsedMilliseconds -ge $BudgetMs) { break }
@@ -303,6 +307,7 @@ function Start-DeviceScan {
           [string]$Kind = 'status', [scriptblock]$OnDone, [scriptblock]$OnFinally)
     Start-UiTask -Owner $Owner -Kind $Kind -OnDone $OnDone -OnFinally $OnFinally -Inputs @{
         AdbPath = $adb; Candidates = $Candidates; ConnectAlways = $ConnectAlways
+        RetryDeviceList = ($Kind -in @('status','status-refresh'))
     }
 }
 function Start-UiTask {
@@ -339,7 +344,7 @@ function Start-NextDeviceScan {
         $names = @('Invoke-ShortCommand','Test-TcpAddress','Test-MdnsSerial','Test-Wireless','Get-ReachableAddrs','Invoke-DeviceScan') + @($job.Functions)
         $definitions = @($names | Select-Object -Unique | ForEach-Object { "function $_ { $((Get-Item "function:$_").Definition) }" })
         $work = if ($job.Work) { $job.Work.ToString() } else {
-            'Invoke-DeviceScan -AdbPath $Inputs.AdbPath -Candidates $Inputs.Candidates -ConnectAlways $Inputs.ConnectAlways -InfoCache $InfoCache -Control $Control'
+            'Invoke-DeviceScan -AdbPath $Inputs.AdbPath -Candidates $Inputs.Candidates -ConnectAlways $Inputs.ConnectAlways -InfoCache $InfoCache -Control $Control -RetryDeviceList $Inputs.RetryDeviceList'
         }
         [void]$job.Ps.AddScript(($definitions -join "`n") + "`n" + $work)
         $job.Async = $job.Ps.BeginInvoke()
@@ -5315,8 +5320,8 @@ try {
         if ($script:mainFlow -and $script:mainFlow.Busy) { return }
         if (-not $result.Success) {
             $lblStatus.BackColor=$cTagBg; $lblStatus.ForeColor=$cMuted
-            $lblStatus.Text='○ 无法读取设备'
-            $tt.SetToolTip($lblStatus, "暂时读不到手机连接状态。$statusTip")
+            $lblStatus.Text='○ 状态待确认'
+            $tt.SetToolTip($lblStatus, '暂时无法确认手机连接状态。切回窗口会重试，也可以点击打开「设备管理」查看原因。')
             $lblDevInfo.Text=''
             return
         }
@@ -5370,8 +5375,16 @@ try {
         param($devices)
         Show-FileManager $form $devices
     }) })
-    # 设备管理入口：底部「设备」链接 + 右上角状态药丸都可进；关掉后刷新一次状态
-    $openDevices = { Invoke-MainFlow ({ Show-DeviceManager $form; & $updateStatus }) }
+    $openDevices = {
+        Invoke-MainFlow ({ Show-DeviceManager $form })
+        if ($script:mainFlow.Busy) { return }
+        # 模态窗口关闭后，主流程才恢复旧状态。此时排队刷新，即使定时查询暂停也能同步。
+        $lblStatus.BackColor=$cTagBg; $lblStatus.ForeColor=$cMuted
+        $lblStatus.Text='◌ 检测中…'
+        $lblDevInfo.Text=''
+        $tt.SetToolTip($lblStatus, $statusTip)
+        Start-DeviceScan -Owner $form -Kind 'status-refresh' -OnDone $renderStatus
+    }
     $btnDevices.Add_Click($openDevices)
     $lblStatus.Add_Click($openDevices)
 
