@@ -5,7 +5,7 @@
 <style>
   /* 1280×640 —— GitHub Settings › Social preview 推荐尺寸
      安全区：官方模板要求四周留 40pt = 80px；这里统一用 88px，再多 8px 余量
-     渲染: node ~/.claude/skills/html-shot/render.mjs assets/social-card.html assets/social-card.png --palette */
+     渲染: node ~/.agents/skills/html-shot/render.mjs assets/social-card.html assets/social-card.png --offline */
   :root{
     --red:#E05B4A;          /* app 图标那支红，在墨底上提亮一档 */
     --ground:#201E1B;       /* app 图标的墨色；截图成为全图最亮的东西 */
@@ -37,11 +37,13 @@
   .foot{position:absolute;left:0;right:0;bottom:0;border-top:1px solid var(--rule);padding-top:17px;
         display:flex;justify-content:space-between;align-items:baseline;font-size:13px;color:var(--foot)}
 
-  /* ── 右：产品本人 ── */
-  .shot{position:absolute;right:88px;top:90px;width:570px;height:459px;
+  /* 裁出 README 合成图中的主窗口。截图尺寸或摆位调整时同步这里。 */
+  .shot{--scale:calc(540px / 808);
+        position:absolute;right:88px;top:90px;width:540px;height:calc(687 * var(--scale));
         border-radius:10px;overflow:hidden;
         box-shadow:0 28px 64px var(--shadow),0 4px 12px rgba(34,32,29,.13)}
-  .shot img{position:absolute;width:1015.31px;left:-59.38px;top:-34.14px;display:block}
+  .shot img{position:absolute;width:calc(1360 * var(--scale));
+            left:calc(-26 * var(--scale));top:calc(-38 * var(--scale));display:block}
 </style>
 
 <div class="say">
