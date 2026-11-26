@@ -90,7 +90,7 @@ Check (($fixture.Scans[0].Candidates -join '|') -ceq $allowed) 'Main feature sub
 Check ($fixture.Result.Success -and ($fixture.Result.Devices -join '|') -ceq $allowed -and $fixture.Finished) 'Main feature did not receive the eligible device'
 
 Reset-Fixture @($skipTcp,$skipMdns,$allowed)
-Connect-RememberedAsync { param($connected) $fixture.Connected=@($connected) }
+Connect-RememberedAsync { param($result) $fixture.Connected=@($result.Connected) }
 Check (($fixture.Attempts -join '|') -ceq $allowed -and ($fixture.Connected -join '|') -ceq $allowed) 'Startup connected an excluded address'
 
 Reset-Fixture @($skipTcp,$skipMdns)

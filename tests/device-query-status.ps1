@@ -4,7 +4,8 @@ $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path (Split-Path $PSScriptRoot) 'scrcpy-helper.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join "`n") }
-foreach ($name in @('Start-DeviceScan','Wait-DeviceScan','Invoke-DeviceScan','Test-Wireless','Test-TcpAddress','Test-MdnsSerial')) {
+foreach ($name in @('Start-DeviceScan','Start-UiTask','Complete-MainFlow','Reconnect-LastAsync','Wait-DeviceScan','Invoke-DeviceScan',
+        'Test-Wireless','Test-TcpAddress','Test-MdnsSerial')) {
     $definition = $ast.Find({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true)
@@ -14,8 +15,8 @@ foreach ($name in @('Start-DeviceScan','Wait-DeviceScan','Invoke-DeviceScan','Te
 function Check($Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
-function Get-FileManagerAction([string]$Name) {
-    $assignment = $fileManager.Find({ param($node)
+function Get-Action($Scope, [string]$Name) {
+    $assignment = $Scope.Find({ param($node)
         $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq ('$' + $Name)
     }, $true)
     return $assignment.Right.Expression.ScriptBlock.GetScriptBlock()
@@ -27,17 +28,15 @@ $refreshButton = $fileManager.Find({ param($node)
     $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Member.Value -eq 'Add_Click' -and
     $node.Expression.VariablePath.UserPath -eq 'btnRefresh'
 }, $true).Arguments[0].ScriptBlock.GetScriptBlock()
-$refresh = Get-FileManagerAction 'refresh'
-$updateButtons = Get-FileManagerAction 'updateButtons'
-function Get-MainStatusAction([string]$Name) {
-    $assignment = $ast.Find({ param($node)
-        $node -is [Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq ('$' + $Name)
-    }, $true)
-    return $assignment.Right.Expression.ScriptBlock.GetScriptBlock()
-}
-$renderStatus = Get-MainStatusAction 'renderStatus'
-$updateStatus = Get-MainStatusAction 'updateStatus'
-$openDevices = Get-MainStatusAction 'openDevices'
+$refresh = Get-Action $fileManager 'refresh'
+$updateButtons = Get-Action $fileManager 'updateButtons'
+$renderStatus = Get-Action $ast 'renderStatus'
+$renderConnectedStatus = Get-Action $ast 'renderConnectedStatus'
+$updateStatus = Get-Action $ast 'updateStatus'
+$openDevices = Get-Action $ast 'openDevices'
+$deviceManager = $ast.Find({ param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Show-DeviceManager'
+}, $true)
 
 $cableBranch = $ast.Find({ param($node)
     $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text -ceq '$pick.Tag -eq ''cable'''
@@ -48,6 +47,8 @@ $adb = 'fixture-adb'
 $form = @{ Visible=$true; IsDisposed=$false }
 $dlg = @{ Visible=$true; IsDisposed=$false }
 $script:fmFlow = @{ Busy=$false }
+$script:mainFlow = @{ Busy=$false; RefreshPending=$false }
+$script:closeState = @{ InProgress=$false }
 $fixture = @{}
 $cRed = [Drawing.Color]::Red; $cMuted = [Drawing.Color]::Gray
 $cTagBg = [Drawing.Color]::Beige; $cGreenBg = [Drawing.Color]::Honeydew; $cGreen = [Drawing.Color]::Green
@@ -115,7 +116,6 @@ function Fm-ListDir {
 
 # Closing the modal window restores the old status before the current device list is requested.
 & {
-    $script:mainFlow = @{ Busy=$false }
     $lblStatus.Text = '● 已连接 无线'
     $lblDevInfo.Text = 'old wireless phone'
     function Invoke-MainFlow {
@@ -128,7 +128,7 @@ function Fm-ListDir {
     function Start-UiTask {
         param($Owner, $Kind, $OnDone, $OnFinally, $Inputs)
         Check (-not $script:mainFlow.Busy) 'Status refresh was requested while the main flow was busy'
-        Check ($Kind -ceq 'status-refresh') 'Closing device management must queue a fresh status even if another scan is busy'
+        Check ($Kind -ceq 'status') 'Closing device management must use the shared status queue'
         Check ($lblStatus.Text -ceq '◌ 检测中…' -and -not $lblDevInfo.Text) 'Stale connection remained visible while refreshing'
         $fixture.Scan = $OnDone
     }
@@ -138,6 +138,101 @@ function Fm-ListDir {
     Check ($lblStatus.Text -ceq '○ 未连接') 'Main window stayed connected after the only device was disconnected'
     & $fixture.Scan @{ Success=$true; Devices=@('new-usb') }
     Check ($lblStatus.Text -ceq '● 已连接 USB' -and $lblDevInfo.Text -ceq 'new-usb') 'Main window did not show the other connected device'
+}
+
+& {
+    function Start-NextDeviceScan {}
+    function Set-BusyLook {}
+    $script:restoreHint = {}
+    $script:deviceScanState = @{ Active=@{ Kind='camera' }; Pending=[Collections.ArrayList]::new(); Closing=$false }
+    $script:mainFlow.Busy = $true
+    $flow = @{ Flag=$script:mainFlow; IsMain=$true; Owner=$form }
+    & $updateStatus
+    & $updateStatus
+    Check ($script:mainFlow.RefreshPending -and $script:deviceScanState.Pending.Count -eq 0) 'Refresh requests were lost or queued during a busy main operation'
+    Complete-MainFlow $flow
+    & $updateStatus
+    Check (-not $script:mainFlow.RefreshPending -and $script:deviceScanState.Pending.Count -eq 1) 'Deferred and concurrent refresh requests were not coalesced behind a background job'
+
+    $job = $script:deviceScanState.Pending[0]
+    $script:deviceScanState.Pending.Clear()
+    $script:mainFlow.Busy = $true
+    $lblStatus.Text = '○ 正在处理…'
+    & $job.OnDone @{ Success=$true; Devices=@('old-usb') }
+    Check ($lblStatus.Text -ceq '○ 正在处理…' -and $script:mainFlow.RefreshPending) 'A result arriving during another operation replaced the busy state or was lost'
+    Complete-MainFlow $flow
+    Check ($script:deviceScanState.Pending.Count -eq 1) 'Main flow did not retry the refresh whose result became stale'
+    & $script:deviceScanState.Pending[0].OnDone @{ Success=$true; Devices=@() }
+    Check ($lblStatus.Text -ceq '○ 未连接') 'The retried refresh did not render the latest status'
+}
+
+& {
+    function Test-AutoConnectExcluded { return $false }
+    function Add-KnownDevice {}
+    function Start-UiTask {
+        param($Owner, $Kind, $OnDone, $OnFinally, $Inputs)
+        Check ($Kind -ceq 'reconnect') 'Rendering a reconnect result queued an extra scan'
+        $fixture.Reconnect = @{ OnDone=$OnDone; OnFinally=$OnFinally; Inputs=$Inputs }
+    }
+    $script:reconnectState = @{ InFlight=$false }
+    $settings = @{ autoConnect=$true; lastWirelessAddr='192.0.2.20:5555' }
+    & $renderStatus @{ Success=$true; Devices=@() }
+    Check ($script:reconnectState.InFlight -and $lblStatus.Text -ceq '○ 未连接') 'An empty list did not start a reconnect'
+    & $fixture.Reconnect.OnDone @{ Success=$true; Devices=@() }
+    Check ($lblStatus.Text -ceq '○ 未连接') 'An unsuccessful reconnect changed the current status'
+    & $fixture.Reconnect.OnDone @{ Success=$true; Devices=@($settings.lastWirelessAddr) }
+    Check ($lblStatus.Text -ceq '● 已连接 无线' -and $lblDevInfo.Text -ceq $settings.lastWirelessAddr) 'Reconnect did not immediately render the returned device list'
+    & $fixture.Reconnect.OnFinally
+    Check (-not $script:reconnectState.InFlight) 'The reconnect guard was not released'
+}
+
+& {
+    $refresh = Get-Action $deviceManager 'refresh'
+    $updateButtons = Get-Action $deviceManager 'updateButtons'
+    $rowDouble = Get-Action $deviceManager 'rowDouble'
+    function Get-ActiveSerials { $fixture.LocalProcesses }
+    function Test-AutoConnectExcluded { return $false }
+    $castSelected = { $fixture.Casts++ }
+    $connectSelected = { $fixture.Connects++ }
+    $fixture = @{ Command=@{ TimedOut=$true }; QueryErrors=0; Casts=0; Connects=0 }
+    $serial = '192.0.2.20:5555'
+    $script:devInfo[$serial] = @{}
+    $script:knownDevices = @{}
+    $state = @{ Active=@(); Connected=@($serial); SnapshotReady=$true }
+    $row = [System.Windows.Forms.ListViewItem]::new('old device')
+    $row.Tag = @{ Serial=$serial; Connected=$true; Wireless=$true }
+    $row.ForeColor = $cGreen
+    $lv = [pscustomobject]@{ Items=[Collections.ArrayList]::new(); SelectedItems=@($row) }
+    $lv | Add-Member ScriptMethod BeginUpdate {}
+    $lv | Add-Member ScriptMethod EndUpdate {}
+    [void]$lv.Items.Add($row)
+    $noDeviceHint = 'empty device list'
+    $capNoDev = @{ Visible=$false; Text=$noDeviceHint }
+    foreach ($name in @('btnConnect','btnCast','btnStop','btnAll','btnDefault','btnDisc','btnRename','btnForget','btnAuto')) {
+        Set-Variable -Name $name -Value @{ Enabled=$false; Text='' }
+    }
+    & $updateButtons
+    Check ($btnCast.Enabled -and $btnAll.Enabled -and $btnDisc.Enabled -and $btnDefault.Enabled) 'Online row did not enable its actions before failure'
+    & $refresh
+    Check ($fixture.QueryErrors -eq 1 -and $capNoDev.Visible -and $capNoDev.Text.Contains('连接状态待确认')) 'Failed manager refresh did not leave a persistent status hint'
+    Check (-not $state.SnapshotReady -and [object]::ReferenceEquals($lv.Items[0],$row) -and $row.ForeColor -eq $cMuted) 'The cached device list was not retained and dimmed'
+    Check (-not ($btnCast.Enabled -or $btnAll.Enabled -or $btnDisc.Enabled -or $btnDefault.Enabled)) 'Online actions stayed enabled on a stale list'
+    & $rowDouble
+    $fixture.LocalProcesses = @($serial)
+    & $updateButtons
+    Check ($btnStop.Enabled -and $btnRename.Enabled -and $btnAuto.Enabled) 'Actions independent of ADB status were disabled'
+
+    $row.Tag.Connected = $false
+    & $updateButtons
+    & $rowDouble
+    Check (-not ($btnConnect.Enabled -or $btnForget.Enabled -or $fixture.Casts -or $fixture.Connects)) 'A stale cached row could still trigger a connection-dependent action'
+    $fixture.Command = @{ Stdout="${header}$serial`tdevice`r`n" }
+    $fixture.LocalProcesses = @()
+    & $refresh
+    $lv.SelectedItems = @($lv.Items[0])
+    & $updateButtons
+    Check ($state.SnapshotReady -and -not $capNoDev.Visible -and $capNoDev.Text -ceq $noDeviceHint) 'A successful refresh did not clear the pending-status hint'
+    Check ($btnCast.Enabled -and $btnAll.Enabled -and $btnDisc.Enabled -and $btnDefault.Enabled) 'Actions stayed disabled after a successful refresh'
 }
 
 & {

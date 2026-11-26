@@ -307,7 +307,7 @@ function Start-DeviceScan {
           [string]$Kind = 'status', [scriptblock]$OnDone, [scriptblock]$OnFinally)
     Start-UiTask -Owner $Owner -Kind $Kind -OnDone $OnDone -OnFinally $OnFinally -Inputs @{
         AdbPath = $adb; Candidates = $Candidates; ConnectAlways = $ConnectAlways
-        RetryDeviceList = ($Kind -in @('status','status-refresh'))
+        RetryDeviceList = ($Kind -eq 'status')
     }
 }
 function Start-UiTask {
@@ -315,7 +315,8 @@ function Start-UiTask {
           [string[]]$Functions = @(), [scriptblock]$OnDone, [scriptblock]$OnFinally)
     $state = $script:deviceScanState
     if ($state.Closing -or ($script:closeState.InProgress -and $Kind -ne 'shutdown')) { if ($OnFinally) { & $OnFinally }; return }
-    if ($Kind -eq 'status' -and ($state.Active -or $state.Pending.Count)) { return }
+    # 保留一个待处理的刷新，避免激活窗口和轮询在同一个后台任务期间排出多份。
+    if ($Kind -eq 'status' -and $state.Pending.Kind -contains 'status') { return }
     [void]$state.Pending.Add(@{
         Owner = $Owner; Kind = $Kind; Work = $Work; Inputs = $Inputs; Functions = $Functions
         OnDone = $OnDone; OnFinally = $OnFinally
@@ -850,8 +851,8 @@ function Request-AppClose {
                 $Owner.Cursor=[System.Windows.Forms.Cursors]::Default
                 $script:hintHeld=$false
                 if ($script:recHintColor) { & $script:restoreHint }
-                if ($OnResume) { & $OnResume }
             }
+            if ($OnResume -and -not $Owner.IsDisposed) { & $OnResume }
         }
     }
 }
@@ -2956,18 +2957,15 @@ function Connect-RememberedAsync {
     $cands = @(Get-AutoConnectCandidates 16)
     if ($cands.Count -eq 0) { return }
     $script:autoConnectStarted = $true
-    Start-DeviceScan -Owner $form -Candidates $cands -ConnectAlways $true -Kind 'startup' -OnDone ({
-        param($result)
-        if ($OnDone) { & $OnDone @($result.Connected) }
-    }.GetNewClosure())
+    Start-DeviceScan -Owner $form -Candidates $cands -ConnectAlways $true -Kind 'startup' -OnDone $OnDone
 }
 $script:reconnectState = @{ InFlight = $false }
 function Reconnect-LastAsync {
-    param($addr)
+    param($addr, [scriptblock]$OnDone)
     if (-not $addr -or $script:reconnectState.InFlight -or (Test-AutoConnectExcluded $addr)) { return }
     $flag = $script:reconnectState
     $flag.InFlight = $true
-    Start-DeviceScan -Owner $form -Candidates @($addr) -Kind 'reconnect' -OnFinally ({ $flag.InFlight = $false }.GetNewClosure())
+    Start-DeviceScan -Owner $form -Candidates @($addr) -Kind 'reconnect' -OnDone $OnDone -OnFinally ({ $flag.InFlight = $false }.GetNewClosure())
 }
 
 # 多设备时让用户挑一台投屏，返回序列号 / 地址，取消返回 $null。
@@ -3132,7 +3130,9 @@ function Show-DeviceManager {
     $lv.HeaderStyle = 'Nonclickable'; $lv.BackColor = $cWhite
     $lv.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
     # 空态提示放列表下方常驻一行：ListView 的行文字只占第一列宽，长指引会被截没
-    $capNoDev = New-Caption '还没有设备？点下方「输入 IP 连接…」添加，或回主界面点「无线投屏」' 16 209
+    $noDeviceHint = '还没有设备？点下方「输入 IP 连接…」添加，或回主界面点「无线投屏」'
+    $capNoDev = New-Caption $noDeviceHint 16 209
+    $capNoDev.Visible = $false
     [void]$lv.Columns.Add('设备', 146)
     [void]$lv.Columns.Add('地址', 128)
     [void]$lv.Columns.Add('类型 · 系统', 204)   # 这栏要装下「无线 · Android 13  ▶ 投屏中  ⊘ 不自动连」，给它最宽，别截断
@@ -3181,21 +3181,23 @@ function Show-DeviceManager {
     $updateButtons = {
         $items = @($lv.SelectedItems | Where-Object { $_.Tag })
         $one = if ($items.Count -eq 1) { $items[0].Tag } else { $null }
-        $active = $state.Active
-        $btnConnect.Enabled = @($items | Where-Object { -not $_.Tag.Connected }).Count -gt 0
-        $btnCast.Enabled    = @($items | Where-Object { $_.Tag.Connected -and ($active -notcontains $_.Tag.Serial) }).Count -gt 0
+        $ready = $state.SnapshotReady
+        # ADB 读不到时仍可停止正在运行的本地进程。
+        $active = @(if ($ready) { $state.Active } else { Get-ActiveSerials })
+        $btnConnect.Enabled = $ready -and @($items | Where-Object { -not $_.Tag.Connected }).Count -gt 0
+        $btnCast.Enabled    = $ready -and @($items | Where-Object { $_.Tag.Connected -and ($active -notcontains $_.Tag.Serial) }).Count -gt 0
         $btnStop.Enabled    = @($items | Where-Object { $active -contains $_.Tag.Serial }).Count -gt 0
-        $btnAll.Enabled     = @($state.Connected | Where-Object { $active -notcontains $_ }).Count -gt 0
+        $btnAll.Enabled     = $ready -and @($state.Connected | Where-Object { $active -notcontains $_ }).Count -gt 0
         # 设为默认 ↔ 取消默认：选中的就是当前默认时，按钮变「取消默认」，让人知道再点是取消
-        if ($one -and $one.Connected) {
+        if ($ready -and $one -and $one.Connected) {
             $btnDefault.Enabled = $true
             $btnDefault.Text = if ($settings.defaultDevice -eq $one.Serial) { '取消默认' } else { '设为默认' }
         } else {
             $btnDefault.Enabled = $false; $btnDefault.Text = '设为默认'
         }
-        $btnDisc.Enabled    = [bool]($one -and $one.Connected -and $one.Wireless)
+        $btnDisc.Enabled    = [bool]($ready -and $one -and $one.Connected -and $one.Wireless)
         $btnRename.Enabled  = [bool]$one
-        $btnForget.Enabled  = [bool]($one -and -not $one.Connected)
+        $btnForget.Enabled  = [bool]($ready -and $one -and -not $one.Connected)
         if ($one -and $one.Wireless) {
             $btnAuto.Enabled = $true
             $btnAuto.Text = if (Test-AutoConnectExcluded $one.Serial) { '恢复自动连' } else { '不自动连' }
@@ -3203,10 +3205,15 @@ function Show-DeviceManager {
     }
     $refresh = {
         $state.SnapshotReady=$false
+        & $updateButtons
         $snapshot=Wait-DeviceScan $dlg
-        if ($snapshot.Cancelled) { return }
-        if (-not $snapshot.Success) {
-            [void](Show-ResultDialog $dlg '设备管理' '无法读取设备列表' '请稍后重试。' $snapshot.Error @('ok'))
+        if ($snapshot.Cancelled -or -not $snapshot.Success) {
+            $capNoDev.Text = '连接状态待确认，请点击「刷新」重试。'
+            $capNoDev.Visible = $true
+            foreach ($it in $lv.Items) { $it.ForeColor = $cMuted }
+            if (-not $snapshot.Cancelled) {
+                [void](Show-ResultDialog $dlg '设备管理' '无法读取设备列表' '请稍后重试。' $snapshot.Error @('ok'))
+            }
             return
         }
         foreach ($key in $snapshot.Info.Keys) { $script:devInfo[$key]=$snapshot.Info[$key] }
@@ -3243,10 +3250,12 @@ function Show-DeviceManager {
             $empty.Group = $grpConn   # 不挂组会冒出英文组头 Default
             $empty.ForeColor = $cMuted; [void]$lv.Items.Add($empty)
         }
+        $capNoDev.Text = $noDeviceHint
         $capNoDev.Visible = ($lv.Items.Count -eq 1 -and $lv.Items[0].Text -eq '（还没有设备）')
         foreach ($it in $lv.Items) { if ($it.Tag -and ($selSerials -contains $it.Tag.Serial)) { $it.Selected = $true } }   # 还原选中
-        $lv.EndUpdate(); & $updateButtons
+        $lv.EndUpdate()
         $state.SnapshotReady=$true
+        & $updateButtons
     }
 
     # 连接选中的未连设备（只连，不投）：连成功后它会进到「已连接」组，再点「投屏」即可
@@ -3290,6 +3299,7 @@ function Show-DeviceManager {
     }
     # 双击某行＝对它做最顺手的那一步：未连就连、已连未投就投（不关窗口，方便接着操作）
     $rowDouble = {
+        if (-not $state.SnapshotReady) { return }
         $items = @($lv.SelectedItems | Where-Object { $_.Tag }); if ($items.Count -ne 1) { return }
         $tag = $items[0].Tag
         if (-not $tag.Connected) { & $connectSelected }
@@ -5317,7 +5327,11 @@ try {
     # ---------------- 行为 ----------------
     $renderStatus = {
         param($result)
-        if ($script:mainFlow -and $script:mainFlow.Busy) { return }
+        if ($script:mainFlow.Busy) {
+            # 忙态结束后再查，避免用操作前拿到的结果覆盖新状态。
+            $script:mainFlow.RefreshPending = $true
+            return
+        }
         if (-not $result.Success) {
             $lblStatus.BackColor=$cTagBg; $lblStatus.ForeColor=$cMuted
             $lblStatus.Text='○ 状态待确认'
@@ -5326,10 +5340,8 @@ try {
             return
         }
         $devs=@($result.Devices)
-        # 掉线且开了自动重连：后台探测+连回上次的无线地址（不阻塞界面，下次刷新生效）。
-        # 排除名单仍由 Reconnect-LastAsync 检查，避免用户断开的设备被刷新逻辑连回。
         if ($devs.Count -eq 0 -and $settings.autoConnect -and $settings.lastWirelessAddr) {
-            Reconnect-LastAsync $settings.lastWirelessAddr
+            Reconnect-LastAsync $settings.lastWirelessAddr $renderConnectedStatus
         }
         if ($devs.Count -gt 0) {
             $w = $devs | Where-Object { Test-Wireless $_ } | Select-Object -First 1
@@ -5363,8 +5375,17 @@ try {
             }
         }
     }
+    $renderConnectedStatus = {
+        param($result)
+        # 重连结果为空时保留当前提示，避免立即发起下一次重连。
+        if ($result.Success -and $result.Devices.Count -gt 0) { & $renderStatus $result }
+    }
     $updateStatus = {
-        if ($script:mainFlow -and $script:mainFlow.Busy) { return }
+        if ($script:mainFlow.Busy -or $script:closeState.InProgress) {
+            $script:mainFlow.RefreshPending = $true
+            return
+        }
+        $script:mainFlow.RefreshPending = $false
         Start-DeviceScan -Owner $form -Kind 'status' -OnDone $renderStatus
     }
     $btnShortcuts.Add_Click({ Invoke-MainFlow ({ Show-Shortcuts $form }) })
@@ -5383,7 +5404,7 @@ try {
         $lblStatus.Text='◌ 检测中…'
         $lblDevInfo.Text=''
         $tt.SetToolTip($lblStatus, $statusTip)
-        Start-DeviceScan -Owner $form -Kind 'status-refresh' -OnDone $renderStatus
+        & $updateStatus
     }
     $btnDevices.Add_Click($openDevices)
     $lblStatus.Add_Click($openDevices)
@@ -5392,7 +5413,7 @@ try {
     # 会被立刻派发 → 整条流程跑两遍（表现为同一个提示弹两次、叠两个设备管理窗）。而 adb 冷启动一次
     # 能阻塞界面 ~2.4 秒且毫无反馈，正是诱发那一次重复点击的源头，所以忙时同时挂等待光标。
     # 标志必须走「哈希表 + 引用」：闭包有自己的模块作用域，写 $script:裸变量 赋的是副本、真实标志不变；跨闭包共享状态一律用哈希表通过捕获引用传递。
-    $script:mainFlow = @{ Busy = $false }
+    $script:mainFlow = @{ Busy = $false; RefreshPending = $false }
     # 设备管理另用一把锁：它是模态窗，「设备」那条流程的锁会占满整个设备管理开着的时段，
     # 窗内按钮若共用同一把，开完窗就全点不动了。
     $script:dmFlow = @{ Busy = $false }
@@ -5496,6 +5517,7 @@ try {
             }
         }
         $Flag.Busy = $false
+        if ($isMain -and $Flag.RefreshPending) { & $updateStatus }
     }
 
 
@@ -5901,7 +5923,7 @@ try {
     $form.Add_Shown({
         & $updateStatus
         if ($settings.liveStatus -or $settings.autoConnect) { $timer.Start() }
-        Connect-RememberedAsync ({ param($connected) & $updateStatus }.GetNewClosure())
+        Connect-RememberedAsync $renderConnectedStatus
         $script:camWatch.Start()
         Start-ActivationWaiter $form.Handle $script:actEvent   # 开始监听"再次启动时激活本窗口"的信号
         # 首次显示主动抢一次前台：conhost --headless 启动的进程窗口有时不会自动到前台/不聚焦，用户以为"没反应"。
