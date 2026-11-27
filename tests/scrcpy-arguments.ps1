@@ -150,6 +150,61 @@ $json = ConvertTo-Json -InputObject @{ Arguments=$argv } -Compress
     $fixed2 = Resolve-RecordingPath 'mp4' '20261128-053000'
     $expected2 = Join-Path $recOutDir '录屏-20261128-053000-2.mp4'
     Check ($fixed2.Mode -ceq 'fixed' -and $fixed2.Path -ceq $expected2) 'Collision suffix was not appended for fixed recDir'
+
+    # Graceful Ctrl+C stop must allow child processes spawned by the target (such as scrcpy -> adb.exe)
+    $helperScript = Join-Path $testRoot 'stop-graceful-helper.ps1'
+    $helperOut = Join-Path $testRoot 'stop-graceful.json'
+    $mainScriptPath = (Join-Path (Split-Path $PSScriptRoot) 'scrcpy-helper.ps1')
+    $cmdProc = $null
+    try {
+        $cmdProc = Microsoft.PowerShell.Management\Start-Process -FilePath 'cmd.exe' -ArgumentList '/c ping -n 10 127.0.0.1 >nul' -WindowStyle Hidden -PassThru
+        $null = $cmdProc.Handle
+        Start-Sleep -Milliseconds 600
+        [IO.File]::WriteAllText($helperScript, @"
+param([int]`$TargetPid, [string]`$MainScript, [string]`$OutFile)
+`$ErrorActionPreference = 'Stop'
+`$t = `$null; `$e = `$null
+`$a = [Management.Automation.Language.Parser]::ParseFile(`$MainScript, [ref]`$t, [ref]`$e)
+`$conBlock = `$a.Find({ param(`$n) `$n -is [Management.Automation.Language.TryStatementAst] -and `$n.Extent.Text -like '*Name ConIO*' }, `$true)
+. ([scriptblock]::Create(`$conBlock.Extent.Text))
+foreach (`$fn in @('Test-ProcessExited','Wait-ScrcpyExit','Get-ParentProcessId','Test-ProcessDescendant','Stop-ScrcpyGraceful')) {
+    `$def = `$a.Find({ param(`$n) `$n -is [Management.Automation.Language.FunctionDefinitionAst] -and `$n.Name -ceq `$fn }, `$true)
+    . ([scriptblock]::Create(`$def.Extent.Text))
+}
+`$target = [Diagnostics.Process]::GetProcessById(`$TargetPid)
+`$ids = New-Object uint32[] 64
+[void][Native.ConIO]::FreeConsole()
+`$attached = [Native.ConIO]::AttachConsole([uint32]`$TargetPid)
+`$cnt = [Native.ConIO]::GetConsoleProcessList(`$ids, 64)
+[void][Native.ConIO]::FreeConsole()
+`$conPids = @(`$ids | Select-Object -First ([Math]::Min(64,[int]`$cnt)))
+`$childPid = @(`$conPids | Where-Object { `$_ -ne `$PID -and `$_ -ne `$TargetPid }) | Select-Object -First 1
+`$childIsDesc = if (`$childPid) { Test-ProcessDescendant ([uint32]`$childPid) ([uint32]`$TargetPid) `$target.StartTime } else { `$false }
+`$selfIsDesc = Test-ProcessDescendant ([uint32]`$PID) ([uint32]`$TargetPid) `$target.StartTime
+`$stopRes = Stop-ScrcpyGraceful `$target 3000 `$null
+@{
+    Attached = [bool]`$attached
+    ChildFound = (`$null -ne `$childPid)
+    ChildIsDescendant = [bool]`$childIsDesc
+    SelfIsDescendant = [bool]`$selfIsDesc
+    SignalSent = [bool]`$stopRes.SignalSent
+    Exited = [bool]`$stopRes.Exited
+    Error = [string]`$stopRes.Error
+} | ConvertTo-Json -Compress | Set-Content -LiteralPath `$OutFile -Encoding UTF8
+"@, [Text.UTF8Encoding]::new($true))
+        $helperProc = Microsoft.PowerShell.Management\Start-Process -FilePath $hostExe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$helperScript,$cmdProc.Id,$mainScriptPath,$helperOut) -WindowStyle Hidden -PassThru -Wait
+        Check ($helperProc.ExitCode -eq 0) "Graceful stop helper failed with exit code $($helperProc.ExitCode)"
+        $grace = ConvertFrom-Json ([IO.File]::ReadAllText($helperOut))
+        Check ($grace.Attached -and $grace.ChildFound) 'Test target did not attach with a child console process'
+        Check ($grace.ChildIsDescendant -and -not $grace.SelfIsDescendant) 'Descendant check misclassified target child or unrelated process'
+        Check ($grace.SignalSent -and $grace.Exited -and $grace.Error -ceq '') (
+            "Graceful stop failed on process with console child: SignalSent=$($grace.SignalSent) Exited=$($grace.Exited) Error=$($grace.Error)")
+    } finally {
+        if ($cmdProc) {
+            if (-not $cmdProc.HasExited) { $cmdProc.Kill(); [void]$cmdProc.WaitForExit(2000) }
+            $cmdProc.Dispose()
+        }
+    }
 } finally {
     foreach ($file in [IO.Directory]::GetFiles($testRoot)) { [IO.File]::Delete($file) }
     foreach ($dir in [IO.Directory]::GetDirectories($testRoot)) { [IO.Directory]::Delete($dir, $true) }

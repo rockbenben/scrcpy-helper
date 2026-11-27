@@ -98,6 +98,9 @@ try {
 [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern bool FreeConsole();
 [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
 [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleCtrlHandler(System.IntPtr HandlerRoutine, bool Add);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern System.IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(System.IntPtr hObject);
+[System.Runtime.InteropServices.DllImport("ntdll.dll")] public static extern int NtQueryInformationProcess(System.IntPtr hProcess, int processInformationClass, System.IntPtr[] processInformation, int processInformationLength, out int returnLength);
 '@
 } catch {}
 
@@ -646,11 +649,21 @@ function Invoke-StopItems {
             } else {
                 $left=[Math]::Max(0,[Math]::Min($WaitMs,15000-[int]$clock.ElapsedMilliseconds))
                 if ($item.Rec) {
-                    $stopped=Stop-ScrcpyGraceful $item.Proc $left $Control -WaitOnly:$sent
-                    $sent=$sent -or $stopped.SignalSent
-                    $item.StopSignalSent=$sent
-                    $errorText=$stopped.Error
-                    $outcome=if ($stopped.Exited) { 'Stopped' } else { 'TimedOut' }
+                    $closed = $false
+                    if (-not $item.RecBg -and -not $sent) {
+                        try { $closed = [bool]$item.Proc.CloseMainWindow() } catch {}
+                    }
+                    if ($closed) {
+                        $sent = $true
+                        $item.StopSignalSent = $true
+                        $outcome = if (Wait-ScrcpyExit $item.Proc $left $Control) { 'Stopped' } else { 'TimedOut' }
+                    } else {
+                        $stopped=Stop-ScrcpyGraceful $item.Proc $left $Control -WaitOnly:$sent
+                        $sent=$sent -or $stopped.SignalSent
+                        $item.StopSignalSent=$sent
+                        $errorText=$stopped.Error
+                        $outcome=if ($stopped.Exited) { 'Stopped' } else { 'TimedOut' }
+                    }
                 } else {
                     try { [void]$item.Proc.CloseMainWindow() } catch { $errorText=$_.Exception.Message }
                     $outcome=if (Wait-ScrcpyExit $item.Proc ([Math]::Min(1000,$left)) $Control) { 'Stopped' } else { 'TimedOut' }
@@ -714,7 +727,7 @@ function Stop-DevicesUi {
     try {
         do {
             $result=Wait-UiTask -Owner $Owner -StatusText $stopText -Kind $(if ($ForExit) { 'shutdown' } else { 'operation' }) -Functions @(
-                'Invoke-StopItems','Stop-ScrcpyGraceful','Wait-ScrcpyExit','Test-ProcessExited','Test-CommandSuccess','Get-CommandDetail'
+                'Invoke-StopItems','Stop-ScrcpyGraceful','Get-ParentProcessId','Test-ProcessDescendant','Wait-ScrcpyExit','Test-ProcessExited','Test-CommandSuccess','Get-CommandDetail'
             ) -Inputs @{ Items=$pending; Adb=$adb; Disconnect=$addresses; Force=$force } -Work {
                 Invoke-StopItems $Inputs.Items $Inputs.Adb $Inputs.Disconnect $Control -Force:$Inputs.Force
             }
@@ -1682,6 +1695,48 @@ function Test-Recording {
     }
     return $false
 }
+function Get-ParentProcessId {
+    param([uint32]$ProcessId)
+    if ($ProcessId -eq 0) { return [uint32]0 }
+    $h = [IntPtr]::Zero
+    try {
+        # PROCESS_QUERY_LIMITED_INFORMATION (0x1000) 足够读取 BasicInformation 中的 InheritedFromUniqueProcessId
+        $h = [Native.ConIO]::OpenProcess(0x1000, $false, $ProcessId)
+        if ($h -eq [IntPtr]::Zero) { return [uint32]0 }
+        $buf = New-Object System.IntPtr[] 6
+        $ret = 0
+        if ([Native.ConIO]::NtQueryInformationProcess($h, 0, $buf, 6 * [IntPtr]::Size, [ref]$ret) -ne 0) { return [uint32]0 }
+        return [uint32]$buf[5].ToInt64()
+    } catch { return [uint32]0 }
+    finally {
+        if ($h -ne [IntPtr]::Zero) { try { [void][Native.ConIO]::CloseHandle($h) } catch {} }
+    }
+}
+function Test-ProcessDescendant {
+    param([uint32]$ProcessId, [uint32]$AncestorId, $AncestorStart = $null)
+    if ($ProcessId -eq 0 -or $AncestorId -eq 0 -or $ProcessId -eq $AncestorId) { return $false }
+    $cur = $ProcessId
+    $seen = @{}
+    for ($hop = 0; $hop -lt 16; $hop++) {
+        if ($seen.ContainsKey($cur)) { return $false }
+        $seen[$cur] = $true
+        $parent = Get-ParentProcessId $cur
+        if ($parent -eq 0) { return $false }
+        if ($parent -eq $AncestorId) {
+            if ($null -ne $AncestorStart) {
+                $p = $null
+                try {
+                    $p = [System.Diagnostics.Process]::GetProcessById([int]$cur)
+                    return ($p.StartTime -ge $AncestorStart)
+                } catch { return $false }
+                finally { if ($p) { $p.Dispose() } }
+            }
+            return $true
+        }
+        $cur = $parent
+    }
+    return $false
+}
 # 给录制进程发一次 Ctrl+C，再等待它自己退出；超时交由 UI 决定继续等待、强制结束或取消。
 # 本函数只在 worker 运行，控制台信号的保护和解除必须配对。
 function Stop-ScrcpyGraceful {
@@ -1696,8 +1751,12 @@ function Stop-ScrcpyGraceful {
                 [void][Native.ConIO]::SetConsoleCtrlHandler([IntPtr]::Zero,$true)
                 $ids=New-Object uint32[] 64
                 $count=[Native.ConIO]::GetConsoleProcessList($ids,64)
-                # Ctrl+C 会广播到整个控制台；有其它会话时保留进程，让用户决定是否定向强制结束。
-                $foreign=@($ids | Select-Object -First ([Math]::Min(64,[int]$count)) | Where-Object { $_ -ne $PID -and $_ -ne $proc.Id })
+                $ancestorStart = $null; try { $ancestorStart = $proc.StartTime } catch {}
+                # Ctrl+C 会广播到整个控制台；scrcpy 自身派生的子进程（如 adb.exe）会继承它的私有控制台，
+                # 不应误判成共享控制台；若存在非目标子孙的其它进程，则保留进程交由用户决定是否强制结束。
+                $foreign=@($ids | Select-Object -First ([Math]::Min(64,[int]$count)) | Where-Object {
+                    $_ -ne $PID -and $_ -ne $proc.Id -and -not (Test-ProcessDescendant ([uint32]$_) ([uint32]$proc.Id) $ancestorStart)
+                })
                 if ($count -gt 0 -and $count -le 64 -and $foreign.Count -eq 0) {
                     $result.SignalSent=[Native.ConIO]::GenerateConsoleCtrlEvent(0,0)
                 } else { $result.Error='共享控制台，无法安全发送 Ctrl+C。' }
