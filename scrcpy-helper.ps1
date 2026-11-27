@@ -710,7 +710,7 @@ function Stop-DevicesUi {
     $forcedRecording=$false
     $recordingError=$false
     $result=[pscustomobject]@{ Success=$false; Cancelled=$true; Error='' }
-    $stopText = if ($Disconnect) { '正在停止投屏并断开无线…' } else { '正在停止投屏和录制…' }
+    $stopText = if ($Disconnect) { '正在停止投屏并断开无线…' } elseif ($Items.Count -gt 0 -and @($Items | Where-Object { -not $_.Rec }).Count -eq 0) { '正在停止录制…' } else { '正在停止投屏和录制…' }
     try {
         do {
             $result=Wait-UiTask -Owner $Owner -StatusText $stopText -Kind $(if ($ForExit) { 'shutdown' } else { 'operation' }) -Functions @(
@@ -902,9 +902,9 @@ $defaults = [ordered]@{
     # 独立窗口
     ndSize = ''; ndDpi = ''; ndNoDecor = $false; ndMode = 'settings'; ndFixed = $false; ndAudio = 'auto'
     # 录制
-    recFormat = 'mp4'; recTimeLimit = 0; recBackground = $false
+    recFormat = 'mp4'; recTimeLimit = 0; recBackground = $false; recDir = ''; lastRecDir = ''
     # 通用
-    liveStatus = $true; autoConnect = $true; disconnectOnClose = $false; extraArgs = ''; lastWirelessAddr = ''; defaultDevice = ''
+    liveStatus = $true; autoConnect = $true; disconnectOnClose = $false; extraArgs = ''; lastWirelessAddr = ''; defaultDevice = ''; lastDownloadDir = ''
     # 自定义 adb / scrcpy 可执行文件路径（留空=用本助手同目录自带的）；在「设置 > 通用」里改，随设置存进 JSON
     scrcpyPath = ''; adbPath = ''
     # 记住主窗口位置（-1 = 还没记，居中显示）
@@ -1138,6 +1138,34 @@ function Get-RecordingExtension {
     # PCM 无法封装进 MP4；关闭音频时不应受此前保存的音频编码影响。
     if ($settings.videoCodec -in @('vp8', 'vp9') -or ($settings.audioOn -and $settings.audioCodec -eq 'raw')) { return 'mkv' }
     return [string]$settings.recFormat
+}
+function Get-RecordingArgs {
+    param([string]$Serial, [string]$Path, [bool]$Wireless)
+    $a = @('-s', $Serial, '-r', $Path) + @(Get-VideoArgs) + @(Get-AudioArgs)
+    # 保持唤醒要分连接方式：无线用 --keep-active（-w/--stay-awake 只在 USB 插电时生效，无线录制会中途息屏断流）
+    if ($settings.noControl) { $a += '--no-control' }
+    else {
+        if ($settings.stayAwake) { $a += $(if ($Wireless) { '--keep-active' } else { '-w' }) }
+        if ($settings.screenOff) { $a += '--turn-screen-off' }
+    }
+    if ([int]$settings.recTimeLimit -gt 0) { $a += "--time-limit=$($settings.recTimeLimit)" }
+    if ($settings.recBackground) { $a += @('--no-window', '--no-playback') }
+    else { $a += @(Get-WindowArgs) }
+    return @($a)
+}
+function Resolve-RecordingPath {
+    param([string]$Ext, [string]$Timestamp = (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $dir = if ($settings.recDir) { ([string]$settings.recDir).Trim() } else { '' }
+    if (-not $dir) { return [pscustomobject]@{ Mode = 'prompt'; Path = ''; Dir = '' } }
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return [pscustomobject]@{ Mode = 'missing'; Path = ''; Dir = $dir } }
+    $base = "录屏-$Timestamp"
+    $candidate = Join-Path $dir "$base.$Ext"
+    $idx = 2
+    while (Test-Path -LiteralPath $candidate) {
+        $candidate = Join-Path $dir "$base-$idx.$Ext"
+        $idx++
+    }
+    return [pscustomobject]@{ Mode = 'fixed'; Path = $candidate; Dir = $dir }
 }
 function Get-ControlArgs {
     param([bool]$Wireless)
@@ -1490,7 +1518,7 @@ function Start-Scrcpy {
     }
     # Audio=本会话是否在电脑上出声（被自动静音的新会话记 false，供后续同设备会话判定「是否已有出声窗口」）
     if (-not $p) { return }
-    $entry=[pscustomobject]@{ Proc=$p; Rec=[bool]$Recording; Serial=$serial; Audio=[bool]$playsAudio; Starting=$true; StopInProgress=$false; StopSignalSent=$false; Forced=$false; ExitReported=$false }
+    $entry=[pscustomobject]@{ Proc=$p; Rec=[bool]$Recording; RecBg=[bool]($Recording -and (@($clean | Where-Object { $_ -eq '--no-window' }).Count -gt 0)); Serial=$serial; Audio=[bool]$playsAudio; Starting=$true; StopInProgress=$false; StopSignalSent=$false; Forced=$false; ExitReported=$false }
     [void]$scrcpyProcs.Add($entry)
     try {
         if ($PassThru) { $p }
@@ -1878,6 +1906,14 @@ function Draw-Glyph {
                 $g.FillEllipse($rb, $x + $w * 0.5 - $ir, $y + $h * 0.5 - $ir, $ir * 2, $ir * 2)
                 $rb.Dispose()
             }
+            'stop' {
+                $or = $w * 0.36
+                $g.DrawEllipse($pen, $x + $w * 0.5 - $or, $y + $h * 0.5 - $or, $or * 2, $or * 2)
+                $sq = $w * 0.28
+                $sp = New-RoundedPath ($x + $w * 0.5 - $sq * 0.5) ($y + $h * 0.5 - $sq * 0.5) $sq $sq ([float]([Math]::Max(1.5, $w * 0.06)))
+                $sb = New-Object System.Drawing.SolidBrush($cRed)
+                $g.FillPath($sb, $sp); $sb.Dispose(); $sp.Dispose()
+            }
             'window' {
                 $wp = New-RoundedPath ($x + $w * 0.15) ($y + $h * 0.18) ($w * 0.70) ($h * 0.64) ($w * 0.1)
                 $g.DrawPath($pen, $wp); $wp.Dispose()
@@ -2112,7 +2148,7 @@ function New-ActionCard {
     $b.ForeColor = if ($Primary) { $cWhite } else { $cInk }
     $b.Cursor = [System.Windows.Forms.Cursors]::Hand
     Enable-DoubleBuffer $b
-    $cd = @{ Title = $title; Sub = $sub; Glyph = $glyph; Primary = [bool]$Primary; Muted = $false; Dimmed = $false; Hover = $false }
+    $cd = @{ Title = $title; Sub = $sub; Glyph = $glyph; Primary = [bool]$Primary; Muted = $false; Dimmed = $false; Accent = $false; Hover = $false }
     $b | Add-Member -NotePropertyName CardData -NotePropertyValue $cd -Force
     $b.Add_MouseEnter({ $btn = $args[0]; if ($btn.CardData) { $btn.CardData.Hover = $true }; $btn.Invalidate() })
     $b.Add_MouseLeave({ $btn = $args[0]; if ($btn.CardData) { $btn.CardData.Hover = $false }; $btn.Invalidate() })
@@ -2140,6 +2176,9 @@ function New-ActionCard {
         } else {
             if ($cd.Dimmed) {
                 $bg = $cBusySecBg; $fg = $cBusySecText; $subFg = $cBusyLink; $badgeBg = $cPaper; $bd = $cBusySecLine
+            } elseif ($cd.Accent) {
+                $bg = if ($cd.Hover) { $cRedBg } else { $cRedStripBg }
+                $fg = $cRed; $subFg = $cText2; $badgeBg = $cRedBg; $bd = $cRedBorder
             } else {
                 $bg = if ($cd.Hover) { $cHover } else { $cWhite }
                 $fg = $cInk; $subFg = $cMuted; $badgeBg = $cPaper; $bd = if ($cd.Hover) { $cLineHover } else { $cLine }
@@ -2585,11 +2624,13 @@ function Show-Settings {
     $tabCtrl = New-Object System.Windows.Forms.Panel
     $cbKb = New-Combo @('默认（推荐）', '模拟实体键盘', 'USB 直连（只控制）') @('', 'uhid', 'aoa') $settings.keyboard 110 13 300
     $cbMouse = New-Combo @('默认（推荐）', '模拟实体鼠标', 'USB 直连（只控制）') @('', 'uhid', 'aoa') $settings.mouse 110 89 300
+    $capMouse = New-Caption '选「模拟实体鼠标」后，按左 Alt 或左 Win 可把鼠标切回电脑。' 14 120
+    $capMouse.MaximumSize = New-Object System.Drawing.Size(396, 0)
     # 顺序按使用度：键鼠模式在前，常用的「只投屏」「关窗息屏」次之，niche 的触摸点 / 手柄沉底
-    $chkNoCtrl = New-Chk '只投屏，不允许控制手机' $settings.noControl 14 126
-    $chkPowerOff = New-Chk '结束投屏后熄灭手机屏幕' $settings.powerOffOnClose 14 154
-    $chkTouches = New-Chk '显示触摸点' $settings.showTouches 14 182
-    $chkGamepad = New-Chk '启用手柄（把电脑手柄映射到手机）' $settings.gamepad 14 210
+    $chkNoCtrl = New-Chk '只投屏，不允许控制手机' $settings.noControl 14 148
+    $chkPowerOff = New-Chk '结束投屏后熄灭手机屏幕' $settings.powerOffOnClose 14 176
+    $chkTouches = New-Chk '显示触摸点' $settings.showTouches 14 204
+    $chkGamepad = New-Chk '启用手柄（把电脑手柄映射到手机）' $settings.gamepad 14 232
     $tt.SetToolTip($chkTouches, '在画面中标出手指实际触摸手机的位置。')
     $tt.SetToolTip($cbKb, '中文可以用 Ctrl+V 粘贴。想用手机输入法打字，可选「模拟实体键盘」。投屏时请选前两项。')
     $tt.SetToolTip($cbMouse, '平时选「默认」。使用「模拟实体鼠标」后，按左 Alt 或左 Win 可把鼠标指针切回电脑。投屏时请选前两项。')
@@ -2601,7 +2642,7 @@ function Show-Settings {
     $capKbCn.MaximumSize = New-Object System.Drawing.Size(396, 0)   # 不限宽会裁出面板右缘；窄于 396 第一行就折出孤儿字
     $tabCtrl.Controls.AddRange(@(
         (New-Lbl '键盘模式：' 14 16), $cbKb,
-        (New-Lbl '鼠标模式：' 14 92), $cbMouse,
+        (New-Lbl '鼠标模式：' 14 92), $cbMouse, $capMouse,
         $chkNoCtrl, $chkPowerOff, $chkTouches, $chkGamepad, $capKbCn))
 
     # ===== 窗口 =====
@@ -2609,12 +2650,13 @@ function Show-Settings {
     $chkFull = New-Chk '启动即全屏' $settings.fullscreen 14 18
     $chkTop = New-Chk '窗口总在最前' $settings.onTop 14 46
     $chkBorderless = New-Chk '无边框窗口' $settings.borderless 14 74
-    $chkMinTray = New-Chk '最小化时收起到系统托盘（不在任务栏占位）' $settings.minToTray 14 102
+    $capBorderless = New-Caption '去掉标题栏与边框，关窗按左 Alt+Q，也可在主界面点「■ 停止」。' 32 99
+    $chkMinTray = New-Chk '最小化时收起到系统托盘（不在任务栏占位）' $settings.minToTray 14 126
     $tt.SetToolTip($chkFull, '投屏后画面直接铺满整个屏幕；在投屏窗口按 左 Alt+f（或 F11）可退出全屏。')
     $tt.SetToolTip($chkTop, '投屏窗口始终浮在其它窗口上方，边看手机边操作电脑很方便。')
     $tt.SetToolTip($chkBorderless, '去掉投屏窗口的标题栏和边框，像把手机屏幕贴在桌面上。关窗用 左 Alt+q。')
-    $tt.SetToolTip($chkMinTray, '勾上后点标题栏最小化，助手窗口会收起到右下角托盘区，任务栏不再占位；单击/双击托盘图标还原，右键菜单可退出。投屏、录制等功能在托盘下照常运行。')
-    $tabWin.Controls.AddRange(@($chkFull, $chkTop, $chkBorderless, $chkMinTray))
+    $tt.SetToolTip($chkMinTray, '勾上后点标题栏最小化，助手窗口会收起到右下角托盘区，任务栏不再占位；单击/双击托盘图标还原，右键菜单可退出或停止会话。投屏、录制等功能在托盘下照常运行。')
+    $tabWin.Controls.AddRange(@($chkFull, $chkTop, $chkBorderless, $capBorderless, $chkMinTray))
 
     # ===== 独立窗口 =====
     $tabNd = New-Object System.Windows.Forms.Panel
@@ -2647,14 +2689,31 @@ function Show-Settings {
     $cbRecFmt = New-Combo @('mp4', 'mkv') @('mp4', 'mkv') $settings.recFormat 110 15 110
     $nudTime = New-Nud $settings.recTimeLimit 0 86400 10 110 77
     $chkRecBg = New-Chk '后台录制（不显示画面，更省资源）' $settings.recBackground 14 114
-    $tt.SetToolTip($nudTime, '到达指定秒数自动停止录制。0=不限时。后台录制请在「设备管理」选中设备后点「停止投屏」。')
+    $capRecBg = New-Caption '开始后可在主界面点「停止录制」或上方「■ 停止」结束。' 32 139
+    $txtRecDir = New-Txt 110 172 214
+    $txtRecDir.Text = $settings.recDir
+    $btnRecDirBrowse = New-SecondaryBtn '浏览…' 330 171 68 26
+    $btnRecDirBrowse.Add_Click({
+        $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+        $fbd.Description = '选择录屏默认保存目录'
+        $fbd.ShowNewFolderButton = $true
+        $curDir = $txtRecDir.Text.Trim()
+        if ($curDir -and (Test-Path -LiteralPath $curDir -PathType Container)) { $fbd.SelectedPath = $curDir }
+        if ($fbd.ShowDialog($dlg) -eq [System.Windows.Forms.DialogResult]::OK) { $txtRecDir.Text = $fbd.SelectedPath }
+        $fbd.Dispose()
+    }.GetNewClosure())
+    $capRecDir = New-Caption '填好后点「录制屏幕」直接保存到这里；不填=每次弹窗选择。' 110 202
+    $capRecDir.MaximumSize = New-Object System.Drawing.Size(294, 0)
+    $tt.SetToolTip($nudTime, '到达指定秒数自动停止录制。0=不限时。后台录制可在主界面点「停止录制」或上方「■ 停止」结束。')
     $tt.SetToolTip($cbRecFmt, 'mp4 通用好打开；mkv 更稳——录制中途若被强退，mp4 可能整段丢失，mkv 一般能保住已录部分。')
-    $tt.SetToolTip($chkRecBg, '录制时电脑不显示画面、不播放声音。已开启且能采集的声音仍会写入录屏文件。')
+    $tt.SetToolTip($chkRecBg, '录制时电脑不显示画面、不播放声音。已开启且能采集的声音仍会写入录屏文件。开始后可在主界面、托盘菜单或「设备管理」停止。')
+    $tt.SetToolTip($txtRecDir, '录屏默认保存文件夹。填好后点「录制屏幕」会直接按时间戳保存，不再每次弹窗；不填=每次手动选（并记住上次目录）。')
     $tabRec.Controls.AddRange(@(
         (New-Lbl '保存格式：' 14 18), $cbRecFmt,
         (New-Caption 'mp4 好打开；担心中途被强退丢整段，选 mkv 更稳' 110 46),
         (New-Lbl '录制时长：' 14 80), $nudTime, (New-Caption '秒，0=不限时长' 210 82),
-        $chkRecBg))
+        $chkRecBg, $capRecBg,
+        (New-Lbl '保存目录：' 14 176), $txtRecDir, $btnRecDirBrowse, $capRecDir))
 
     # ===== 通用 =====
     $tabGen = New-Object System.Windows.Forms.Panel
@@ -2751,6 +2810,7 @@ function Show-Settings {
         $settings.recFormat  = $cbRecFmt.Vals[$cbRecFmt.SelectedIndex]
         $settings.recTimeLimit = [int]$nudTime.Value
         $settings.recBackground = $chkRecBg.Checked
+        $settings.recDir     = $txtRecDir.Text.Trim()
         $settings.liveStatus = $chkLive.Checked
         $settings.autoConnect = $chkReconnect.Checked
         $settings.disconnectOnClose = $chkDisconnect.Checked
@@ -2766,6 +2826,9 @@ function Show-Settings {
         }
         if ($settings.adbPath -and -not (Test-Path -LiteralPath $settings.adbPath)) {
             [System.Windows.Forms.MessageBox]::Show("填写的 adb 路径不存在，已暂时回退到自带的：`n$($settings.adbPath)", '设置') | Out-Null
+        }
+        if ($settings.recDir -and -not (Test-Path -LiteralPath $settings.recDir -PathType Container)) {
+            [System.Windows.Forms.MessageBox]::Show("填写的录制保存目录不存在，录制时将改为弹窗选择：`n$($settings.recDir)", '设置') | Out-Null
         }
         $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $dlg.Close()
@@ -5191,10 +5254,15 @@ function Show-FileManager {
         $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
         $fbd.Description = "选择保存到电脑的文件夹（共 $($sel.Count) 项）"
         $fbd.ShowNewFolderButton = $true
+        if ($settings -and $settings.lastDownloadDir -and (Test-Path -LiteralPath $settings.lastDownloadDir -PathType Container)) { $fbd.SelectedPath = $settings.lastDownloadDir }
         if ($fbd.ShowDialog($dlg) -ne [System.Windows.Forms.DialogResult]::OK) { $fbd.Dispose(); return }
         $dest = $fbd.SelectedPath
         $fbd.Dispose()
         if (-not (Test-Path -LiteralPath $dest)) { return }
+        if ($settings -and $settings.lastDownloadDir -ne $dest) {
+            $settings.lastDownloadDir = $dest
+            if (Get-Command Save-Settings -ErrorAction SilentlyContinue) { Save-Settings }
+        }
         $relativeTargets = @{}
         try {
             $dest = Get-FmSaveRoot $dest
@@ -6051,26 +6119,66 @@ try {
         $btnCapRes.Invalidate()
     }
 
+    $script:recCardState = @{ Active = $false; Bg = $false }
+    $script:trayTextCache = ''
     $syncLiveSession = {
         Update-ProcessLifecycle
         $activeProcs = @($scrcpyProcs | Where-Object { $_.Proc -and -not (Test-ProcessExited $_.Proc) })
+        $activeRecProcs = @($activeProcs | Where-Object { $_.Rec })
+        $recCount = $activeRecProcs.Count
+        $hasBgRec = (@($activeRecProcs | Where-Object { $_.RecBg }).Count -gt 0)
         $showSess = ($activeProcs.Count -gt 0)
         if ($showSess) {
-            $recCount = @($activeProcs | Where-Object { $_.Rec }).Count
             $camCount = @($script:camSessions | Where-Object { -not $_.Stopped -and $_.Proc -and -not (Test-ProcessExited $_.Proc) }).Count
             $firstSerial = [string]$activeProcs[0].Serial
             $firstName = if ($firstSerial) { Get-FriendlyName $firstSerial -CachedOnly } else { '设备' }
             if ($activeProcs.Count -eq 1) {
                 if ($recCount -gt 0) {
-                    $lblSession.Text = $(if ($settings.recBackground) { "后台录屏中 · $firstName" } else { "录屏中 · $firstName" })
+                    $lblSession.Text = $(if ($activeRecProcs[0].RecBg) { "后台录屏中 · $firstName" } else { "录屏中 · $firstName" })
                 } elseif ($camCount -gt 0) {
                     $lblSession.Text = "摄像头运行中 · $firstName"
                 } else {
                     $lblSession.Text = "投屏中 · $firstName"
                 }
             } else {
-                $lblSession.Text = "运行中 · 共 $($activeProcs.Count) 个会话"
+                $lblSession.Text = $(if ($recCount -gt 0) { "运行中 · 共 $($activeProcs.Count) 个会话（含录屏）" } else { "运行中 · 共 $($activeProcs.Count) 个会话" })
             }
+        }
+        $recActive = ($recCount -gt 0)
+        if ($recActive -ne $script:recCardState.Active -or $hasBgRec -ne $script:recCardState.Bg) {
+            $script:recCardState.Active = $recActive
+            $script:recCardState.Bg = $hasBgRec
+            if ($recActive) {
+                $btnRecord.CardData.Title = '停止录制'
+                $btnRecord.CardData.Sub = if ($hasBgRec) { '后台录屏中 · 点此结束（不影响投屏）' } else { '正在录屏 · 点此结束（不影响投屏）' }
+                $btnRecord.CardData.Glyph = 'stop'
+                $btnRecord.CardData.Accent = $true
+                $btnRecord.Text = '停止录制'
+                $tt.SetToolTip($btnRecord, '仅停止当前录制并保存视频，不影响正在运行的投屏窗口。')
+            } else {
+                $btnRecord.CardData.Title = '录制屏幕'
+                $btnRecord.CardData.Sub = '边投边录或后台静默录'
+                $btnRecord.CardData.Glyph = 'record'
+                $btnRecord.CardData.Accent = $false
+                $btnRecord.Text = '录制屏幕'
+                $tt.SetToolTip($btnRecord, '把手机屏幕录制成视频文件（可边投边录或后台静默录）。')
+            }
+            $btnRecord.Invalidate()
+        }
+        if ($tray) {
+            $trayText = if ($recActive) {
+                if ($hasBgRec) { 'scrcpy 投屏助手 · 后台录屏中' } else { 'scrcpy 投屏助手 · 录屏中' }
+            } elseif ($activeProcs.Count -gt 0) {
+                'scrcpy 投屏助手 · 投屏运行中'
+            } else {
+                'scrcpy 投屏助手'
+            }
+            if ($trayText -ne $script:trayTextCache) {
+                $script:trayTextCache = $trayText
+                $tray.Text = $trayText
+            }
+            $miTrayStopRec.Visible = $recActive
+            $miTrayStopAll.Visible = ($activeProcs.Count -gt $recCount)
         }
         $changed = ($pnlSession.Visible -ne $showSess)
         $pnlSession.Visible = $showSess
@@ -6349,9 +6457,12 @@ try {
     }) })
 
     $btnQuickStop.Add_Click({ Invoke-MainFlow ({
-        [void](Stop-DevicesUi $form -All)
+        $res = Stop-DevicesUi $form -All
         & $syncLiveSession
-        & $script:showTempHint '已停止当前运行的投屏 / 录制会话' $cGreen 4000
+        if ($res -and $res.Success) {
+            & $script:showTempHint '已停止当前运行的投屏 / 录制会话' $cGreen 4000
+            $script:hintKeepAfterFlow = $true
+        }
     }) })
 
     $btnCapAudio.Add_Click({
@@ -6748,45 +6859,69 @@ try {
         }
     }) })
 
-    $btnRecord.Add_Click({ Invoke-MainFlow -WithDevices -Source $btnRecord ({
-        param($devices)
-        $tgt = Resolve-Target $form -Devices $devices
-        if (-not $tgt.Ok) { if ($tgt.Reason -eq 'none') { [System.Windows.Forms.MessageBox]::Show('没检测到手机，请先连接手机再录制。', '录制屏幕') | Out-Null }; return }
-        $recExt = Get-RecordingExtension
-        $mkvOnly = ($settings.videoCodec -in @('vp8', 'vp9') -or ($settings.audioOn -and $settings.audioCodec -eq 'raw'))
-        $sfd = New-Object System.Windows.Forms.SaveFileDialog
-        $sfd.InitialDirectory = $PSScriptRoot
-        $sfd.FileName = "录屏-$(Get-Date -Format 'yyyyMMdd-HHmmss').$recExt"
-        $sfd.DefaultExt = $recExt
-        $sfd.Filter = if ($mkvOnly) { 'MKV 视频|*.mkv' } else { 'MP4 视频|*.mp4|MKV 视频|*.mkv' }
-        $sfd.FilterIndex = if (-not $mkvOnly -and $recExt -eq 'mkv') { 2 } else { 1 }
-        # 不在对话框关闭后改路径；显式填写不兼容后缀时留在对话框里修改，确保覆盖确认与写入同一文件。
-        $sfd.Add_FileOk({
-            param($sender, $eventArgs)
-            $ext = [System.IO.Path]::GetExtension($sender.FileName)
-            if (($mkvOnly -and $ext -ne '.mkv') -or $ext -notin @('.mp4', '.mkv')) {
-                $eventArgs.Cancel = $true
-                [System.Windows.Forms.MessageBox]::Show($(if ($mkvOnly) { '当前编码需使用 mkv，请把文件后缀改为 .mkv。' } else { '请使用 .mp4 或 .mkv 文件后缀。' }), '录制屏幕') | Out-Null
+    $btnRecord.Add_Click({
+        Update-ProcessLifecycle
+        $recItems = @($scrcpyProcs | Where-Object { $_.Rec -and $_.Proc -and -not (Test-ProcessExited $_.Proc) })
+        if ($recItems.Count -gt 0) {
+            Invoke-MainFlow -Source $btnRecord ({
+                $res = Stop-DevicesUi $form -Items $recItems
+                & $syncLiveSession
+                if ($res -and $res.Success) {
+                    & $script:showTempHint '已停止录制' $cGreen 4000
+                    $script:hintKeepAfterFlow = $true
+                }
+            })
+            return
+        }
+        Invoke-MainFlow -WithDevices -Source $btnRecord ({
+            param($devices)
+            $tgt = Resolve-Target $form -Devices $devices
+            if (-not $tgt.Ok) { if ($tgt.Reason -eq 'none') { [System.Windows.Forms.MessageBox]::Show('没检测到手机，请先连接手机再录制。', '录制屏幕') | Out-Null }; return }
+            $recExt = Get-RecordingExtension
+            $recTarget = Resolve-RecordingPath $recExt
+            $recPath = ''
+            if ($recTarget.Mode -eq 'fixed') {
+                $recPath = $recTarget.Path
+            } else {
+                if ($recTarget.Mode -eq 'missing') {
+                    [System.Windows.Forms.MessageBox]::Show("设置的录制保存目录不存在：`n$($recTarget.Dir)`n`n请在接下来的窗口中手动选择保存位置。", '录制屏幕', 'OK', 'Warning') | Out-Null
+                }
+                $mkvOnly = ($settings.videoCodec -in @('vp8', 'vp9') -or ($settings.audioOn -and $settings.audioCodec -eq 'raw'))
+                $sfd = New-Object System.Windows.Forms.SaveFileDialog
+                $sfd.InitialDirectory = if ($settings.lastRecDir -and (Test-Path -LiteralPath $settings.lastRecDir -PathType Container)) { $settings.lastRecDir } else { $PSScriptRoot }
+                $sfd.FileName = "录屏-$(Get-Date -Format 'yyyyMMdd-HHmmss').$recExt"
+                $sfd.DefaultExt = $recExt
+                $sfd.Filter = if ($mkvOnly) { 'MKV 视频|*.mkv' } else { 'MP4 视频|*.mp4|MKV 视频|*.mkv' }
+                $sfd.FilterIndex = if (-not $mkvOnly -and $recExt -eq 'mkv') { 2 } else { 1 }
+                # 不在对话框关闭后改路径；显式填写不兼容后缀时留在对话框里修改，确保覆盖确认与写入同一文件。
+                $sfd.Add_FileOk({
+                    param($sender, $eventArgs)
+                    $ext = [System.IO.Path]::GetExtension($sender.FileName)
+                    if (($mkvOnly -and $ext -ne '.mkv') -or $ext -notin @('.mp4', '.mkv')) {
+                        $eventArgs.Cancel = $true
+                        [System.Windows.Forms.MessageBox]::Show($(if ($mkvOnly) { '当前编码需使用 mkv，请把文件后缀改为 .mkv。' } else { '请使用 .mp4 或 .mkv 文件后缀。' }), '录制屏幕') | Out-Null
+                    }
+                })
+                if ($sfd.ShowDialog($form) -ne 'OK') { return }
+                $recPath = $sfd.FileName
+                $parentDir = Split-Path -Parent $recPath
+                if ($parentDir -and $settings.lastRecDir -ne $parentDir) {
+                    $settings.lastRecDir = $parentDir
+                    Save-Settings
+                }
             }
-        })
-        if ($sfd.ShowDialog($form) -eq 'OK') {
-            $recPath = $sfd.FileName
-            $a = @('-s', $tgt.Serial, '-r', $recPath) + (Get-VideoArgs) + (Get-AudioArgs)
-            # 保持唤醒要分连接方式：无线用 --keep-active（-w/--stay-awake 只在 USB 插电时生效，无线录制会中途息屏断流）
-            if ($settings.noControl) { $a += '--no-control' }
-            elseif ($settings.stayAwake) { $a += $(if (Test-Wireless $tgt.Serial) { '--keep-active' } else { '-w' }) }
-            if ([int]$settings.recTimeLimit -gt 0) { $a += "--time-limit=$($settings.recTimeLimit)" }
-            if ($settings.recBackground) { $a += @('--no-window', '--no-playback') }
+            $a = Get-RecordingArgs -Serial $tgt.Serial -Path $recPath -Wireless:(Test-Wireless $tgt.Serial)
             $newRec=Start-Scrcpy $a -Recording -PassThru
             $recStarted=($newRec -and -not (Test-ProcessExited $newRec))
             if ($recStarted) {
-                $recTip = if ($settings.recBackground) { '● 后台录制中 · 可直接在上方「当前设备」卡片点「停止」' } else { '● 录制中 · 关掉投屏窗口或在主界面点「停止」可结束录制' }
+                $recName = [System.IO.Path]::GetFileName($recPath)
+                $recTip = if ($settings.recBackground) { "● 后台录制中（$recName）· 点「停止录制」可结束" } else { "● 录制中（$recName）· 关窗或点「停止录制」可结束" }
                 & $script:showTempHint $recTip $cGreen
                 $script:hintKeepAfterFlow = $true
                 & $syncLiveSession
             }
-        }
-    }) })
+        })
+    })
 
     $btnNd.Add_Click({
         # scrcpy 的 --start-app 和 --flex-display 都需要控制通道，禁用控制时无需连接设备。
@@ -6888,6 +7023,8 @@ try {
     $tray.Text = 'scrcpy 投屏助手'
     $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
     $miTrayRestore = $trayMenu.Items.Add('显示主窗口')
+    $miTrayStopRec = $trayMenu.Items.Add('■ 停止录制'); $miTrayStopRec.Visible = $false
+    $miTrayStopAll = $trayMenu.Items.Add('■ 停止全部会话'); $miTrayStopAll.Visible = $false
     [void]$trayMenu.Items.Add('-')
     $miTrayExit = $trayMenu.Items.Add('退出助手')
     $tray.ContextMenuStrip = $trayMenu
@@ -6901,6 +7038,39 @@ try {
         $form.Activate()
     }
     $miTrayRestore.Add_Click($restoreFromTray)
+    $miTrayStopRec.Add_Click({
+        Update-ProcessLifecycle
+        $recItems = @($scrcpyProcs | Where-Object { $_.Rec -and $_.Proc -and -not (Test-ProcessExited $_.Proc) })
+        if ($recItems.Count -eq 0) { & $syncLiveSession; return }
+        Invoke-MainFlow ({
+            $res = Stop-DevicesUi $form -Items $recItems
+            & $syncLiveSession
+            if ($res -and $res.Success) {
+                & $script:showTempHint '已停止录制' $cGreen 4000
+                $script:hintKeepAfterFlow = $true
+                if ($tray.Visible) {
+                    $tray.BalloonTipTitle = 'scrcpy 投屏助手'
+                    $tray.BalloonTipText = '已停止录制。'
+                    $tray.ShowBalloonTip(2000)
+                }
+            }
+        })
+    })
+    $miTrayStopAll.Add_Click({
+        Invoke-MainFlow ({
+            $res = Stop-DevicesUi $form -All
+            & $syncLiveSession
+            if ($res -and $res.Success) {
+                & $script:showTempHint '已停止当前运行的投屏 / 录制会话' $cGreen 4000
+                $script:hintKeepAfterFlow = $true
+                if ($tray.Visible) {
+                    $tray.BalloonTipTitle = 'scrcpy 投屏助手'
+                    $tray.BalloonTipText = '已停止全部投屏 / 录制会话。'
+                    $tray.ShowBalloonTip(2000)
+                }
+            }
+        })
+    })
     $tray.Add_DoubleClick($restoreFromTray)
     # Win11 习惯：单击托盘图标也还原；右键仍由系统弹菜单
     $tray.Add_MouseClick({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { & $restoreFromTray } })

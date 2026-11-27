@@ -3,7 +3,8 @@ $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path (Split-Path $PSScriptRoot) 'scrcpy-helper.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join [Environment]::NewLine) }
-foreach ($name in @('Start-Scrcpy','Split-WindowsArguments','Fm-WinArg')) {
+foreach ($name in @('Start-Scrcpy','Split-WindowsArguments','Fm-WinArg',
+    'Get-HwDecArgs','Get-DisplayCompatibilityArgs','Get-VideoArgs','Get-AudioArgs','Get-WindowArgs','Get-RecordingArgs','Resolve-RecordingPath')) {
     $definition = $ast.Find({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true)
@@ -81,14 +82,19 @@ $json = ConvertTo-Json -InputObject @{ Arguments=$argv } -Compress
 '@)
     $launchCases = @(
         @{
-            Extra='--window-title="Living Room" --angle=90'; Title='Living Room'; Rec=$false
+            Extra='--window-title="Living Room" --angle=90'; Title='Living Room'; Rec=$false; RecBg=$false
             Values=@('-s','test-device','--window-title=Living Room','--angle=90')
         },
         @{
             Extra='--window-title "房间 \"东\"" --record="C:\My Videos\clip.mp4" --push-target="C:\Phone Files\\" ""'
-            Title='房间 "东"'; Rec=$true; BuiltInTitle='--window-title=Test phone · App'
+            Title='房间 "东"'; Rec=$true; RecBg=$false; BuiltInTitle='--window-title=Test phone · App'
             Values=@('-s','test-device','--window-title=Test phone · App','--window-title','房间 "东"',
                 '--record=C:\My Videos\clip.mp4','--push-target=C:\Phone Files\','')
+        },
+        @{
+            Extra='--record="C:\My Videos\bg.mp4" --no-window --no-playback'
+            Title=$null; Rec=$true; RecBg=$true; BuiltInTitle=''
+            Values=@('-s','test-device','--record=C:\My Videos\bg.mp4','--no-window','--no-playback','--window-title=Test-phone · 录制')
         }
     )
     foreach ($case in $launchCases) {
@@ -98,11 +104,55 @@ $json = ConvertTo-Json -InputObject @{ Arguments=$argv } -Compress
         Start-Scrcpy @('-s','test-device','',$case.BuiltInTitle)
         Check (-not $fixture.LaunchError) "Argument spy failed: $($fixture.LaunchError)"
         Assert-Arguments $fixture.Actual $case.Values 'Child process'
-        Check ($fixture.Title -ceq $case.Title) 'Startup used the wrong window title'
-        Check ($scrcpyProcs.Count -eq 1 -and $scrcpyProcs[0].Rec -eq $case.Rec) 'Process registration did not use the parsed options'
+        if ($null -ne $case.Title) { Check ($fixture.Title -ceq $case.Title) 'Startup used the wrong window title' }
+        else { Check (-not $fixture.ContainsKey('Title')) 'Background playback unexpectedly waited for a window' }
+        Check ($scrcpyProcs.Count -eq 1 -and $scrcpyProcs[0].Rec -eq $case.Rec -and $scrcpyProcs[0].RecBg -eq $case.RecBg) 'Process registration did not use the parsed options'
     }
+
+    $settings = @{
+        maxSize=0; maxFps=0; bitRate=0; videoCodec=''; crop=''; hwDec=''; ignoreEncoderConstraints=$false
+        audioOn=$true; audioSource=''; audioCodec=''
+        noControl=$false; stayAwake=$true; screenOff=$true
+        fullscreen=$false; onTop=$true; borderless=$true
+        recTimeLimit=120; recBackground=$false; recDir=''
+    }
+    Assert-Arguments @(Get-RecordingArgs -Serial 'usb-1' -Path 'C:\rec\a.mp4' -Wireless $false) @(
+        '-s','usb-1','-r','C:\rec\a.mp4','-w','--turn-screen-off','--time-limit=120','--always-on-top','--window-borderless'
+    ) 'Windowed USB recording arguments'
+    Assert-Arguments @(Get-RecordingArgs -Serial '192.0.2.5:5555' -Path 'C:\rec\b.mp4' -Wireless $true) @(
+        '-s','192.0.2.5:5555','-r','C:\rec\b.mp4','--keep-active','--turn-screen-off','--time-limit=120','--always-on-top','--window-borderless'
+    ) 'Windowed wireless recording arguments'
+
+    $settings.recBackground = $true
+    Assert-Arguments @(Get-RecordingArgs -Serial 'usb-1' -Path 'C:\rec\c.mp4' -Wireless $false) @(
+        '-s','usb-1','-r','C:\rec\c.mp4','-w','--turn-screen-off','--time-limit=120','--no-window','--no-playback'
+    ) 'Background recording arguments'
+
+    $settings.noControl = $true
+    Assert-Arguments @(Get-RecordingArgs -Serial 'usb-1' -Path 'C:\rec\d.mp4' -Wireless $false) @(
+        '-s','usb-1','-r','C:\rec\d.mp4','--no-control','--time-limit=120','--no-window','--no-playback'
+    ) 'No-control recording arguments'
+
+    $promptTarget = Resolve-RecordingPath 'mp4' '20261128-053000'
+    Check ($promptTarget.Mode -ceq 'prompt') 'Empty recDir did not prompt'
+    $missingDir = Join-Path $testRoot 'missing-folder'
+    $settings.recDir = $missingDir
+    $missingTarget = Resolve-RecordingPath 'mp4' '20261128-053000'
+    Check ($missingTarget.Mode -ceq 'missing' -and $missingTarget.Dir -ceq $missingDir) 'Missing recDir did not report missing'
+
+    $recOutDir = Join-Path $testRoot 'recordings'
+    [void][IO.Directory]::CreateDirectory($recOutDir)
+    $settings.recDir = "  $recOutDir  "
+    $fixed1 = Resolve-RecordingPath 'mp4' '20261128-053000'
+    $expected1 = Join-Path $recOutDir '录屏-20261128-053000.mp4'
+    Check ($fixed1.Mode -ceq 'fixed' -and $fixed1.Path -ceq $expected1) 'Fixed recDir produced wrong file path'
+    [IO.File]::WriteAllText($expected1, 'taken')
+    $fixed2 = Resolve-RecordingPath 'mp4' '20261128-053000'
+    $expected2 = Join-Path $recOutDir '录屏-20261128-053000-2.mp4'
+    Check ($fixed2.Mode -ceq 'fixed' -and $fixed2.Path -ceq $expected2) 'Collision suffix was not appended for fixed recDir'
 } finally {
     foreach ($file in [IO.Directory]::GetFiles($testRoot)) { [IO.File]::Delete($file) }
+    foreach ($dir in [IO.Directory]::GetDirectories($testRoot)) { [IO.Directory]::Delete($dir, $true) }
     [IO.Directory]::Delete($testRoot)
 }
 'PASS scrcpy command-line argument regression on PowerShell ' + $PSVersionTable.PSVersion

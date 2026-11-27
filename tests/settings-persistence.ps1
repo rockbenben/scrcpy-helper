@@ -35,6 +35,8 @@ function Reset-SettingsState {
 function Check-ValidSettings {
     Check ($settings.maxSize -eq 720 -and $settings.bitRate -eq 8 -and $settings.recFormat -ceq 'mkv') 'A valid scalar setting was lost'
     Check ($settings.ndSize -ceq '' -and $settings.ndDpi -ceq '420' -and $settings.winX -eq -120) 'A valid custom display or window setting was lost'
+    Check ($settings.recDir -ceq 'C:\Videos\Scrcpy' -and $settings.lastDownloadDir -ceq 'C:\Downloads\Phone') 'Valid directory memory was lost'
+    Check ($settings.lastRecDir -ceq $defaults.lastRecDir) 'Invalid directory memory did not fall back'
     Check ($settings.audioOn -eq $false -and $settings.fullscreen -eq $true) 'Boolean values changed during load'
     Check ($settings.maxFps -eq $defaults.maxFps -and $settings.recTimeLimit -eq $defaults.recTimeLimit) 'Bad numeric field did not fall back'
     Check ($settings.noControl -eq $defaults.noControl -and $settings.stayAwake -eq $defaults.stayAwake) 'Bad boolean field did not fall back'
@@ -66,6 +68,9 @@ try {
   "bitRate": "8",
   "recTimeLimit": 1.5,
   "recFormat": "mkv",
+  "recDir": "C:\\Videos\\Scrcpy",
+  "lastRecDir": 12345,
+  "lastDownloadDir": "C:\\Downloads\\Phone",
   "audioOn": "false",
   "fullscreen": true,
   "noControl": "broken",
