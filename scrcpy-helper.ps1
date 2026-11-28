@@ -3333,20 +3333,15 @@ function Show-Settings {
     [void]$dlg.ShowDialog($owner)
 }
 
-function Test-AppInFavorites {
-    param([string]$pkg)
-    return ($apps.psbase.Values -contains $pkg -or $script:customApps.psbase.Values -contains $pkg)
-}
-
 function Add-AppFavorite {
     param($owner, [string]$name, [string]$pkg, [switch]$FromPhone)
-    if (Test-AppInFavorites $pkg) {
-        [void](Show-ResultDialog $owner '管理常用' '这个应用已在常用列表中' $pkg '' @('ok'))
+    if ($apps.psbase.Values -contains $pkg -or $script:customApps.psbase.Values -contains $pkg) {
+        [void](Show-ResultDialog $owner '更多应用' '这个应用已在常用列表中' $pkg '' @('ok'))
         return
     }
     if ($apps.Contains($name) -or $script:customApps.Contains($name)) {
         if (-not $FromPhone) {
-            [void](Show-ResultDialog $owner '管理常用' '这个显示名称已被使用' '请用其他名称添加该应用。' '' @('ok'))
+            [void](Show-ResultDialog $owner '更多应用' '这个显示名称已被使用' '请用其他名称添加该应用。' '' @('ok'))
             return
         }
         # 手机上的不同应用可以同名，用包名区分，避免覆盖已有条目。
@@ -3358,161 +3353,118 @@ function Add-AppFavorite {
     return $name
 }
 
-# ---------------- 从手机已装 App 里挑一个（可搜索） ----------------
-# 用 scrcpy --list-apps 取得显示名和包名，避免同名应用选错。
+# ---------------- 从手机已装 App 和常用应用里挑一个（可搜索） ----------------
 function Show-AppPicker {
-    param($owner, $serial, [switch]$AddToFavorites)
-    $title = if ($AddToFavorites) { '从手机添加' } else { '更多应用' }
-    $manualAction = if ($AddToFavorites) { '手动添加' } else { '手动输入' }
-    # 必须带 -s 指定设备：多设备连接时 scrcpy --list-apps 不指定设备会因「有多台设备」直接失败、列不出 App
+    param($owner, $serial)
+    $title = '更多应用'
+    # 多设备连接时必须指定序列号，避免读取错误的手机。
     $listArgs = if ($serial) { @('-s', $serial, '--list-apps') } else { @('--list-apps') }
     $oldCursor = $owner.Cursor
     $owner.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     try { $command = Invoke-UiCommand $owner $exe $listArgs -StatusText '正在读取手机应用列表…' }
     finally { $owner.Cursor = $oldCursor }
     if ($command.Cancelled) { return $null }
-    if (-not (Test-CommandSuccess $command)) {
-        [void](Show-ResultDialog $owner $title '读取手机应用列表失败' "请确认手机仍在线。若知道应用的包名，也可用「$manualAction」。" (Get-CommandDetail $command) @('ok'))
-        return $null
-    }
-    $raw = $command.Stdout + "`n" + $command.Stderr
-    $list = @()
-    foreach ($line in ($raw -split "`n")) {
-        # 形如：「 - 微信                 com.tencent.mm」/「 * 设置  com.android.settings」
-        if ($line -match '^\s*[-*]\s+(.*?)\s+([A-Za-z][A-Za-z0-9._]+)\s*$') {
-            $list += [pscustomobject]@{ Name = $matches[1].Trim(); Pkg = $matches[2] }
-        }
-    }
-    if (-not $list) {
-        [void](Show-ResultDialog $owner $title '应用列表中没有可选项' "可用「$manualAction」，例如 com.tencent.mm。" $raw.Trim() @('ok'))
-        return $null
-    }
-    $list = @($list | Sort-Object Name)
 
-    $dlg = New-Dialog $title 340 388 $owner
-
-    $lbl = New-Lbl '按应用名称或包名搜索' 16 14
-    $txt = New-Txt 16 40 308
-    $lb = New-Object System.Windows.Forms.ListBox
-    $lb.Location = '16,74'; $lb.Size = '308,256'
-    $lb.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
-    $lblEmpty = New-Caption '没有找到匹配的 App，换个关键词试试' 24 84
-    $lblEmpty.BackColor = $cWhite
-    $lblEmpty.Visible = $false
-
-    $shown = New-Object System.Collections.ArrayList
-    $result = @{ SelectedApp=$null; AddedName=$null }
-    $btnGo = $null
-    if ($AddToFavorites) {
-        $btnFavorite = New-PrimaryBtn '加入常用' 16 342 218 34 10
-    } else {
-        $btnGo = New-PrimaryBtn '选择应用' 16 342 108 34 10
-        $btnFavorite = New-SecondaryBtn '加入常用' 132 342 104 34
-    }
-    $btnClose = New-SecondaryBtn '关闭' 242 342 82 34
-    $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-
-    $syncButtons = {
-        $hasSelection = $lb.SelectedIndex -ge 0 -and $lb.SelectedIndex -lt $shown.Count
-        $alreadyFavorite = $hasSelection -and (Test-AppInFavorites $shown[$lb.SelectedIndex].Pkg)
-        if ($btnGo) { $btnGo.Enabled = $hasSelection }
-        $btnFavorite.Enabled = $hasSelection -and -not $alreadyFavorite
-        $btnFavorite.Text = if ($alreadyFavorite) { '已在常用' } else { '加入常用' }
-    }
-    $fill = {
-        param($q)
-        $ql = ([string]$q).ToLower()   # 字面子串匹配（大小写不敏感）：避免把 [ 等当通配符导致 -like 抛异常
-        $lb.BeginUpdate(); $lb.Items.Clear(); $shown.Clear()
-        foreach ($it in $list) {
-            if (-not $ql -or $it.Name.ToLower().Contains($ql) -or $it.Pkg.ToLower().Contains($ql)) {
-                [void]$lb.Items.Add("$($it.Name)   ·   $($it.Pkg)")
-                [void]$shown.Add($it)
+    $installed = @{}
+    if (Test-CommandSuccess $command) {
+        $raw = $command.Stdout + "`n" + $command.Stderr
+        foreach ($line in ($raw -split "`n")) {
+            if ($line -match '^\s*[-*]\s+(.*?)\s+([A-Za-z][A-Za-z0-9._]+)\s*$') {
+                $installed[$matches[2]] = $matches[1].Trim()
             }
         }
-        $lb.EndUpdate()
-        $has = $lb.Items.Count -gt 0
-        if ($has) { $lb.SelectedIndex = 0 }
-        $lblEmpty.Visible = -not $has
-        & $syncButtons
+    } else {
+        [void](Show-ResultDialog $owner $title '读取手机应用列表失败' '请确认手机仍在线。这里仍可查看常用应用，或用「手动添加」。' (Get-CommandDetail $command) @('ok'))
     }
-    & $fill ''
-    $txt.Add_TextChanged({ & $fill $txt.Text.Trim() })
-    $lb.Add_SelectedIndexChanged($syncButtons)
-    $btnFavorite.Add_Click({
-        if (-not $btnFavorite.Enabled) { return }
-        $app = $shown[$lb.SelectedIndex]
-        $added = Add-AppFavorite $dlg $app.Name $app.Pkg -FromPhone
-        if ($added) { $result.AddedName = $added }
-        & $syncButtons
-    })
-    $dlg.Controls.AddRange(@($lbl, $txt, $lb, $lblEmpty))
-    $dlg.AcceptButton = $btnFavorite
-    $dlg.CancelButton = $btnClose
-    if ($btnGo) {
-        $pick = {
-            if ($lb.SelectedIndex -lt 0 -or $lb.SelectedIndex -ge $shown.Count) { return }
-            $result.SelectedApp = $shown[$lb.SelectedIndex]
-            $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
-        }
-        $btnGo.Add_Click($pick)
-        $lb.Add_MouseDoubleClick({
-            param($sender, $mouseEvent)
-            $index = $sender.IndexFromPoint($mouseEvent.Location)
-            if ($index -lt 0) { return }
-            $sender.SelectedIndex = $index
-            & $pick
-        })
-        [void]$dlg.Controls.Add($btnGo)
-        $dlg.AcceptButton = $btnGo
-    }
-    $dlg.Controls.AddRange(@($btnFavorite, $btnClose))
-    $lblEmpty.BringToFront()
-    # 关闭时仍须把新收藏通知父窗，已保存的收藏不依赖选择应用的结果。
-    [void]$dlg.ShowDialog($owner)
-    return $result
-}
 
-# ---------------- 管理「我的常用应用」：用户自己增删常用 App ----------------
-function Show-ManageApps {
-    param($owner, $serial)
-    $dlg = New-Dialog '管理常用' 360 322 $owner
-    $lbl = New-Lbl '你添加的应用会出现在独立窗口的下拉列表中。' 16 14
+    $dlg = New-Dialog $title 460 388 $owner
+    $lbl = New-Lbl '按应用名称或包名搜索' 16 14
+    $txt = New-Txt 16 40 308
+    $chkFavorites = New-Chk '只看常用' ($installed.Count -eq 0) 344 42
     $lb = New-Object System.Windows.Forms.ListBox
-    $lb.Location = '16,40'; $lb.Size = '328,176'
+    $lb.Location = '16,74'; $lb.Size = '428,256'
     $lb.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
-    $lblEmpty = New-Caption '还没有添加常用应用' 24 49
+    $lblEmpty = New-Caption '没有匹配的应用' 24 84
     $lblEmpty.BackColor = $cWhite
 
-    $btnFromPhone = New-SecondaryBtn '从手机添加' 16 226 108 34
-    $btnAdd = New-SecondaryBtn '手动添加' 132 226 102 34
-    $btnDel = New-SecondaryBtn '移除常用' 242 226 102 34
-    $btnDone = New-PrimaryBtn '完成' 16 274 328 34 10
+    $btnGo = New-PrimaryBtn '选择应用' 16 342 102 34 10
+    $btnFavorite = New-SecondaryBtn '加入常用' 126 342 80 34
+    $btnRemove = New-SecondaryBtn '移除常用' 214 342 80 34
+    $btnManual = New-SecondaryBtn '手动添加' 302 342 80 34
+    $btnClose = New-SecondaryBtn '关闭' 390 342 54 34
+    $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $shown = New-Object System.Collections.ArrayList
+    $result = @{ SelectedApp=$null; FavoritesChanged=$false }
 
-    $refresh = {
-        param([string]$selected)
-        $lb.BeginUpdate()
-        $lb.Items.Clear()
-        foreach ($name in $script:customApps.psbase.Keys) {
-            $index = $lb.Items.Add("$name   ·   $($script:customApps[$name])")
-            if ($name -eq $selected) { $lb.SelectedIndex = $index }
+    $syncButtons = {
+        $selectedApp = if ($lb.SelectedIndex -ge 0 -and $lb.SelectedIndex -lt $shown.Count) { $shown[$lb.SelectedIndex] }
+        $btnGo.Enabled = $null -ne $selectedApp
+        $btnFavorite.Enabled = $btnGo.Enabled -and -not $selectedApp.Favorite
+        $btnFavorite.Text = if ($selectedApp.Favorite) { '已在常用' } else { '加入常用' }
+        $btnRemove.Enabled = [bool]$selectedApp.Removable
+    }
+    $fill = {
+        param([string]$preferredName, [string]$preferredPackage, [switch]$ClearSelection)
+        $query = $txt.Text.Trim()
+        $favoritePackages = @{}
+        $entries = @(
+            foreach ($map in @($apps, $script:customApps)) {
+                $removable = [object]::ReferenceEquals($map, $script:customApps)
+                foreach ($name in $map.psbase.Keys) {
+                    $pkg = $map[$name]
+                    $favoritePackages[$pkg] = $true
+                    [pscustomobject]@{ Name=$name; Pkg=$pkg; Favorite=$true; Removable=$removable }
+                }
+            }
+            if (-not $chkFavorites.Checked) {
+                foreach ($pkg in $installed.psbase.Keys) {
+                    if (-not $favoritePackages.ContainsKey($pkg)) {
+                        [pscustomobject]@{ Name=$installed[$pkg]; Pkg=$pkg; Favorite=$false; Removable=$false }
+                    }
+                }
+            }
+        )
+        $preferredIndex = -1
+        $lb.BeginUpdate(); $lb.Items.Clear(); $shown.Clear()
+        foreach ($entry in ($entries | Sort-Object Name, Pkg)) {
+            $phoneName = [string]$installed[$entry.Pkg]
+            if ($query -and $entry.Name.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
+                $entry.Pkg.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
+                $phoneName.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+            $index = $lb.Items.Add("$($entry.Name)   ·   $($entry.Pkg)")
+            [void]$shown.Add($entry)
+            if ($entry.Name -eq $preferredName -and $entry.Pkg -eq $preferredPackage) { $preferredIndex = $index }
         }
         $lb.EndUpdate()
-        $lblEmpty.Visible = $lb.Items.Count -eq 0
-        $btnDel.Enabled = $lb.SelectedIndex -ge 0
+        $hasApps = $shown.Count -gt 0
+        if ($hasApps -and -not $ClearSelection) { $lb.SelectedIndex = [Math]::Max(0, $preferredIndex) }
+        $lblEmpty.Visible = -not $hasApps
+        & $syncButtons
     }
-    $lb.Add_SelectedIndexChanged({ $btnDel.Enabled = $lb.SelectedIndex -ge 0 })
-    & $refresh
-
-    $addState = @{ Busy=$false }
-    $btnFromPhone.Add_Click({
-        if ($addState.Busy) { return }
-        $addState.Busy = $true
-        try {
-            $picked = Show-AppPicker $dlg $serial -AddToFavorites
-            if ($picked.AddedName) { & $refresh $picked.AddedName }
-        } finally { $addState.Busy = $false }
+    & $fill
+    $txt.Add_TextChanged({ & $fill })
+    $chkFavorites.Add_CheckedChanged({
+        $current = if ($lb.SelectedIndex -ge 0) { $shown[$lb.SelectedIndex] }
+        & $fill $current.Name $current.Pkg
     })
-    $btnAdd.Add_Click({
+    $lb.Add_SelectedIndexChanged($syncButtons)
+
+    $btnFavorite.Add_Click({
+        if (-not $btnFavorite.Enabled) { return }
+        $entry = $shown[$lb.SelectedIndex]
+        $added = Add-AppFavorite $dlg $entry.Name $entry.Pkg -FromPhone
+        if ($added) { $result.FavoritesChanged = $true; & $fill $added $entry.Pkg }
+    })
+    $btnRemove.Add_Click({
+        if (-not $btnRemove.Enabled) { return }
+        $entry = $shown[$lb.SelectedIndex]
+        $script:customApps.Remove($entry.Name)
+        Save-Settings
+        $result.FavoritesChanged = $true
+        # 要先选中下一项再移除，避免连点时误删相邻的收藏。
+        & $fill -ClearSelection
+    })
+    $btnManual.Add_Click({
         $name = Show-InputDialog $dlg '手动添加' '输入应用的显示名称，例如飞书。' ''
         if ([string]::IsNullOrWhiteSpace($name)) { return }
         $pkg = Show-InputDialog $dlg '手动添加' '输入应用的完整包名，例如 com.ss.android.lark。' ''
@@ -3523,21 +3475,29 @@ function Show-ManageApps {
             return
         }
         $added = Add-AppFavorite $dlg $name.Trim() $pkg
-        if ($added) { & $refresh $added }
+        if ($added) { $result.FavoritesChanged = $true; & $fill $added $pkg }
     })
-    $btnDel.Add_Click({
-        $keys = @($script:customApps.psbase.Keys)
-        if ($lb.SelectedIndex -lt 0 -or $lb.SelectedIndex -ge $keys.Count) { return }
-        $script:customApps.Remove($keys[$lb.SelectedIndex])
-        Save-Settings
-        & $refresh
+
+    $pick = {
+        if ($lb.SelectedIndex -lt 0) { return }
+        $result.SelectedApp = $shown[$lb.SelectedIndex]
+        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    }
+    $btnGo.Add_Click($pick)
+    $lb.Add_MouseDoubleClick({
+        param($sender, $mouseEvent)
+        $index = $sender.IndexFromPoint($mouseEvent.Location)
+        if ($index -lt 0) { return }
+        $sender.SelectedIndex = $index
+        & $pick
     })
-    $btnDone.Add_Click({ $dlg.Close() })
-    $dlg.Controls.AddRange(@($lbl, $lb, $lblEmpty, $btnFromPhone, $btnAdd, $btnDel, $btnDone))
+    $dlg.Controls.AddRange(@($lbl, $txt, $chkFavorites, $lb, $lblEmpty, $btnGo, $btnFavorite, $btnRemove, $btnManual, $btnClose))
     $lblEmpty.BringToFront()
-    $dlg.AcceptButton = $btnDone
-    $dlg.CancelButton = $btnDone
+    $dlg.AcceptButton = $btnGo
+    $dlg.CancelButton = $btnClose
+    # 关闭时仍须刷新父窗的常用列表，因为增删操作已经保存。
     [void]$dlg.ShowDialog($owner)
+    return $result
 }
 
 # ---------------- 独立窗口：自定义虚拟屏尺寸 ----------------
@@ -3788,7 +3748,6 @@ function Show-NewDisplay {
 
     $btnMore = New-LinkBtn '更多应用' 12 64 82
     $btnManual = New-LinkBtn '手动输入' 102 64 82
-    $btnManage = New-LinkBtn '管理常用' 214 64 82
     $appActionState = @{ Busy=$false }
     $btnMore.Add_Click({
         if ($appActionState.Busy) { return }
@@ -3798,7 +3757,7 @@ function Show-NewDisplay {
             $app = $picked.SelectedApp
             if ($app) {
                 & $refreshApps ([pscustomobject]@{ Name=$app.Name; Target="+$($app.Pkg)"; Label=$app.Name; Temporary=$true })
-            } elseif ($picked.AddedName) {
+            } elseif ($picked.FavoritesChanged) {
                 & $refreshApps
             }
         } finally { $appActionState.Busy = $false }
@@ -3811,11 +3770,6 @@ function Show-NewDisplay {
         $target = if ($name -match '\.') { "+$name" } else { "+?$name" }
         & $refreshApps ([pscustomobject]@{ Name=$name; Target=$target; Label=$name; Temporary=$true })
     })
-    $btnManage.Add_Click({
-        if ($appActionState.Busy) { return }
-        Show-ManageApps $dlg $serial
-        & $refreshApps
-    })
 
     # 窗口比例/方向：微信、QQ 等手机应用在“横屏平板”虚拟屏上会用平板版面、显示不全，选「竖屏·手机」即用手机版面
     $customLabel = if ($settings.ndSize) { "自定义 $($settings.ndSize)" } else { '自定义…' }
@@ -3827,8 +3781,8 @@ function Show-NewDisplay {
         Set-CardStyle $cardApp 10 $cWhite $cLine
         $lApp = New-Lbl '选择应用（需 Android 11+）' 12 10; $lApp.ForeColor = $cText2; $lApp.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
         $cb.Location = New-Object System.Drawing.Point(12, 34); $cb.Size = New-Object System.Drawing.Size(284, 28)
-        foreach ($button in @($btnMore, $btnManual, $btnManage)) { $button.BackColor = $cWhite }
-        $cardApp.Controls.AddRange(@($lApp, $cb, $btnMore, $btnManual, $btnManage))
+        foreach ($button in @($btnMore, $btnManual)) { $button.BackColor = $cWhite }
+        $cardApp.Controls.AddRange(@($lApp, $cb, $btnMore, $btnManual))
 
         $cardMode = New-Object System.Windows.Forms.Panel
         $cardMode.Location = New-Object System.Drawing.Point(16, 122); $cardMode.Size = New-Object System.Drawing.Size(308, 96)
@@ -3858,7 +3812,7 @@ function Show-NewDisplay {
         $l1 = New-Lbl '在电脑上单开一块屏，运行下面这个 App：' 16 14
         $l2 = New-Lbl '需要 Android 11 或更新版本' 16 38; $l2.ForeColor = $cMuted
         $cb.Location = New-Object System.Drawing.Point(16, 64); $cb.Size = New-Object System.Drawing.Size(288, 28)
-        $btnMore.Location = '16,96'; $btnManual.Location = '106,96'; $btnManage.Location = '222,96'
+        $btnMore.Location = '16,96'; $btnManual.Location = '106,96'
         $lblMode = New-Lbl '窗口比例' 16 140
         $cbMode.Location = New-Object System.Drawing.Point(84, 137); $cbMode.Size = New-Object System.Drawing.Size(220, 26)
         $chkFixed = New-Chk '固定分辨率（窗口缩放时尺寸不变）' $settings.ndFixed 16 173
@@ -3868,7 +3822,7 @@ function Show-NewDisplay {
         $cbAudio = New-Combo @('自动（同设备避免重音）', '播放（允许此窗口出声）', '静音（这扇窗不出声）') @('auto', 'on', 'off') $ndAudioState.Val 84 262 220
         $cbAudio.Add_SelectedIndexChanged({ $ndAudioState.Val = [string]$cbAudio.Vals[$cbAudio.SelectedIndex] }.GetNewClosure())
         $btnGo = New-PrimaryBtn '打开独立窗口' 16 304 288 38 11
-        $dlg.Controls.AddRange(@($l1, $l2, $cb, $btnMore, $btnManual, $btnManage, $lblMode, $cbMode, $chkFixed, $capMode, $lblAudio, $cbAudio, $btnGo))
+        $dlg.Controls.AddRange(@($l1, $l2, $cb, $btnMore, $btnManual, $lblMode, $cbMode, $chkFixed, $capMode, $lblAudio, $cbAudio, $btnGo))
     }
 
     # 空字符串是用户明确清空后的值，不能再用值的真假来判断是否确认过。

@@ -5,7 +5,7 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path (Split-Path $PSScriptRoot) 'scrcpy-helper.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join "`n") }
 foreach ($name in @(
-    'Show-NewDisplay','Show-AppPicker','Show-ManageApps','Test-AppInFavorites','Add-AppFavorite','Get-NewDisplayArgs','Get-DisplayCompatibilityArgs','Get-HwDecArgs',
+    'Show-NewDisplay','Show-AppPicker','Add-AppFavorite','Get-NewDisplayArgs','Get-DisplayCompatibilityArgs','Get-HwDecArgs',
     'Get-VideoArgs','Get-ControlArgs','New-Lbl','New-Combo','New-Chk','New-Caption','New-Txt'
 )) {
     $definition = $ast.Find({ param($node)
@@ -145,9 +145,11 @@ foreach ($preset in @(
 function Invoke-UiCommand {
     param($Owner, $Exe, $Options, $StatusText)
     Check (($Options -join '|') -eq '-s|test-device|--list-apps') 'App picker did not list apps from the selected device'
-    return @{ Stdout=" - Test app com.example.second`n - Another app com.example.third"; Stderr='' }
+    if ($fixture.FailedList) { return @{ Started=$false; Error='Device offline' } }
+    return @{ Started=$true; Stdout=" - Test app com.example.second`n - Another app com.example.third"; Stderr='' }
 }
-function Test-CommandSuccess { return $true }
+function Test-CommandSuccess($Result) { return $Result.Started }
+function Get-CommandDetail($Result) { return $Result.Error }
 function Show-InputDialog { return $fixture.Inputs.Dequeue() }
 
 $settings = @{ ndMode='settings'; ndFixed=$true; ndNoDecor=$false; ndAudio='auto'; audioOn=$true }
@@ -209,63 +211,85 @@ try {
 
 $script:customApps.Clear()
 $script:customApps['Keys'] = 'com.example.saved'
+$script:customApps['To remove'] = 'com.example.fourth'
 $fixture = @{
-    Scans=0; Pickers=0; Starts=0; Saves=0
+    Scans=0; Pickers=0; Starts=0; Saves=0; FailedList=$false
     Inputs=[Collections.Queue]::new()
     DialogActions=@{
         '独立窗口' = {
             param($window)
             $appsCombo = @($window.Controls | Where-Object { $_ -is [Windows.Forms.ComboBox] })[0]
             $appsCombo.SelectedIndex = 1
-            $manage = $window.Controls | Where-Object { $_.Text -ceq '管理常用' }
-            & $manage.Action
+            Check (-not ($window.Controls | Where-Object { $_.Text -ceq '管理常用' })) 'Independent window retained the separate favorites dialog'
+            $more = $window.Controls | Where-Object { $_.Text -ceq '更多应用' }
+            & $more.Action
             Check ($appsCombo.SelectedItem.Target -ceq '+com.example.saved') 'Managing favorites changed the selected app'
-            Check ($appsCombo.Items.Count -eq 3) 'Saved favorites did not refresh in the dropdown'
+            Check ($appsCombo.Items.Target -cnotcontains '+com.example.fourth') 'The removed favorite stayed in the dropdown'
+            $fixture.FailedList = $true
+            & $more.Action
+            Check ($fixture.Heading -ceq '读取手机应用列表失败') 'Phone app query failure was not reported'
             $manual = $window.Controls | Where-Object { $_.Text -ceq '手动输入' }
             $fixture.Inputs.Enqueue('example')
             & $manual.Action
             Check ($appsCombo.SelectedItem.Target -ceq '+?example') 'Manual search was not staged for launch'
             Check ($fixture.Starts -eq 0) 'An app action unexpectedly launched scrcpy'
         }
-        '管理常用' = {
-            param($manager)
-            $fromPhone = $manager.Controls | Where-Object { $_.Text -ceq '从手机添加' }
-            $manualAdd = $manager.Controls | Where-Object { $_.Text -ceq '手动添加' }
-            $remove = $manager.Controls | Where-Object { $_.Text -ceq '移除常用' }
-            Check (-not $remove.Enabled) 'Remove was enabled without a selection'
-            & $fromPhone.Action
-            Check ($script:customApps['Test app (com.example.second)'] -ceq 'com.example.second') 'Adding a same-name favorite overwrote or lost an app'
-            & $fromPhone.Action
-            Check ($fixture.Saves -eq 1) 'A duplicate package was saved'
+        '更多应用' = {
+            param($picker)
+            $filter = $picker.Controls | Where-Object { $_ -is [Windows.Forms.CheckBox] }
+            $search = $picker.Controls | Where-Object { $_ -is [Windows.Forms.TextBox] }
+            $list = $picker.Controls | Where-Object { $_ -is [Windows.Forms.ListBox] }
+            $remove = $picker.Controls | Where-Object { $_.Text -ceq '移除常用' }
+            $manualAdd = $picker.Controls | Where-Object { $_.Text -ceq '手动添加' }
+            Check ($filter.Text -ceq '只看常用') 'More apps did not offer a favorites filter'
+            if ($fixture.FailedList) {
+                Check ($filter.Checked -and $list.Items.Count -eq 2) 'Query failure hid saved or built-in favorites'
+                return
+            }
+            Check (-not $filter.Checked) 'More apps did not initially show installed apps'
+            $search.Text = 'com.example.second'
+            $filter.Checked = $true
+            Check ($list.Items.Count -eq 0 -and -not $remove.Enabled) 'Favorites filter included an unsaved app'
+            $filter.Checked = $false
+            Check ($list.Items.Count -eq 1) 'Disabling the filter did not restore installed search results'
+            $favorite = $picker.Controls | Where-Object { $_.Text -ceq '加入常用' }
+            & $favorite.Action
+            Check ($script:customApps['Test app (com.example.second)'] -ceq 'com.example.second') 'A same-name favorite overwrote or lost an app'
+            $filter.Checked = $true
+            Check ($list.Items.Count -eq 1 -and $remove.Enabled -and $search.Text -ceq 'com.example.second') 'The saved app did not appear under the same search in favorites'
+            & $remove.Action
+            Check ($list.Items.Count -eq 0 -and -not $remove.Enabled -and $fixture.Saves -eq 2) 'Removing a favorite did not refresh the list'
+            $filter.Checked = $false
+            Check ($list.Items.Count -eq 1 -and $picker.AcceptButton.Enabled -and $favorite.Enabled) 'Removing a favorite hid the installed app'
+            $filter.Checked = $true
+            $search.Text = 'com.example.app'
+            Check ($list.Items.Count -eq 1 -and -not $remove.Enabled -and -not $favorite.Enabled) 'A built-in favorite could be added or removed'
+            $search.Text = ''
             $fixture.Inputs.Enqueue('Keys')
             $fixture.Inputs.Enqueue('com.example.other')
             & $manualAdd.Action
-            Check ($script:customApps['Keys'] -ceq 'com.example.saved' -and $fixture.Saves -eq 1) 'Manual add overwrote an existing favorite'
+            Check ($script:customApps['Keys'] -ceq 'com.example.saved' -and $fixture.Saves -eq 2) 'Manual add overwrote an existing favorite'
             $fixture.Inputs.Enqueue('Values')
             $fixture.Inputs.Enqueue('com.example.manual')
             & $manualAdd.Action
             Check ($script:customApps['Values'] -ceq 'com.example.manual' -and $remove.Enabled) 'Manual favorite was not saved and selected'
-            & $fromPhone.Action
-            Check ($fixture.Saves -eq 2) 'A favorite named Values bypassed package deduplication'
+            $fixture.Inputs.Enqueue('Other name')
+            $fixture.Inputs.Enqueue('com.example.saved')
+            & $manualAdd.Action
+            Check ($fixture.Saves -eq 3 -and $fixture.Heading -ceq '这个应用已在常用列表中') 'A favorite named Values bypassed package deduplication'
             & $remove.Action
-            Check (-not $script:customApps.Contains('Values') -and $fixture.Saves -eq 3) 'Removing an app did not update favorites'
-        }
-        '从手机添加' = {
-            param($picker)
-            $search = $picker.Controls | Where-Object { $_ -is [Windows.Forms.TextBox] }
-            $search.Text = 'com.example.second'
-            if ($fixture.Saves -eq 0) {
-                Check ($picker.AcceptButton.Text -ceq '加入常用' -and $picker.AcceptButton.Enabled) 'Favorite picker did not identify the effect of confirming'
-                & $picker.AcceptButton.Action
-            } else {
-                Check ($picker.AcceptButton.Text -ceq '已在常用' -and -not $picker.AcceptButton.Enabled) 'Favorite picker allowed a duplicate package'
-            }
+            Check (-not $script:customApps.Contains('Values') -and $fixture.Saves -eq 4 -and -not $remove.Enabled) 'Removal did not clear the selection or update favorites'
+            $search.Text = 'com.example.fourth'
+            Check ($remove.Enabled) 'A saved app missing from the phone list could not be removed'
+            & $remove.Action
+            Check ($fixture.Saves -eq 5 -and $list.Items.Count -eq 0) 'Removal did not update the existing favorite'
+            Check ($fixture.Starts -eq 0) 'A favorites operation launched the installed app'
         }
     }
 }
 try {
     & $click
-    Check ($fixture.Starts -eq 0) 'Leaving app selection launched scrcpy'
+    Check ($fixture.Starts -eq 0) 'Leaving the independent window launched scrcpy'
 } finally {
     foreach ($control in $fixture.Picker.Controls) {
         if ($control -is [Windows.Forms.Control]) { $control.Dispose() }
