@@ -2561,6 +2561,13 @@ function Add-RoundedButtonPaint {
         $flags = [System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::SingleLine -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis
         $textRect = $b.ClientRectangle
         if ($st.Glyph) {
+            if ([string]::IsNullOrEmpty($b.Text)) {
+                $sz = [float](14 * $script:dpiScale)
+                $sx = ($b.ClientSize.Width - $sz) / 2.0
+                $sy = ($b.ClientSize.Height - $sz) / 2.0
+                Draw-Glyph $g $st.Glyph ([System.Drawing.RectangleF]::new($sx, $sy, $sz, $sz)) $fg (1.4 * $script:dpiScale)
+                return
+            }
             $sz = [float](13 * $script:dpiScale)
             $txSz = [System.Windows.Forms.TextRenderer]::MeasureText($g, $b.Text, $b.Font, $b.ClientSize, $flags)
             $gap = [float](4 * $script:dpiScale)
@@ -6365,12 +6372,9 @@ try {
     $lblSection.ForeColor = $cInk
     $form.Controls.Add($lblSection)
 
-    $btnFindPhone = New-LinkBtn '寻找手机' 108 11 94 'bell'
-    $findPhoneTip = '以最大闹钟音量循环播放手机当前的来电铃声，直到点「停止响铃」。'
-    $tt.SetToolTip($btnFindPhone, $findPhoneTip)
     $btnShortcuts = New-LinkBtn '快捷键' 382 11 72 'keyboard'
     $btnSettings  = New-LinkBtn '设置'   458 11 62 'settings'
-    $form.Controls.AddRange(@($btnFindPhone, $btnShortcuts, $btnSettings))
+    $form.Controls.AddRange(@($btnShortcuts, $btnSettings))
 
     # 设备与运行态卡片
     $pnlDevCard = New-Object System.Windows.Forms.Panel
@@ -6394,7 +6398,7 @@ try {
     })
 
     $btnDevName = New-Object System.Windows.Forms.Button
-    $btnDevName.Location = New-Object System.Drawing.Point(27, 7); $btnDevName.Size = New-Object System.Drawing.Size(350, 26)
+    $btnDevName.Location = New-Object System.Drawing.Point(27, 7); $btnDevName.Size = New-Object System.Drawing.Size(330, 26)
     $btnDevName.FlatStyle = 'Flat'; $btnDevName.FlatAppearance.BorderSize = 0
     $btnDevName.BackColor = $cWhite; $btnDevName.ForeColor = $cInk
     $btnDevName.Cursor = [System.Windows.Forms.Cursors]::Default
@@ -6437,12 +6441,26 @@ try {
     })
 
     $lblCardMeta = New-Caption '正在读取设备连接状态' 27 35
-    $lblCardMeta.AutoSize = $false; $lblCardMeta.Size = New-Object System.Drawing.Size(360, 18)
+    $lblCardMeta.AutoSize = $false; $lblCardMeta.Size = New-Object System.Drawing.Size(330, 18)
     $lblCardMeta.ForeColor = $cMuted
+
+    $btnFindPhone = New-Object System.Windows.Forms.Button
+    $btnFindPhone.Text = ''
+    $btnFindPhone.AccessibleName = '寻找手机'
+    $btnFindPhone.Location = New-Object System.Drawing.Point(362, 15)
+    $btnFindPhone.Size = New-Object System.Drawing.Size(28, 28)
+    $btnFindPhone.FlatStyle = 'Flat'; $btnFindPhone.FlatAppearance.BorderSize = 0
+    $btnFindPhone.BackColor = $cWhite; $btnFindPhone.ForeColor = $cMuted
+    $btnFindPhone.FlatAppearance.MouseOverBackColor = $cSoft
+    $btnFindPhone.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $btnFindPhone.Visible = $false
+    Add-RoundedButtonPaint $btnFindPhone 7 $false 'bell'
+    $findPhoneTip = '寻找手机：以最大闹钟音量循环播放手机当前的来电铃声，直到停止。'
+    $tt.SetToolTip($btnFindPhone, $findPhoneTip)
 
     $btnDevices = New-SecondaryBtn '设备管理' 396 15 82 28
     $btnDevices.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
-    $pnlDevTop.Controls.AddRange(@($btnDevName, $lblCardMeta, $btnDevices))
+    $pnlDevTop.Controls.AddRange(@($btnDevName, $lblCardMeta, $btnFindPhone, $btnDevices))
 
     # 多设备切换菜单
     $devMenu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -6607,9 +6625,12 @@ try {
     $syncFindPhoneButton = {
         $ring = $script:phoneRing
         $ringActive = ($null -ne $ring -and -not $ring.Finished)
+        $hasOnline = (@($script:uiState.OnlineDevices).Count -gt 0)
+        $btnFindPhone.Visible = ($hasOnline -or $ringActive)
         if ($ringActive) {
             $stopping = ($ring.Phase -eq 'stopping')
-            $btnFindPhone.Text = if ($stopping) { '正在停止…' } else { '停止响铃' }
+            $btnFindPhone.Text = ''
+            $btnFindPhone.AccessibleName = if ($stopping) { '正在停止响铃' } else { '停止响铃' }
             $btnFindPhone.Enabled = (-not $stopping)
             $btnFindPhone.BackColor = $cRedStripBg
             $btnFindPhone.ForeColor = $cRed
@@ -6617,18 +6638,24 @@ try {
             $btnFindPhone.FlatAppearance.MouseOverBackColor = $cRedBg
             $btnFindPhone.BtnPaint.HasBorder = $true
             $btnFindPhone.BtnPaint.Glyph = 'stop'
+            if ($stopping) {
+                $btnFindPhone.BtnPaint.Hover = $false
+                $btnFindPhone.BtnPaint.Down = $false
+            }
             $ringName = if ($ring.DeviceName) { $ring.DeviceName } else { '手机' }
             $tt.SetToolTip($btnFindPhone, $(if ($stopping) { "正在停止「$ringName」响铃并恢复闹钟音量…" } else { "停止「$ringName」响铃并恢复原来的闹钟音量。" }))
         } else {
-            $btnFindPhone.Text = '寻找手机'
+            $btnFindPhone.Text = ''
+            $btnFindPhone.AccessibleName = '寻找手机'
             $btnFindPhone.Enabled = $true
-            $btnFindPhone.BackColor = $cPaper
-            $btnFindPhone.FlatAppearance.BorderColor = [System.Drawing.Color]::Transparent
+            $btnFindPhone.BackColor = $cWhite
+            $btnFindPhone.FlatAppearance.BorderColor = [System.Drawing.Color]::Empty
             $btnFindPhone.FlatAppearance.MouseOverBackColor = $cSoft
             $btnFindPhone.BtnPaint.HasBorder = $false
             $btnFindPhone.BtnPaint.Glyph = 'bell'
-            $hasOnline = (@($script:uiState.OnlineDevices).Count -gt 0)
-            $btnFindPhone.ForeColor = if ($script:mainFlow -and $script:mainFlow.Busy) { $cBusyLink } elseif ($hasOnline) { $cText2 } else { $cMuted }
+            $btnFindPhone.BtnPaint.Hover = $false
+            $btnFindPhone.BtnPaint.Down = $false
+            $btnFindPhone.ForeColor = if ($script:mainFlow -and $script:mainFlow.Busy) { $cBusyLink } else { $cMuted }
             $tt.SetToolTip($btnFindPhone, $findPhoneTip)
         }
         $btnFindPhone.Invalidate()
@@ -6953,7 +6980,7 @@ try {
                 else { & $script:showTempHint $heading $cRed 8000 }
             } else { & $script:showTempHint '已停止响铃。' $cMuted 6000 }
         } elseif ($phase -eq 'starting' -and $ring.Phase -eq 'playing') {
-            & $script:showTempHint "「$($ring.DeviceName)」正在响铃，点「停止响铃」结束。" $cRed $null
+            & $script:showTempHint "「$($ring.DeviceName)」正在响铃，点「■ 停止」结束。" $cRed $null
             & $syncLiveSession
         }
     })
