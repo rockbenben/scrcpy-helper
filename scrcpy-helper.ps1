@@ -501,109 +501,252 @@ function Start-PhoneRing {
     <#
 // 从这一段复制为 ScrcpyPhoneRing.java。使用 Android SDK 36 的 android.jar 和 D8 36.0.0。
 // javac -g:none --release 8 -classpath <android.jar> ScrcpyPhoneRing.java
-// d8 --release --min-api 23 --lib <android.jar> ScrcpyPhoneRing.class
+// d8 --release --min-api 23 --lib <android.jar> ScrcpyPhoneRing.class 'ScrcpyPhoneRing$RingtoneSource.class'
 // 将生成的 classes.dex 转为 Base64，替换下方 $player 的内容。
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
+import android.media.MediaCodec;
+import android.media.MediaDataSource;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
+import android.net.Uri;
+import android.os.SystemClock;
 import java.io.FileDescriptor;
 import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
 public final class ScrcpyPhoneRing {
-    public static void main(String[] args) throws Exception {
-        final int sampleRate = 48000;
-        final int pulseFrames = sampleRate / 4;
-        final int fadeFrames = sampleRate / 100;
-        short[] samples = new short[sampleRate * 3 / 2];
-        for (int i = 0; i < samples.length; ++i) {
-            int pulse = i / pulseFrames;
-            int frame = i % pulseFrames;
-            if (pulse >= 4 || pulse % 2 != 0) {
-                continue;
-            }
-            double frequency = pulse == 0 ? 1050 : 1550;
-            double envelope = Math.min(1.0, Math.min(frame, pulseFrames - 1 - frame) / (double) fadeFrames);
-            samples[i] = (short) (28000 * envelope * Math.sin(2 * Math.PI * frequency * frame / sampleRate));
+    // The player runs as an ADB shell tool, so it has no application Context.
+    private static final class RingtoneSource extends MediaDataSource {
+        private final RandomAccessFile file;
+
+        RingtoneSource(String path) throws IOException {
+            file = new RandomAccessFile(path, "r");
         }
 
-        AudioTrack track = new AudioTrack.Builder()
+        @Override public synchronized int readAt(long position, byte[] buffer, int offset, int size)
+                throws IOException {
+            file.seek(position);
+            return file.read(buffer, offset, size);
+        }
+
+        @Override public synchronized long getSize() throws IOException {
+            return file.length();
+        }
+
+        @Override public synchronized void close() throws IOException {
+            file.close();
+        }
+    }
+
+    private static MediaFormat selectAudio(MediaExtractor extractor) throws IOException {
+        for (int index = 0; index < extractor.getTrackCount(); ++index) {
+            MediaFormat format = extractor.getTrackFormat(index);
+            String mime = format.getString(MediaFormat.KEY_MIME);
+            if (mime != null && mime.startsWith("audio/")) {
+                extractor.selectTrack(index);
+                return format;
+            }
+        }
+        throw new IOException("The ringtone does not contain audio");
+    }
+
+    private static AudioTrack openTrack(MediaFormat format) {
+        int channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
+        int encoding = format.containsKey(MediaFormat.KEY_PCM_ENCODING)
+                ? format.getInteger(MediaFormat.KEY_PCM_ENCODING) : AudioFormat.ENCODING_PCM_16BIT;
+        AudioFormat.Builder pcm = new AudioFormat.Builder()
+                .setEncoding(encoding)
+                .setSampleRate(format.getInteger(MediaFormat.KEY_SAMPLE_RATE));
+        if (channels <= 2) {
+            pcm.setChannelMask(channels == 1 ? AudioFormat.CHANNEL_OUT_MONO : AudioFormat.CHANNEL_OUT_STEREO);
+        } else {
+            pcm.setChannelIndexMask((1 << channels) - 1);
+        }
+        return new AudioTrack.Builder()
                 .setAudioAttributes(new AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_ALARM)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                         .build())
-                .setAudioFormat(new AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build())
-                .setBufferSizeInBytes(samples.length * 2)
-                .setTransferMode(AudioTrack.MODE_STATIC)
+                .setAudioFormat(pcm.build())
                 .build();
-        try {
-            if (track.write(samples, 0, samples.length) != samples.length ||
-                    track.setLoopPoints(0, samples.length, -1) != AudioTrack.SUCCESS) {
-                throw new IllegalStateException("AudioTrack could not loop the alert");
-            }
+    }
 
-            track.play();
-            if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) {
-                throw new IllegalStateException("AudioTrack did not start");
-            }
+    private static void play(MediaExtractor extractor, MediaCodec decoder) throws IOException {
+        AudioTrack track = null;
+        boolean inputEnded = false;
+        long nextHeartbeat = 0;
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        try {
             // Write to the ADB shell pipe without Android's Java stream redirection.
             FileOutputStream stdout = new FileOutputStream(FileDescriptor.out);
             byte[] heartbeat = "FIND_PHONE_PLAYING\n".getBytes(StandardCharsets.US_ASCII);
             for (;;) {
-                stdout.write(heartbeat);
-                Thread.sleep(1500);
+                int input = inputEnded ? -1 : decoder.dequeueInputBuffer(10000);
+                if (input >= 0) {
+                    int size = extractor.readSampleData(decoder.getInputBuffer(input), 0);
+                    inputEnded = size < 0;
+                    decoder.queueInputBuffer(input, 0, Math.max(size, 0),
+                            inputEnded ? 0 : extractor.getSampleTime(),
+                            inputEnded ? MediaCodec.BUFFER_FLAG_END_OF_STREAM : 0);
+                    if (!inputEnded) {
+                        extractor.advance();
+                    }
+                }
+
+                int output = decoder.dequeueOutputBuffer(info, 10000);
+                if (output < 0) {
+                    continue;
+                }
+                if (info.size > 0) {
+                    if (track == null) {
+                        track = openTrack(decoder.getOutputFormat(output));
+                        track.play();
+                    }
+                    ByteBuffer pcm = decoder.getOutputBuffer(output);
+                    pcm.position(info.offset);
+                    pcm.limit(info.offset + info.size);
+                    if (track.write(pcm, info.size, AudioTrack.WRITE_BLOCKING) != info.size) {
+                        throw new IOException("The ringtone audio could not be played");
+                    }
+                    long now = SystemClock.elapsedRealtime();
+                    if (now >= nextHeartbeat) {
+                        stdout.write(heartbeat);
+                        nextHeartbeat = now + 1500;
+                    }
+                }
+                decoder.releaseOutputBuffer(output, false);
+                if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                    // Keep queued PCM playing while the decoder goes back to the start.
+                    extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                    decoder.flush();
+                    inputEnded = false;
+                }
             }
         } finally {
-            track.release();
+            if (track != null) {
+                track.release();
+            }
+        }
+    }
+
+    public static void main(String[] args) throws IOException {
+        Uri source = Uri.parse(args[0]);
+        String path = "file".equals(source.getScheme()) ? source.getPath() : args[0];
+        try (RingtoneSource ringtone = new RingtoneSource(path)) {
+            MediaExtractor extractor = new MediaExtractor();
+            try {
+                extractor.setDataSource(ringtone);
+                MediaFormat format = selectAudio(extractor);
+                MediaCodec decoder = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME));
+                try {
+                    decoder.configure(format, null, null, 0);
+                    decoder.start();
+                    play(extractor, decoder);
+                } finally {
+                    decoder.release();
+                }
+            } finally {
+                extractor.release();
+            }
+        } catch (IOException | IllegalArgumentException | SecurityException ex) {
+            System.err.println("FIND_PHONE_RINGTONE_UNAVAILABLE");
+            throw ex;
         }
     }
 }
     #>
     $player = @'
-ZGV4CjAzNQBVFL5/41eNtSFxPTg7CcmKzHGfewiegamUCwAAcAAAAHhWNBIAAAAAAAAAANwKAAA/AAAAcAAAABkAAABsAQAAFQAA
-ANABAAACAAAAzAIAAB8AAADcAgAAAQAAANQDAACgBwAA9AMAAFYGAABeBgAAgwYAAJ0GAACgBgAApAYAAKkGAAC+BgAAwQYAAMYG
-AADMBgAA0gYAANUGAADYBgAA3AYAAOAGAADzBgAAHAcAAD0HAABiBwAAfwcAAKMHAAC/BwAA2wcAAPUHAAARCAAAKAgAAEsIAABd
-CAAAcQgAAIUIAACZCAAAtQgAANoIAADkCAAA5wgAAOsIAADvCAAA8wgAAAgJAAAMCQAAEwkAAB0JAAArCQAAMQkAADYJAAA7CQAA
-QQkAAEoJAABeCQAAbgkAAIQJAACUCQAApAkAALEJAADACQAAzwkAAOAJAADqCQAA7wkAAPYJAAD9CQAABAoAAAMAAAAHAAAACwAA
-AA8AAAAQAAAAEQAAABIAAAATAAAAFAAAABUAAAAWAAAAFwAAABgAAAAZAAAAGgAAABsAAAAcAAAAHQAAAB4AAAAfAAAAIAAAACIA
-AAAlAAAAJgAAACcAAAAEAAAAAAAAAOAFAAAFAAAAAAAAAOgFAAAHAAAAAQAAAAAAAAAIAAAAAQAAAPAFAAAJAAAAAQAAAPgFAAAK
-AAAAAQAAAAQGAAANAAAABAAAABAGAAAMAAAABQAAAAAAAAANAAAABgAAABAGAAAMAAAABwAAAAAAAAANAAAACAAAABAGAAAOAAAA
-CAAAABgGAAAOAAAACAAAACAGAAAMAAAACQAAAAAAAAAiAAAAFQAAAAAAAAAjAAAAFQAAACgGAAAkAAAAFQAAADAGAAAkAAAAFQAA
-ADgGAAAkAAAAFQAAAEAGAAAkAAAAFQAAAEgGAAAOAAAAFgAAAFAGAAALAAsALQAAABQAEwAhAAAAAwAOAAAAAAADABMAKwAAAAQA
-DgAAAAAABAAHACgAAAAEAAYANAAAAAQABgA5AAAABgAOAAAAAAAGAAkAKAAAAAYACAAzAAAABgAIADUAAAAGAAgANwAAAAgADgAA
-AAAACAANACgAAAAIAAsAMAAAAAgADAAxAAAACAAKADIAAAAIAAoAOAAAAAkAAgAqAAAACQAOAC4AAAAJAA4ALwAAAAkABAA2AAAA
-CQAFAD0AAAAMABAAAAAAAAwAEgA9AAAADgARAAAAAAAPAAEALAAAAA8AAwAsAAAADwAAADoAAAAQAA4AAAAAABEAFAApAAAAEgAP
-ADsAAAADAAAAEQAAABAAAAAAAAAA/////8QKAACuCgAAAAAAAAEAAQABAAAAAAAAAAQAAABwEBwAAAAOAAsAAQAEAAEAAAAAANwA
-AAAUCkAZAQAjoBgAEgEBEhJDNaJKANMk4C7UJeAuNTRBANwDBAI4AwMAKDs5BAgAGAMAAAAAAGiQQCgGGAMAAAAAADiYQNFW3y5x
-IBoAZQAKBoNmGQh+QM6GGQjwP3FAGQCYdgsGGAgAAAAAAFjbQM2GGAgYLURU+yEZQM2Dg1jNgxgIAAAAAABw50DOg3EgGwBDAAsD
-zTaKY48zUQMAAtgCAgEotiICCABwEAsAAgAiBAQAcBACAAQAbiAFADQADARuIAQANAAMBG4QAwAEAAwEbiANAEIADAIiBAYAcBAG
-AAQAEiVuIAkAVAAMBBQFgLsAAG4gCgBUAAwEbiAIADQADANuEAcAAwAMA24gDgAyAAwCFAOAMgIAbiAPADIADAJuIBAAEgAMAm4Q
-DAACAAwCbkAVAAKhCgAzoDMAEvBuQBQAEgoKCjkKLABuEBIAAgBuEBEAAgAKChIwMwoaACIKDABiAAAAcCAWAAoAGgAGAGIBAQBu
-IB0AEAAMAG4gFwAKABYD3AVxIB4AQwAo+CIKDgAaAAIAcCAYAAoAJwoiCg4AGgABAHAgGAAKACcKDQpuEBMAAgAnCpgAAAA/AAEA
-AQDXAQEAAAAAAAAAAgAAAAAAAAACAAAAAQABAAMAAAABAAEAAQAAAAMAAAAYAAEAAQAAAAEAAAABAAAAAQAAAAUAAAABAAAABwAA
-AAEAAAACAAAAAQAAAAsAAAABAAAAEQAAAAEAAAAWAAAAAQAAABcAAAABAAAAEwAGPGluaXQ+ACNBdWRpb1RyYWNrIGNvdWxkIG5v
-dCBsb29wIHRoZSBhbGVydAAYQXVkaW9UcmFjayBkaWQgbm90IHN0YXJ0AAFEAAJERAADREREABNGSU5EX1BIT05FX1BMQVlJTkcK
-AAFJAANJSUkABElJSUkABElMSUkAAUoAAUwAAkxJAAJMTAARTFNjcmNweVBob25lUmluZzsAJ0xhbmRyb2lkL21lZGlhL0F1ZGlv
-QXR0cmlidXRlcyRCdWlsZGVyOwAfTGFuZHJvaWQvbWVkaWEvQXVkaW9BdHRyaWJ1dGVzOwAjTGFuZHJvaWQvbWVkaWEvQXVkaW9G
-b3JtYXQkQnVpbGRlcjsAG0xhbmRyb2lkL21lZGlhL0F1ZGlvRm9ybWF0OwAiTGFuZHJvaWQvbWVkaWEvQXVkaW9UcmFjayRCdWls
-ZGVyOwAaTGFuZHJvaWQvbWVkaWEvQXVkaW9UcmFjazsAGkxkYWx2aWsvYW5ub3RhdGlvbi9UaHJvd3M7ABhMamF2YS9pby9GaWxl
-RGVzY3JpcHRvcjsAGkxqYXZhL2lvL0ZpbGVPdXRwdXRTdHJlYW07ABVMamF2YS9sYW5nL0V4Y2VwdGlvbjsAIUxqYXZhL2xhbmcv
-SWxsZWdhbFN0YXRlRXhjZXB0aW9uOwAQTGphdmEvbGFuZy9NYXRoOwASTGphdmEvbGFuZy9PYmplY3Q7ABJMamF2YS9sYW5nL1N0
-cmluZzsAEkxqYXZhL2xhbmcvVGhyZWFkOwAaTGphdmEvbmlvL2NoYXJzZXQvQ2hhcnNldDsAI0xqYXZhL25pby9jaGFyc2V0L1N0
-YW5kYXJkQ2hhcnNldHM7AAhVU19BU0NJSQABVgACVkoAAlZMAAJbQgATW0xqYXZhL2xhbmcvU3RyaW5nOwACW1MABWJ1aWxkAAhn
-ZXRCeXRlcwAMZ2V0UGxheVN0YXRlAARtYWluAANtaW4AA291dAAEcGxheQAHcmVsZWFzZQASc2V0QXVkaW9BdHRyaWJ1dGVzAA5z
-ZXRBdWRpb0Zvcm1hdAAUc2V0QnVmZmVyU2l6ZUluQnl0ZXMADnNldENoYW5uZWxNYXNrAA5zZXRDb250ZW50VHlwZQALc2V0RW5j
-b2RpbmcADXNldExvb3BQb2ludHMADXNldFNhbXBsZVJhdGUAD3NldFRyYW5zZmVyTW9kZQAIc2V0VXNhZ2UAA3NpbgAFc2xlZXAA
-BXZhbHVlAAV3cml0ZQCfAX5+RDh7ImJhY2tlbmQiOiJkZXgiLCJjb21waWxhdGlvbi1tb2RlIjoicmVsZWFzZSIsImhhcy1jaGVj
-a3N1bXMiOmZhbHNlLCJtaW4tYXBpIjoyMywic2hhLTEiOiJhN2FkMThhNzA0NjBiNzk5ZDA0ODJlNDk3YzEwOWE3NWJmN2Y5MWRl
-IiwidmVyc2lvbiI6IjguMTAuOS1kZXYifQACCgE8HAEYDQAAAgAAgYAE9AcBCYwIAQAAAKYKAAAAAAAAAAAAAAEAAAAAAAAAAQAA
-ALwKAAAPAAAAAAAAAAEAAAAAAAAAAQAAAD8AAABwAAAAAgAAABkAAABsAQAAAwAAABUAAADQAQAABAAAAAIAAADMAgAABQAAAB8A
-AADcAgAABgAAAAEAAADUAwAAASAAAAIAAAD0AwAAARAAAA4AAADgBQAAAiAAAD8AAABWBgAABCAAAAEAAACmCgAAACAAAAEAAACu
-CgAAAxAAAAEAAAC8CgAABiAAAAEAAADECgAAABAAAAEAAADcCgAA
+ZGV4CjAzNQA2cCfb9t8YZMKbQYp+GObFFvAPvf6qFNAEGQAAcAAAAHhWNBIAAAAAAAAAAEwYAACMAAAAcAAAACsAAACgAgAALQAA
+AEwDAAAHAAAAaAUAAEoAAACgBQAAAgAAAPAHAADUEAAAMAgAAIIOAACKDgAAnw4AAMAOAADDDgAAyA4AAMwOAADTDgAA1w4AANwO
+AADiDgAA5w4AAOoOAADtDgAA8Q4AAPUOAAAXDwAAKg8AAFMPAAB0DwAAmQ8AALYPAADaDwAA9g8AAB0QAAA5EAAAVhAAAHcQAACX
+EAAAtBAAAMcQAADhEAAA+RAAAB0RAAA9EQAAYBEAAHwRAACWEQAAshEAAMkRAADgEQAA/BEAACISAAA0EgAASBIAAGcSAAB7EgAA
+jxIAAKYSAAC5EgAA0BIAAOwSAAAREwAAIRMAAEkTAABuEwAAeBMAAHsTAAB/EwAAhxMAAIwTAACQEwAAlRMAAJkTAACeEwAApRMA
+AKgTAACsEwAAsBMAAMUTAADSEwAA4RMAAOoTAADyEwAA+RMAAAgUAAAPFAAAGhQAACcUAAA8FAAAUBQAAGUUAAB2FAAAfhQAAIMU
+AACJFAAAkBQAAJcUAAChFAAAsRQAAL0UAADOFAAA3xQAAOgUAAD3FAAAAhUAAAsVAAAWFQAAJRUAADUVAAA9FQAARBUAAEoVAABP
+FQAAVRUAAFsVAABjFQAAbhUAAHMVAAB6FQAAiBUAAI4VAACYFQAAoRUAALMVAAC2FQAAvBUAAMQVAADUFQAA3RUAAPIVAAD/FQAA
+BRYAAA0WAAAaFgAAJxYAADsWAABLFgAAYBYAAHAWAACAFgAAjxYAAJwWAACrFgAAtRYAALsWAADCFgAAzhYAANUWAADcFgAAAwAA
+AAsAAAAPAAAAEAAAABEAAAASAAAAEwAAABQAAAAVAAAAFgAAABcAAAAYAAAAGQAAABoAAAAbAAAAHAAAAB0AAAAeAAAAHwAAACAA
+AAAhAAAAIgAAACMAAAAkAAAAJQAAACYAAAAnAAAAKAAAACkAAAAqAAAAKwAAACwAAAAtAAAALgAAAC8AAAAwAAAAMQAAADIAAAAz
+AAAAOAAAAEEAAABDAAAARAAAAAMAAAAAAAAAAAAAAAQAAAAAAAAAnA0AAAUAAAAAAAAApA0AAAYAAAAAAAAArA0AAAoAAAAAAAAA
+uA0AAAcAAAAAAAAAwA0AAAgAAAAAAAAAyA0AAAkAAAAAAAAA0A0AAAkAAAAAAAAA3A0AAAsAAAABAAAAAAAAAA0AAAAEAAAA6A0A
+AAwAAAAFAAAAAAAAAA0AAAAGAAAA6A0AAAwAAAAHAAAAAAAAAA4AAAAIAAAA8A0AAA4AAAAIAAAA+A0AAAwAAAAJAAAAAAAAAA4A
+AAAJAAAAAA4AAA4AAAALAAAAwA0AAA0AAAAPAAAA6A0AAA4AAAAPAAAACA4AAA4AAAAQAAAAwA0AAAwAAAAgAAAAAAAAAA4AAAAg
+AAAAwA0AAA0AAAAjAAAA6A0AAA0AAAAkAAAA6A0AADgAAAAnAAAAAAAAADkAAAAnAAAA6A0AADoAAAAnAAAAEA4AADsAAAAnAAAA
+IA4AADwAAAAnAAAApA0AAD0AAAAnAAAAKA4AAD4AAAAnAAAAMA4AAD8AAAAnAAAAOA4AAEAAAAAnAAAAQA4AAD4AAAAnAAAATA4A
+AD4AAAAnAAAAwA0AAD8AAAAnAAAAVA4AAD4AAAAnAAAAXA4AAD4AAAAnAAAAZA4AAD4AAAAnAAAAbA4AAEEAAAAoAAAAAAAAAEIA
+AAAoAAAAdA4AAEIAAAAoAAAAwA0AAA4AAAApAAAAfA4AAAIAGwBUAAAACgAAAFUAAAAKAAAAaQAAAAoAAACGAAAAFwAXAGsAAAAh
+ABoAUwAAACYAJQA3AAAAAgAkAAAAAAACABoASwAAAAIACQBfAAAAAgADAHQAAAADABoAAAAAAAMAKABlAAAAAwARAGoAAAADACEA
+bgAAAAMAFAB7AAAABAAaAAAAAAAEAAsASQAAAAQACgCBAAAABAAKAIUAAAAGABoAAAAAAAYADQBJAAAABgAMAH8AAAAGAAwAgAAA
+AAYADACDAAAABgAMAIQAAAAIABoAAAAAAAgAEABJAAAACAAOAH0AAAAIAA8AfgAAAAkAGgBuAAAACQAaAHYAAAAJAAcAigAAAAoA
+GgAAAAAACwAiAEwAAAALABIATgAAAAsAAgBPAAAACwAEAFAAAAALABoAVgAAAAsAGQBYAAAACwAZAFoAAAALABMAWwAAAAsAHABx
+AAAACwAaAHYAAAALAB0AdwAAAAsAGgCHAAAADQAaAAAAAAAOABoAAAAAAA4AKQBHAAAADgAJAF0AAAAOAAAAYQAAAA4AEwBiAAAA
+DgAGAHUAAAAOABoAdgAAAA4AHwB6AAAADgAbAHwAAAAOACAAggAAAA8AKwBNAAAADwAFAFkAAAAPABcAYAAAABAAFgBcAAAAEAAW
+AF4AAAAQABUAbAAAABEACQBRAAAAGAAjAAAAAAAYACcAigAAABkAJAAAAAAAGgAkAHAAAAAbACUAAAAAABsAGgBLAAAAGwAJAGMA
+AAAbAAgAcwAAABsAHgB5AAAAHQABAGYAAAAeABoAAAAAACAAKgBSAAAAIAAsAFcAAAAgACsAiAAAACIAJgBGAAAAJAAYAGQAAAAk
+ABgAbwAAAAIAAAAQAAAADQAAAAAAAAD/////9BcAAKAXAAAAAAAAAwAAABEAAAAeAAAAAAAAAP////8kGAAAvhcAAAAAAAAHAAYA
+BAACAAAAAAARAAAAHQFUEAAAbjBBACADVBIAAG5AQABCZQoCHgEPAg0CHgEnAgAAAQAAAAsAAQAPAAAAAQABAAEADgADAAEAAQAC
+AAAAAAAMAAAAHQJUIAAAbhA/AAAACwAeAhAADQAeAicAAQAAAAYAAQAKAAAAAQABAAEACQAEAAIAAwAAAAAAAAANAAAAcBAnAAIA
+IgAbABoBcgBwMD0AMAFbIAAADgAAAAIAAQABAAIAAAAAAAsAAAAdAVQQAABuED4AAAAeAQ4ADQAeAScAAAABAAAABQABAAkAAAAB
+AAEAAQAIAAUAAQACAAAAAAAAAGMAAAAaAEoAbiAzAAQACgAaAW0AbiAyABQACgISIzgCBwBuIDMAFAAKASgCATEiAgYAcBANAAIA
+biARABIADAEaAngAbiAzACQACgRuIBIAQQAMBBJBEhI2MAwAMyAEAAEQKAMTAAwAbiAQAAQAKAeYAAIAsSBuIA8ABAAiAAgAcBAT
+AAAAIgIEAHAQCQACAG4gDAASAAwCbiALABIADAFuEAoAAQAMAW4gFQAQAAwAbhAOAAQADARuIBYAQAAMBG4QFAAEAAwEEQQAAAUA
+AQACAAAAAAAAACoAAAASAG4QKwAEAAoBNRAdAG4gLAAEAAwBGgJnAG4gNAAhAAwCOAIOABoDSABuIEYAMgAKAjgCBgBuIDAABAAR
+AdgAAAEo4CIEGQAaADYAcCA7AAQAJwQBAAEAAQAAAAAAAAAEAAAAcBBDAAAADgAGAAEABQALAAAAAABmAAAAEgBGAQUAcRA3AAEA
+DAEaAlQAbhA2AAEADANuIEQAMgAKAjgCBwBuEDUAAQAMBSgDRgUFACIBAgBwIAAAUQAiBQ4AcBAoAAUAbiAxABUAcRAIAAUADAIa
+A2cAbiA0ADIADANxEBwAAwAMAxIEblAbACNEbhAmAAMAcSAHADUAbhAkAAMAbhAuAAUAbhABAAEADgANAG4QJAADACcADQBuEC4A
+BQAnAA0FbhABAAEAKAUNAG4gRwAFACcFDQViAAUAGgECAG4gPAAQACcFGgAAAAUAAQAfAAAABQAIACQAAAARAAoANgAAAAkADAA/
+AAAAAwAKAEIAAAADAAgARQAAAAMAAQBKAAAABAAKAE8AAAAEAAgAVAAAAAMADgBZAAAABAABAAUDGV0cXR9dAFMATgBJAFgXAAIA
+BwAEAAAAAADWAAAACAAVAAgBFgAiCAoAcBAaAAgAEgIiCRgAYgMEAHAgOQA5ABoDAQBiBAYAbiBFAEMADAoSCwcuAbIWDwAAFgMQ
+JzgCBAAS9SgFbjAdADEECgUTEQQAOgU4AG4gIABRAAwCbjAtACALCgI7AgYAEhYCEgYAKAMCEgsAcSBCALIACgI4EgUAFgYAACgF
+bhAqAAAACwYFEwMAASQBUgRlOBIFAAIHEQAoAgG3EgMFDBMAdAcjAAEAORIFAG4QKQAAAAICEgAoAgQ8bkAeAIHcCgM7AwMAKLVS
+hAMAPQRHADkOEgBuICIAMQAMBHEQBgAEAAwEbhAXAAQAB04oBA0AB0IoUW4gIQAxAAwEUoUCAG4gSQBUAFKFAgBShgMAsGVuIEgA
+VABShQMAbkAZAE61CgRShQMAM1QSAHEAOAAAAAsEMQYEDzoGEgBuIDoAqQAWBtwFu2QETygJIgAZABoBNQBwIDsAEAAnAG4wJQAx
+C1KDAQDdAwMEOAMOABIiFgMAAG5ALwAwJG4QHwABAAGyKQBY/xYDAAApAFT/DQAH4igCDQA4AgUAbhAYAAIAJwAKAAAADwABACQA
+AABUAAQAeAAAAAMABwCAAAAARQAEAAMAzwEAzAEAfQAAAAIAAAAAAAAAAQAAAAEAAAAEAAAAAQApAAAAAAACAAAACgABAAEAAAAg
+AAAAAgAAACQAAAADAAAAJAAAAAAAAAADAAAAKQAAAAAAAAABAAAAAAAAAAEAAAAFAAAAAQAAAAcAAAABAAAADwAAAAEAAAAOAAAA
+BQAAAAAAAAAAAAEAAAAAAAIAAAAAACgAAgAAAAEAAAABAAAADQAAAAIAAAAOAAsABAAAAA8AEgAMAAAAAQAAABcAAAACAAAAIAAg
+AAEAAAAiAAAAAQAAACkAAAABAAAAKgAAAAEAAAAeAAAAAQAAACUABjxpbml0PgATRklORF9QSE9ORV9QTEFZSU5HCgAfRklORF9Q
+SE9ORV9SSU5HVE9ORV9VTkFWQUlMQUJMRQABSQADSUlJAAJJSgAFSUpMSUkAAklMAANJTEkABElMSUkAA0lMSgABSgABTAACTEkA
+AkxMACBMU2NyY3B5UGhvbmVSaW5nJFJpbmd0b25lU291cmNlOwARTFNjcmNweVBob25lUmluZzsAJ0xhbmRyb2lkL21lZGlhL0F1
+ZGlvQXR0cmlidXRlcyRCdWlsZGVyOwAfTGFuZHJvaWQvbWVkaWEvQXVkaW9BdHRyaWJ1dGVzOwAjTGFuZHJvaWQvbWVkaWEvQXVk
+aW9Gb3JtYXQkQnVpbGRlcjsAG0xhbmRyb2lkL21lZGlhL0F1ZGlvRm9ybWF0OwAiTGFuZHJvaWQvbWVkaWEvQXVkaW9UcmFjayRC
+dWlsZGVyOwAaTGFuZHJvaWQvbWVkaWEvQXVkaW9UcmFjazsAJUxhbmRyb2lkL21lZGlhL01lZGlhQ29kZWMkQnVmZmVySW5mbzsA
+GkxhbmRyb2lkL21lZGlhL01lZGlhQ29kZWM7ABtMYW5kcm9pZC9tZWRpYS9NZWRpYUNyeXB0bzsAH0xhbmRyb2lkL21lZGlhL01l
+ZGlhRGF0YVNvdXJjZTsAHkxhbmRyb2lkL21lZGlhL01lZGlhRXh0cmFjdG9yOwAbTGFuZHJvaWQvbWVkaWEvTWVkaWFGb3JtYXQ7
+ABFMYW5kcm9pZC9uZXQvVXJpOwAYTGFuZHJvaWQvb3MvU3lzdGVtQ2xvY2s7ABZMYW5kcm9pZC92aWV3L1N1cmZhY2U7ACJMZGFs
+dmlrL2Fubm90YXRpb24vRW5jbG9zaW5nQ2xhc3M7AB5MZGFsdmlrL2Fubm90YXRpb24vSW5uZXJDbGFzczsAIUxkYWx2aWsvYW5u
+b3RhdGlvbi9NZW1iZXJDbGFzc2VzOwAaTGRhbHZpay9hbm5vdGF0aW9uL1Rocm93czsAGExqYXZhL2lvL0ZpbGVEZXNjcmlwdG9y
+OwAaTGphdmEvaW8vRmlsZU91dHB1dFN0cmVhbTsAFUxqYXZhL2lvL0lPRXhjZXB0aW9uOwAVTGphdmEvaW8vUHJpbnRTdHJlYW07
+ABpMamF2YS9pby9SYW5kb21BY2Nlc3NGaWxlOwAkTGphdmEvbGFuZy9JbGxlZ2FsQXJndW1lbnRFeGNlcHRpb247ABBMamF2YS9s
+YW5nL01hdGg7ABJMamF2YS9sYW5nL09iamVjdDsAHUxqYXZhL2xhbmcvU2VjdXJpdHlFeGNlcHRpb247ABJMamF2YS9sYW5nL1N0
+cmluZzsAEkxqYXZhL2xhbmcvU3lzdGVtOwAVTGphdmEvbGFuZy9UaHJvd2FibGU7ABFMamF2YS9uaW8vQnVmZmVyOwAVTGphdmEv
+bmlvL0J5dGVCdWZmZXI7ABpMamF2YS9uaW8vY2hhcnNldC9DaGFyc2V0OwAjTGphdmEvbmlvL2NoYXJzZXQvU3RhbmRhcmRDaGFy
+c2V0czsADlJpbmd0b25lU291cmNlACZUaGUgcmluZ3RvbmUgYXVkaW8gY291bGQgbm90IGJlIHBsYXllZAAjVGhlIHJpbmd0b25l
+IGRvZXMgbm90IGNvbnRhaW4gYXVkaW8ACFVTX0FTQ0lJAAFWAAJWSQAGVklJSUpJAANWSVoAAlZKAANWSkkAAlZMAANWTEwABVZM
+TExJAAFaAAJaTAACW0IAE1tMamF2YS9sYW5nL1N0cmluZzsAC2FjY2Vzc0ZsYWdzAA1hZGRTdXBwcmVzc2VkAAdhZHZhbmNlAAZh
+dWRpby8ABWJ1aWxkAA1jaGFubmVsLWNvdW50AAVjbG9zZQAJY29uZmlndXJlAAtjb250YWluc0tleQATY3JlYXRlRGVjb2RlckJ5
+VHlwZQASZGVxdWV1ZUlucHV0QnVmZmVyABNkZXF1ZXVlT3V0cHV0QnVmZmVyAA9lbGFwc2VkUmVhbHRpbWUABmVxdWFscwADZXJy
+AARmaWxlAAVmbGFncwAFZmx1c2gACGdldEJ5dGVzAA5nZXRJbnB1dEJ1ZmZlcgAKZ2V0SW50ZWdlcgAPZ2V0T3V0cHV0QnVmZmVy
+AA9nZXRPdXRwdXRGb3JtYXQAB2dldFBhdGgADWdldFNhbXBsZVRpbWUACWdldFNjaGVtZQAHZ2V0U2l6ZQAJZ2V0U3RyaW5nAA1n
+ZXRUcmFja0NvdW50AA5nZXRUcmFja0Zvcm1hdAAGbGVuZ3RoAAVsaW1pdAAEbWFpbgADbWF4AARtaW1lAARuYW1lAAZvZmZzZXQA
+CW9wZW5UcmFjawADb3V0AAVwYXJzZQAMcGNtLWVuY29kaW5nAARwbGF5AAhwb3NpdGlvbgAHcHJpbnRsbgAQcXVldWVJbnB1dEJ1
+ZmZlcgABcgAEcmVhZAAGcmVhZEF0AA5yZWFkU2FtcGxlRGF0YQAHcmVsZWFzZQATcmVsZWFzZU91dHB1dEJ1ZmZlcgALc2FtcGxl
+LXJhdGUABHNlZWsABnNlZWtUbwALc2VsZWN0QXVkaW8AC3NlbGVjdFRyYWNrABJzZXRBdWRpb0F0dHJpYnV0ZXMADnNldEF1ZGlv
+Rm9ybWF0ABNzZXRDaGFubmVsSW5kZXhNYXNrAA5zZXRDaGFubmVsTWFzawAOc2V0Q29udGVudFR5cGUADXNldERhdGFTb3VyY2UA
+C3NldEVuY29kaW5nAA1zZXRTYW1wbGVSYXRlAAhzZXRVc2FnZQAEc2l6ZQAFc3RhcnQACnN0YXJ0c1dpdGgABXZhbHVlAAV3cml0
+ZQCfAX5+RDh7ImJhY2tlbmQiOiJkZXgiLCJjb21waWxhdGlvbi1tb2RlIjoicmVsZWFzZSIsImhhcy1jaGVja3N1bXMiOmZhbHNl
+LCJtaW4tYXBpIjoyMywic2hhLTEiOiJhN2FkMThhNzA0NjBiNzk5ZDA0ODJlNDk3YzEwOWE3NWJmN2Y5MWRlIiwidmVyc2lvbiI6
+IjguMTAuOS1kZXYifQACFgGJARwBGBkCEwGJARgDAhQCRQQaaBc0AhUBiQEcARgCAAEBAwASAICABLQRAYGACOARAYGACPgQAYGA
+CLAQAAAFAASBgATYFAEJ8BQBCpwSAQq0FwEK9BMBAAAAfhcAAAIAAACHFwAAjhcAAAEAAACXFwAA4BcAAAAAAAAEAAAAAAAAAAAA
+AADYFwAAAQAAANgXAAACAAAA2BcAAAMAAADYFwAA7BcAAAAAAAADAAAAAAAAAAUAAADYFwAABwAAANgXAAAIAAAA2BcAAA8AAAAA
+AAAAAQAAAAAAAAABAAAAjAAAAHAAAAACAAAAKwAAAKACAAADAAAALQAAAEwDAAAEAAAABwAAAGgFAAAFAAAASgAAAKAFAAAGAAAA
+AgAAAPAHAAABIAAACQAAADAIAAABEAAAGgAAAJwNAAACIAAAjAAAAIIOAAAEIAAABAAAAH4XAAAAIAAAAgAAAKAXAAADEAAAAwAA
+ANgXAAAGIAAAAgAAAPQXAAAAEAAAAQAAAEwYAAA=
 '@ -replace '\s'
     # 音量恢复和临时文件清理留在手机上，ADB 断开后电脑无法代为收尾。
     $remote = @'
@@ -621,7 +764,7 @@ set_alarm_volume() {
     [ "${range%% *}" = "$1" ]
 }
 cleanup() {
-    # 部分 ROM 的 app_process 即便释放 AudioTrack 也会卡在退出阶段，直接结束本次的专用播放器。
+    # 部分 ROM 的 app_process 会卡在退出阶段，直接结束本次的专用播放器。
     if [ -n "$player_pid" ]; then
         kill -KILL "$player_pid" 2>/dev/null
         wait "$player_pid" 2>/dev/null
@@ -629,13 +772,14 @@ cleanup() {
     if [ -n "$restore" ] && ! set_alarm_volume "$restore"; then
         echo FIND_PHONE_RESTORE_FAILED >&2
     fi
-    rm -f "$player"
+    rm -f "$player" "$ringtone_file"
     rmdir "$workdir"
 }
 
 umask 077
 workdir=$(mktemp -d /data/local/tmp/scrcpy-helper-ring.XXXXXX) || exit 1
 player="$workdir/player.dex"
+ringtone_file="$workdir/ringtone"
 restore=
 player_pid=
 trap cleanup EXIT
@@ -644,6 +788,26 @@ trap '' HUP PIPE
 trap 'exit 1' INT TERM
 # Android 14 起，动态加载的 DEX 必须是只读文件。
 { chmod 400 "$player" && printf '%s' '__PLAYER__' | base64 -d; } > "$player" || exit 1
+
+user=$(am get-current-user)
+tone=$(settings --user "$user" get system ringtone)
+source=
+case "$tone" in
+    file:/*|/*)
+        source=$tone
+        ;;
+    content://*)
+        # 优先读取当前设置的 URI，权限受限时再用 Android 为来电铃声留的缓存。
+        if { content read --user "$user" --uri "$tone" > "$ringtone_file" 2>/dev/null && [ -s "$ringtone_file" ]; } ||
+           { content read --user "$user" --uri content://settings/system/ringtone_cache > "$ringtone_file" 2>/dev/null && [ -s "$ringtone_file" ]; }; then
+            source=$ringtone_file
+        fi
+        ;;
+esac
+if [ -z "$source" ]; then
+    echo FIND_PHONE_RINGTONE_UNAVAILABLE >&2
+    exit 1
+fi
 
 set -- $(volume_range)
 if [ "$#" -ne 3 ] || [ "$3" -le 0 ] || [ "$1" -lt "$2" ] || [ "$1" -gt "$3" ]; then
@@ -657,7 +821,7 @@ if [ "$1" != "$3" ]; then
         exit 1
     fi
 fi
-CLASSPATH="$player" app_process /system/bin ScrcpyPhoneRing </dev/null &
+CLASSPATH="$player" app_process /system/bin ScrcpyPhoneRing "$source" </dev/null &
 player_pid=$!
 # 等待电脑确认播放器仍在正常回报。电脑退出、断线或卡住时，手机会自己收尾。
 while IFS= read -r -t 10 heartbeat && [ "$heartbeat" = "." ]; do
@@ -3914,7 +4078,7 @@ function Reconnect-LastAsync {
 
 # 多设备时让用户挑一台投屏，返回序列号 / 地址，取消返回 $null。
 function Select-Device {
-    param($owner, $devs, $title = '选择设备', $Prompt = '检测到多台设备，选择要投屏的一台：', $ButtonText = '投屏这台')
+    param($owner, $devs, $title = '选择设备', $Prompt = '检测到多台设备，选择要投屏的一台：', $ButtonText = '投屏这台', [string]$SelectedSerial)
     $dlg = New-Dialog $title 340 296 $owner
     $lbl = New-Lbl $Prompt 16 14
     $lb = New-Object System.Windows.Forms.ListBox
@@ -3924,7 +4088,9 @@ function Select-Device {
         $tp = if (Test-Wireless $s) { '无线' } else { 'USB' }
         [void]$lb.Items.Add("$(Get-FriendlyName $s)   ·   $tp   ·   $s")
     }
-    if ($lb.Items.Count -gt 0) { $lb.SelectedIndex = 0 }
+    if ($lb.Items.Count -gt 0) {
+        $lb.SelectedIndex = [Math]::Max(0, [array]::IndexOf(@($devs), $SelectedSerial))
+    }
     $btnGo = New-PrimaryBtn $ButtonText 16 218 308 34 10
     $result = @{ s = $null }
     $pick = { if ($lb.SelectedIndex -ge 0) { $result.s = $devs[$lb.SelectedIndex]; $dlg.Close() } }
@@ -6191,7 +6357,7 @@ try {
     $form.Controls.Add($lblSection)
 
     $btnFindPhone = New-LinkBtn '寻找手机' 298 11 80
-    $findPhoneTip = '以最大闹钟音量循环播放提示音，直到点「停止响铃」。'
+    $findPhoneTip = '以最大闹钟音量循环播放手机当前的来电铃声，直到点「停止响铃」。'
     $tt.SetToolTip($btnFindPhone, $findPhoneTip)
     $btnShortcuts = New-LinkBtn '快捷键' 382 11 72 'keyboard'
     $btnSettings  = New-LinkBtn '设置'   458 11 62 'settings'
@@ -6704,6 +6870,9 @@ try {
                 } elseif ($ring.Detail -match 'FIND_PHONE_VOLUME_UNAVAILABLE') {
                     $heading = '手机未能调至最大闹钟音量'
                     $body = '请检查手机的音量和勿扰设置。'
+                } elseif ($ring.Detail -match 'FIND_PHONE_RINGTONE_UNAVAILABLE') {
+                    $heading = '无法读取手机当前的来电铃声'
+                    $body = '请在手机的声音设置中选一首能正常播放的来电铃声，再重试。'
                 } else {
                     $heading = '手机响铃未能继续'
                     $body = '请确认手机仍在线后重试。'
@@ -6712,7 +6881,7 @@ try {
                 else { & $script:showTempHint $heading $cRed 8000 }
             } else { & $script:showTempHint '已停止响铃。' $cMuted 6000 }
         } elseif ($phase -eq 'starting' -and $ring.Phase -eq 'playing') {
-            & $script:showTempHint '手机正在响铃，点「停止响铃」结束。' $cMuted 6000
+            & $script:showTempHint "「$($ring.DeviceName)」正在响铃，点「停止响铃」结束。" $cMuted 6000
         }
     })
     $btnFindPhone.Add_Click({
@@ -6729,17 +6898,19 @@ try {
                 [void](Show-ResultDialog $form '寻找手机' '没检测到手机' '请用数据线连接并允许 USB 调试，或点「无线连接…」。')
                 return
             }
-            $serial = if ($devs -contains $script:uiState.SelectedSerial) { $script:uiState.SelectedSerial }
-                      elseif ($devs.Count -eq 1) { $devs[0] }
-                      else { Select-Device $form $devs '寻找手机 · 选择设备' '检测到多台设备，选择要寻找的一台：' '寻找这台' }
+            $serial = if ($devs.Count -eq 1) { $devs[0] }
+                      else {
+                          Select-Device $form $devs '寻找手机 · 选择设备' '检测到多台设备，选择要寻找的一台：' '寻找这台' -SelectedSerial $script:uiState.SelectedSerial
+                      }
             if (-not $serial) { return }
             try { $script:phoneRing = Start-PhoneRing $serial }
             catch {
                 [void](Show-ResultDialog $form '寻找手机' '无法启动响铃' '请确认手机仍在线后重试。' $_.Exception.Message)
                 return
             }
+            $script:phoneRing.DeviceName = Get-FriendlyName $serial -CachedOnly
             $btnFindPhone.Text = '停止响铃'
-            $tt.SetToolTip($btnFindPhone, '停止响铃并恢复手机原来的闹钟音量。')
+            $tt.SetToolTip($btnFindPhone, "停止「$($script:phoneRing.DeviceName)」响铃并恢复原来的闹钟音量。")
             $phoneRingTimer.Start()
         })
     })
