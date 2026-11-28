@@ -1324,7 +1324,7 @@ $defaults = [ordered]@{
     # 窗口
     fullscreen = $false; onTop = $false; borderless = $false; minToTray = $false
     # 独立窗口
-    ndSize = ''; ndDpi = ''; ndNoDecor = $false; ndMode = 'settings'; ndFixed = $false; ndAudio = 'auto'
+    ndSize = ''; ndDpi = ''; ndNoDecor = $false; ndMode = 'portrait'; ndFixed = $true; ndAudio = 'auto'
     # 录制
     recFormat = 'mp4'; recTimeLimit = 0; recBackground = $false; recDir = ''; lastRecDir = ''
     # 通用
@@ -1623,14 +1623,12 @@ function Get-NewDisplayArgs {
     param($sz = $settings.ndSize, $dpi = $settings.ndDpi, [bool]$fixed = $settings.ndFixed, [bool]$noDecor = $settings.ndNoDecor)
     $nd = if ($sz -and $dpi) { "--new-display=$sz/$dpi" } elseif ($sz) { "--new-display=$sz" } elseif ($dpi) { "--new-display=/$dpi" } else { '--new-display' }
     $a = @($nd)
-    # 固定方向时不加 --flex-display：虚拟屏不再跟着窗口尺寸变，避免最大化/全屏时画面循环自转。
+    # 固定分辨率时不加 --flex-display，避免调整电脑窗口大小时安卓应用重新排版。
     if (-not $fixed) { $a += '--flex-display' }
     if ($noDecor) { $a += '--no-vd-system-decorations' }
     return $a
 }
-# 按虚拟屏(WxH)比例算出一个塞进电脑屏幕可用区的「窗口大小」（--window-width/height），
-# 让竖屏窗口不超出屏幕被切。虚拟屏分辨率保持真实（比例、密度都对，App 不拉伸），只缩窗口。
-# 注意：--window-width/height 与 --flex-display 冲突（scrcpy 会报错禁用），故用它时必须不加 --flex-display。
+# 按摄像头画面比例限制初始窗口大小（--window-width/height），避免竖屏预览超出工作区。
 # 尺寸未知（非 WxH）或放得下时返回 @() —— 交给 scrcpy 默认，不强行定窗口。
 function Get-FitWindowArgs {
     param([string]$sizeWxH)
@@ -3798,7 +3796,6 @@ function Show-NewDisplay {
         if (-not $target) { return }
         $ndModeSel = [string]$cbMode.Vals[$cbMode.SelectedIndex]
         $ndSz = $settings.ndSize; $ndDpi = $settings.ndDpi
-        $autoFit = $false
         switch ($ndModeSel) {
             'portrait'  {
                 $disp = Get-DeviceDisplay $serial
@@ -3807,9 +3804,9 @@ function Show-NewDisplay {
                     $w = [Math]::Min($disp.W, $disp.H); $h = [Math]::Max($disp.W, $disp.H)
                     $d = if ($disp.Dpi -gt 0) { $disp.Dpi } else { 420 }
                 } else { $w = 1080; $h = 2340; $d = 420 }
-                $ndSz = "${w}x${h}"; $ndDpi = "$d"; $autoFit = $true
+                $ndSz = "${w}x${h}"; $ndDpi = "$d"
             }
-            'landscape' { $ndSz = '1920x1080'; $ndDpi = '240'; $autoFit = $true }
+            'landscape' { $ndSz = '1920x1080'; $ndDpi = '240' }
             'custom'    {
                 if ($state.CustomConfirmed) { $ndSz = [string]$state.CustomSize; $ndDpi = [string]$state.CustomDpi }
             }
@@ -3825,9 +3822,7 @@ function Show-NewDisplay {
         $winLabel = (@($friendly, $appLabel) | Where-Object { $_ }) -join ' · '
         $winLabel = ($winLabel -replace '[\r\n\x00-\x1F"]', ' ').Trim()
         $titleArg = if ($winLabel) { @("--window-title=$winLabel") } else { @() }
-        $fitWin = if ($autoFit) { Get-FitWindowArgs $ndSz } else { @() }
-        $useFixed = if ($fitWin.Count -gt 0) { $true } else { $chkFixed.Checked }
-        Start-Scrcpy ($pre + @(Get-DisplayCompatibilityArgs) + @(Get-NewDisplayArgs $ndSz $ndDpi $useFixed $settings.ndNoDecor) + $fitWin + $titleArg + "--start-app=$target") -AudioMode $effAudio
+        Start-Scrcpy ($pre + @(Get-DisplayCompatibilityArgs) + @(Get-NewDisplayArgs $ndSz $ndDpi $chkFixed.Checked $settings.ndNoDecor) + $titleArg + "--start-app=$target") -AudioMode $effAudio
     }
 }
 

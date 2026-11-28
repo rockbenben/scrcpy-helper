@@ -46,6 +46,10 @@ function New-Dialog {
     }
     $dialog | Add-Member ScriptMethod ShowDialog {
         param($Owner)
+        if ($fixture.ToggleFixed) {
+            $fixed = $this.Controls | Where-Object { $_ -is [Windows.Forms.CheckBox] }
+            $fixed.Checked = -not $fixed.Checked
+        }
         & $this.AcceptButton.Action
         return $this.DialogResult
     }
@@ -60,6 +64,8 @@ function New-PrimaryBtn {
 }
 function New-EscCancel {}
 function Get-FriendlyName { return 'Test phone' }
+function Get-DeviceDisplay { return @{ W=1080; H=2340; Dpi=420 } }
+function Get-FitWindowArgs { throw 'Independent windows should let scrcpy choose the initial window size' }
 function Save-Settings { $fixture.Saves++ }
 function Show-ResultDialog {
     param($Owner, $Title, $Heading, $Body)
@@ -99,6 +105,27 @@ foreach ($ignoreLimits in @($false,$true)) {
                 Check (($fixture.Options -join '|') -ceq ($expected -join '|')) 'Independent window launched with incorrect arguments'
                 Check ($fixture.AudioMode -eq 'on') 'Independent window lost the selected audio mode'
             }
+        } finally {
+            foreach ($control in $fixture.Picker.Controls) {
+                if ($control -is [Windows.Forms.Control]) { $control.Dispose() }
+            }
+        }
+    }
+}
+foreach ($preset in @(
+    @{ Mode='portrait'; Display='1080x2340/420' },
+    @{ Mode='landscape'; Display='1920x1080/240' }
+)) {
+    foreach ($fixed in @($false,$true)) {
+        $settings = @{ ndMode=$preset.Mode; ndFixed=(-not $fixed); ndNoDecor=$false; ndAudio='auto'; audioOn=$true }
+        $fixture = @{ Scans=0; Pickers=0; Starts=0; Saves=0; Picker=$null; ToggleFixed=$true }
+        try {
+            & $click
+            Check ($fixture.Starts -eq 1 -and $fixture.Saves -eq 1) 'Independent window preset did not launch and save'
+            Check ($fixture.Options -ccontains "--new-display=$($preset.Display)") 'Independent window preset lost its dimensions or DPI'
+            Check (($fixture.Options -contains '--flex-display') -eq (-not $fixed)) 'Independent window did not honor the checkbox'
+            Check (-not ($fixture.Options -match '^--window-(width|height)=')) 'Independent window forced the initial desktop window size'
+            Check ($settings.ndFixed -eq $fixed) 'Independent window did not save the checkbox state'
         } finally {
             foreach ($control in $fixture.Picker.Controls) {
                 if ($control -is [Windows.Forms.Control]) { $control.Dispose() }

@@ -35,6 +35,7 @@ function Reset-SettingsState {
 function Check-ValidSettings {
     Check ($settings.maxSize -eq 720 -and $settings.bitRate -eq 8 -and $settings.recFormat -ceq 'mkv') 'A valid scalar setting was lost'
     Check ($settings.ndSize -ceq '' -and $settings.ndDpi -ceq '420' -and $settings.winX -eq -120) 'A valid custom display or window setting was lost'
+    Check ($settings.ndMode -ceq 'settings' -and $settings.ndFixed -eq $false) 'Saved independent window preferences were replaced by the new defaults'
     Check ($settings.recDir -ceq 'C:\Videos\Scrcpy' -and $settings.lastDownloadDir -ceq 'C:\Downloads\Phone') 'Valid directory memory was lost'
     Check ($settings.lastRecDir -ceq $defaults.lastRecDir) 'Invalid directory memory did not fall back'
     Check ($settings.audioOn -eq $false -and $settings.fullscreen -eq $true) 'Boolean values changed during load'
@@ -57,6 +58,8 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('scrcpy-settings-' + [guid]::N
 $cfgPath = Join-Path $testRoot 'settings.json'
 try {
     Reset-SettingsState
+    Load-Settings
+    Check ($settings.ndMode -ceq 'portrait' -and $settings.ndFixed -eq $true) 'First launch did not default to a fixed portrait display'
     $dateAlias = '2026-01-01T00:00:00Z'
     if (-not (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
         $dateAlias = [string](ConvertFrom-Json '{"label":"2026-01-01T00:00:00Z"}').label
@@ -78,6 +81,8 @@ try {
   "extraArgs": {"bad": true},
   "ndSize": "",
   "ndDpi": "420",
+  "ndMode": "settings",
+  "ndFixed": false,
   "winX": -120,
   "camResMax": 1280,
   "camZoom": "broken",
