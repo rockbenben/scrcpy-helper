@@ -1292,7 +1292,7 @@ function Request-AppClose {
     }
 }
 
-# 「独立窗口」可一键打开的最常用 App（按使用度排，购物类靠后）；其余 App 用「更多应用…」从手机列表里挑
+# 「独立窗口」可一键打开的最常用 App（按使用度排，购物类靠后）；其余 App 用「更多应用」从手机列表里挑
 $apps = [ordered]@{
     '微信'   = 'com.tencent.mm'
     '抖音'   = 'com.ss.android.ugc.aweme'
@@ -3334,17 +3334,20 @@ function Show-Settings {
 }
 
 # ---------------- 从手机已装 App 里挑一个（可搜索） ----------------
-# 用 scrcpy --list-apps 列出手机所有 App（带中文名），免去手动查包名。返回包名，取消返回 $null。
+# 用 scrcpy --list-apps 取得显示名和包名，避免同名应用选错。取消时返回 $null。
 function Show-AppPicker {
-    param($owner, $serial)
-    $owner.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    param($owner, $serial, [switch]$AddToFavorites)
+    $title = if ($AddToFavorites) { '从手机添加' } else { '更多应用' }
+    $manualAction = if ($AddToFavorites) { '手动添加' } else { '手动输入' }
     # 必须带 -s 指定设备：多设备连接时 scrcpy --list-apps 不指定设备会因「有多台设备」直接失败、列不出 App
     $listArgs = if ($serial) { @('-s', $serial, '--list-apps') } else { @('--list-apps') }
-    $command=Invoke-UiCommand $owner $exe $listArgs -StatusText '正在读取手机应用列表…'
-    $owner.Cursor = [System.Windows.Forms.Cursors]::Default
+    $oldCursor = $owner.Cursor
+    $owner.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    try { $command = Invoke-UiCommand $owner $exe $listArgs -StatusText '正在读取手机应用列表…' }
+    finally { $owner.Cursor = $oldCursor }
     if ($command.Cancelled) { return $null }
     if (-not (Test-CommandSuccess $command)) {
-        [void](Show-ResultDialog $owner '选择 App' '读取手机应用列表失败' '请确认手机仍在线。若知道应用的包名，也可用「手动输入名字或包名」。' (Get-CommandDetail $command) @('ok'))
+        [void](Show-ResultDialog $owner $title '读取手机应用列表失败' "请确认手机仍在线。若知道应用的包名，也可用「$manualAction」。" (Get-CommandDetail $command) @('ok'))
         return $null
     }
     $raw = $command.Stdout + "`n" + $command.Stderr
@@ -3356,14 +3359,14 @@ function Show-AppPicker {
         }
     }
     if (-not $list) {
-        [void](Show-ResultDialog $owner '选择 App' '应用列表中没有可选项' '可用「手动输入名字或包名」，例如 com.tencent.mm。' $raw.Trim() @('ok'))
+        [void](Show-ResultDialog $owner $title '应用列表中没有可选项' "可用「$manualAction」，例如 com.tencent.mm。" $raw.Trim() @('ok'))
         return $null
     }
     $list = @($list | Sort-Object Name)
 
-    $dlg = New-Dialog '选择 App' 340 388 $owner
+    $dlg = New-Dialog $title 340 388 $owner
 
-    $lbl = New-Lbl '搜索 / 选择要在独立窗口里打开的 App：' 16 14
+    $lbl = New-Lbl '按应用名称或包名搜索' 16 14
     $txt = New-Txt 16 40 308
     $lb = New-Object System.Windows.Forms.ListBox
     $lb.Location = '16,74'; $lb.Size = '308,256'
@@ -3389,67 +3392,118 @@ function Show-AppPicker {
         if ($lblEmpty) { $lblEmpty.Visible = -not $has }
         if ($btnGo) { $btnGo.Enabled = $has }
     }
-    $btnGo = New-PrimaryBtn '打开' 16 342 308 34 10
+    $btnText = if ($AddToFavorites) { '加入常用' } else { '选择应用' }
+    $btnGo = New-PrimaryBtn $btnText 16 342 218 34 10
+    $btnCancel = New-SecondaryBtn '取消' 242 342 82 34
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     & $fill ''
     $txt.Add_TextChanged({ & $fill $txt.Text.Trim() })
 
     $result = @{ app = $null }
     $pick = {
-        if ($lb.SelectedIndex -ge 0 -and $lb.SelectedIndex -lt $shown.Count) { $result.app = $shown[$lb.SelectedIndex]; $dlg.Close() }
+        if ($lb.SelectedIndex -lt 0 -or $lb.SelectedIndex -ge $shown.Count) { return }
+        $result.app = $shown[$lb.SelectedIndex]
+        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
     }
     $btnGo.Add_Click($pick)
-    $lb.Add_DoubleClick($pick)
-    $dlg.Controls.AddRange(@($lbl, $txt, $lb, $lblEmpty, $btnGo))
+    $lb.Add_MouseDoubleClick({
+        param($sender, $mouseEvent)
+        $index = $sender.IndexFromPoint($mouseEvent.Location)
+        if ($index -lt 0) { return }
+        $sender.SelectedIndex = $index
+        & $pick
+    })
+    $dlg.Controls.AddRange(@($lbl, $txt, $lb, $lblEmpty, $btnGo, $btnCancel))
     $lblEmpty.BringToFront()
     $dlg.AcceptButton = $btnGo
-    New-EscCancel $dlg
-    [void]$dlg.ShowDialog($owner)
-    return $result.app   # 返回 [pscustomobject]@{ Name; Pkg }，取消则 $null
+    $dlg.CancelButton = $btnCancel
+    if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { return $result.app }
+    return $null
 }
 
 # ---------------- 管理「我的常用应用」：用户自己增删常用 App ----------------
 function Show-ManageApps {
-    param($owner)
-    $dlg = New-Dialog '我的常用应用' 360 322 $owner
-
-    $lbl = New-Lbl '你自己加的常用 App（会出现在独立窗口下拉里）：' 16 14
+    param($owner, $serial)
+    $dlg = New-Dialog '管理常用' 360 322 $owner
+    $lbl = New-Lbl '你添加的应用会出现在独立窗口的下拉列表中。' 16 14
     $lb = New-Object System.Windows.Forms.ListBox
     $lb.Location = '16,40'; $lb.Size = '328,176'
     $lb.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
-    $refresh = {
-        $lb.BeginUpdate(); $lb.Items.Clear()
-        foreach ($k in $script:customApps.Keys) { [void]$lb.Items.Add("$k   ·   $($script:customApps[$k])") }
-        $lb.EndUpdate()
-        if ($lb.Items.Count -eq 0) { [void]$lb.Items.Add('（还没有；点「手动添加」或「更多应用…」）') }
-        if ($btnDel) { $btnDel.Enabled = ($script:customApps.Count -gt 0) }
-    }
+    $lblEmpty = New-Caption '还没有添加常用应用' 24 49
+    $lblEmpty.BackColor = $cWhite
 
-    $btnAdd = New-SecondaryBtn '手动添加…' 16 226 156 34
-    $btnDel = New-SecondaryBtn '删除选中' 188 226 156 34
-    & $refresh
-    if ($tt) {
-        $tt.SetToolTip($btnAdd, '不知道包名？用独立窗口的「更多应用…」从手机列表里挑，会自动加进来，不用手填。')
-        $tt.SetToolTip($lb, '空态：点「手动添加」，或在独立窗口的「更多应用…」里挑')
+    $btnFromPhone = New-SecondaryBtn '从手机添加' 16 226 108 34
+    $btnAdd = New-SecondaryBtn '手动添加' 132 226 102 34
+    $btnDel = New-SecondaryBtn '移除常用' 242 226 102 34
+    $btnDone = New-PrimaryBtn '完成' 16 274 328 34 10
+
+    $refresh = {
+        param([string]$selected)
+        $lb.BeginUpdate()
+        $lb.Items.Clear()
+        foreach ($name in $script:customApps.psbase.Keys) {
+            $index = $lb.Items.Add("$name   ·   $($script:customApps[$name])")
+            if ($name -eq $selected) { $lb.SelectedIndex = $index }
+        }
+        $lb.EndUpdate()
+        $lblEmpty.Visible = $lb.Items.Count -eq 0
+        $btnDel.Enabled = $lb.SelectedIndex -ge 0
     }
+    $lb.Add_SelectedIndexChanged({ $btnDel.Enabled = $lb.SelectedIndex -ge 0 })
+    & $refresh
+
+    $addFavorite = {
+        param([string]$name, [string]$pkg, [switch]$FromPhone)
+        if ($apps.Values -contains $pkg -or $script:customApps.psbase.Values -contains $pkg) {
+            [void](Show-ResultDialog $dlg '管理常用' '这个应用已在常用列表中' $pkg '' @('ok'))
+            return
+        }
+        if ($apps.Contains($name) -or $script:customApps.Contains($name)) {
+            if (-not $FromPhone) {
+                [void](Show-ResultDialog $dlg '管理常用' '这个显示名称已被使用' '请用其他名称添加该应用。' '' @('ok'))
+                return
+            }
+            # 手机上的不同应用可以同名，用包名区分，避免覆盖已有条目。
+            $name = "$name ($pkg)"
+            while ($apps.Contains($name) -or $script:customApps.Contains($name)) { $name += ' ·' }
+        }
+        $script:customApps[$name] = $pkg
+        Save-Settings
+        & $refresh $name
+    }
+    $addState = @{ Busy=$false }
+    $btnFromPhone.Add_Click({
+        if ($addState.Busy) { return }
+        $addState.Busy = $true
+        try {
+            $app = Show-AppPicker $dlg $serial -AddToFavorites
+            if ($app) { & $addFavorite $app.Name $app.Pkg -FromPhone }
+        } finally { $addState.Busy = $false }
+    })
     $btnAdd.Add_Click({
-        $name = Show-InputDialog $dlg '手动添加常用应用' '给这个 App 起个显示名字（如 飞书）：' ''
+        $name = Show-InputDialog $dlg '手动添加' '输入应用的显示名称，例如飞书。' ''
         if ([string]::IsNullOrWhiteSpace($name)) { return }
-        $pkg = Show-InputDialog $dlg '手动添加常用应用' "输入它的包名（如 com.ss.android.lark）。`n不知道包名？用独立窗口的「更多应用…」从手机列表里挑，会自动加，不用手填。" ''
+        $pkg = Show-InputDialog $dlg '手动添加' '输入应用的完整包名，例如 com.ss.android.lark。' ''
         if ([string]::IsNullOrWhiteSpace($pkg)) { return }
-        $script:customApps[$name.Trim()] = $pkg.Trim()
-        Save-Settings; & $refresh
+        $pkg = $pkg.Trim()
+        if ($pkg -notmatch '^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$') {
+            [void](Show-ResultDialog $dlg '手动添加' '请输入有效的包名' '例如 com.ss.android.lark。' '' @('ok'))
+            return
+        }
+        & $addFavorite $name.Trim() $pkg
     })
     $btnDel.Add_Click({
-        $keys = @($script:customApps.Keys)
+        $keys = @($script:customApps.psbase.Keys)
         if ($lb.SelectedIndex -lt 0 -or $lb.SelectedIndex -ge $keys.Count) { return }
         $script:customApps.Remove($keys[$lb.SelectedIndex])
-        Save-Settings; & $refresh
+        Save-Settings
+        & $refresh
     })
-    $btnDone = New-PrimaryBtn '完成' 16 274 328 34 10
     $btnDone.Add_Click({ $dlg.Close() })
-    $dlg.Controls.AddRange(@($lbl, $lb, $btnAdd, $btnDel, $btnDone))
+    $dlg.Controls.AddRange(@($lbl, $lb, $lblEmpty, $btnFromPhone, $btnAdd, $btnDel, $btnDone))
+    $lblEmpty.BringToFront()
     $dlg.AcceptButton = $btnDone
-    $dlg.CancelButton = $btnDone   # Enter/Esc 都能关窗
+    $dlg.CancelButton = $btnDone
     [void]$dlg.ShowDialog($owner)
 }
 
@@ -3658,23 +3712,72 @@ function Show-NewDisplay {
     param($owner, $serial)
     $useCards = [bool](Get-Command Set-CardStyle -ErrorAction SilentlyContinue)
     $useSeg = [bool](Get-Command New-SegSwitch -ErrorAction SilentlyContinue)
-    $dlg = New-Dialog '独立窗口' 340 $(if ($useCards) { 382 } else { 330 }) $owner
+    $dlg = New-Dialog '独立窗口' 340 $(if ($useCards -and $useSeg) { 410 } else { 360 }) $owner
     $ndAudioState = @{ Val = $(if ($settings.ndAudio -in @('auto', 'on', 'off')) { [string]$settings.ndAudio } else { 'auto' }) }
 
     $cb = New-Object System.Windows.Forms.ComboBox
     $cb.DropDownStyle = 'DropDownList'
     $cb.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
-    $specialApps = @('更多应用…（从手机里挑）', '手动输入名字或包名…', '管理我的常用应用…')
+    $cb.DisplayMember = 'Label'
     $refreshApps = {
-        $cur = [string]$cb.SelectedItem
+        param($picked)
+        $current = if ($picked) { $picked } else { $cb.SelectedItem }
+        $selectedIndex = -1
+        $matchingTargetIndex = -1
+        $cb.BeginUpdate()
         $cb.Items.Clear()
-        foreach ($name in $apps.Keys) { [void]$cb.Items.Add($name) }
-        foreach ($name in $script:customApps.Keys) { [void]$cb.Items.Add($name) }
-        foreach ($name in $specialApps) { [void]$cb.Items.Add($name) }
-        $i = $cb.Items.IndexOf($cur)
-        if ($i -ge 0) { $cb.SelectedIndex = $i } else { $cb.SelectedIndex = 0 }
+        foreach ($appMap in @($apps, $script:customApps)) {
+            foreach ($name in $appMap.psbase.Keys) {
+                $pkg = $appMap[$name]
+                $label = if ([object]::ReferenceEquals($appMap, $script:customApps) -and $apps.Contains($name)) { "$name ($pkg)" } else { $name }
+                $item = [pscustomobject]@{ Name=$name; Target="+$pkg"; Label=$label; Temporary=$false }
+                $index = $cb.Items.Add($item)
+                if ($item.Target -eq $current.Target) {
+                    if ($matchingTargetIndex -lt 0) { $matchingTargetIndex = $index }
+                    if ($item.Name -eq $current.Name) { $selectedIndex = $index }
+                }
+            }
+        }
+        if ($selectedIndex -lt 0 -and $current.Temporary) {
+            if ($matchingTargetIndex -ge 0) {
+                $selectedIndex = $matchingTargetIndex
+            } else {
+                if (@($cb.Items | Where-Object { $_.Label -eq $current.Label }).Count -gt 0) {
+                    $current.Label = "$($current.Name) ($($current.Target.TrimStart('+')))"
+                }
+                $selectedIndex = $cb.Items.Add($current)
+            }
+        }
+        if ($cb.Items.Count -gt 0) { $cb.SelectedIndex = [Math]::Max(0, $selectedIndex) }
+        $cb.EndUpdate()
     }
     & $refreshApps
+
+    $btnMore = New-LinkBtn '更多应用' 12 64 82
+    $btnManual = New-LinkBtn '手动输入' 102 64 82
+    $btnManage = New-LinkBtn '管理常用' 214 64 82
+    $appActionState = @{ Busy=$false }
+    $btnMore.Add_Click({
+        if ($appActionState.Busy) { return }
+        $appActionState.Busy = $true
+        try {
+            $app = Show-AppPicker $dlg $serial
+            if ($app) { & $refreshApps ([pscustomobject]@{ Name=$app.Name; Target="+$($app.Pkg)"; Label=$app.Name; Temporary=$true }) }
+        } finally { $appActionState.Busy = $false }
+    })
+    $btnManual.Add_Click({
+        if ($appActionState.Busy) { return }
+        $name = Show-InputDialog $dlg '手动输入' "输入 App 名字（如 chrome）或完整包名（如 com.tencent.mm）。`n中文 App 建议用包名，更准确。" ''
+        if ([string]::IsNullOrWhiteSpace($name)) { return }
+        $name = $name.Trim()
+        $target = if ($name -match '\.') { "+$name" } else { "+?$name" }
+        & $refreshApps ([pscustomobject]@{ Name=$name; Target=$target; Label=$name; Temporary=$true })
+    })
+    $btnManage.Add_Click({
+        if ($appActionState.Busy) { return }
+        Show-ManageApps $dlg $serial
+        & $refreshApps
+    })
 
     # 窗口比例/方向：微信、QQ 等手机应用在“横屏平板”虚拟屏上会用平板版面、显示不全，选「竖屏·手机」即用手机版面
     $customLabel = if ($settings.ndSize) { "自定义 $($settings.ndSize)" } else { '自定义…' }
@@ -3682,19 +3785,15 @@ function Show-NewDisplay {
 
     if ($useCards -and $useSeg) {
         $cardApp = New-Object System.Windows.Forms.Panel
-        $cardApp.Location = New-Object System.Drawing.Point(16, 12); $cardApp.Size = New-Object System.Drawing.Size(308, 72)
+        $cardApp.Location = New-Object System.Drawing.Point(16, 12); $cardApp.Size = New-Object System.Drawing.Size(308, 100)
         Set-CardStyle $cardApp 10 $cWhite $cLine
         $lApp = New-Lbl '选择应用（需 Android 11+）' 12 10; $lApp.ForeColor = $cText2; $lApp.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
-        $lnkManage = New-Object System.Windows.Forms.LinkLabel
-        $lnkManage.Text = '管理常用'; $lnkManage.AutoSize = $true; $lnkManage.Location = New-Object System.Drawing.Point(240, 10)
-        $lnkManage.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
-        $lnkManage.LinkColor = $cRed; $lnkManage.VisitedLinkColor = $cRed; $lnkManage.LinkBehavior = 'HoverUnderline'
-        $lnkManage.Add_Click({ Show-ManageApps $dlg; & $refreshApps }.GetNewClosure())
         $cb.Location = New-Object System.Drawing.Point(12, 34); $cb.Size = New-Object System.Drawing.Size(284, 28)
-        $cardApp.Controls.AddRange(@($lApp, $lnkManage, $cb))
+        foreach ($button in @($btnMore, $btnManual, $btnManage)) { $button.BackColor = $cWhite }
+        $cardApp.Controls.AddRange(@($lApp, $cb, $btnMore, $btnManual, $btnManage))
 
         $cardMode = New-Object System.Windows.Forms.Panel
-        $cardMode.Location = New-Object System.Drawing.Point(16, 94); $cardMode.Size = New-Object System.Drawing.Size(308, 96)
+        $cardMode.Location = New-Object System.Drawing.Point(16, 122); $cardMode.Size = New-Object System.Drawing.Size(308, 96)
         Set-CardStyle $cardMode 10 $cWhite $cLine
         $lblMode = New-Lbl '窗口比例' 12 10; $lblMode.ForeColor = $cText2; $lblMode.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
         $cbMode.Location = New-Object System.Drawing.Point(12, 34); $cbMode.Size = New-Object System.Drawing.Size(284, 26)
@@ -3702,7 +3801,7 @@ function Show-NewDisplay {
         $cardMode.Controls.AddRange(@($lblMode, $cbMode, $chkFixed))
 
         $cardAudio = New-Object System.Windows.Forms.Panel
-        $cardAudio.Location = New-Object System.Drawing.Point(16, 200); $cardAudio.Size = New-Object System.Drawing.Size(308, 72)
+        $cardAudio.Location = New-Object System.Drawing.Point(16, 228); $cardAudio.Size = New-Object System.Drawing.Size(308, 72)
         Set-CardStyle $cardAudio 10 $cWhite $cLine
         $lblAudio = New-Lbl '此窗口的声音' 12 10; $lblAudio.ForeColor = $cText2; $lblAudio.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
         $segAudio = New-SegSwitch @('自动', '强制播放', '静音') @('auto', 'on', 'off') $ndAudioState.Val 12 33 284 30 ({
@@ -3711,82 +3810,53 @@ function Show-NewDisplay {
         }.GetNewClosure())
         $cardAudio.Controls.AddRange(@($lblAudio, $segAudio))
 
-        $capMode = New-Caption "手机主屏可继续正常使用；应用双开 / 分身若黑屏，`n请改用普通投屏在手机上打开。" 16 280
+        $capMode = New-Caption "手机主屏可继续正常使用；应用双开 / 分身若黑屏，`n请改用普通投屏在手机上打开。" 16 308
         $capMode.MaximumSize = New-Object System.Drawing.Size(308, 0)
         $audioTt = '独立窗口播放手机的系统声音，需要 Android 11+。「自动」遵循声音总开关，并在已有窗口播放时静音。「强制播放」允许本窗口播放，即使总开关关闭。'
         if ($tt) { $tt.SetToolTip($segAudio, $audioTt); $tt.SetToolTip($lblAudio, $audioTt) }
-        $btnGo = New-PrimaryBtn '打开独立窗口' 16 326 308 40 11
+        $btnGo = New-PrimaryBtn '打开独立窗口' 16 354 308 40 11
         $dlg.Controls.AddRange(@($cardApp, $cardMode, $cardAudio, $capMode, $btnGo))
     } else {
         $l1 = New-Lbl '在电脑上单开一块屏，运行下面这个 App：' 16 14
         $l2 = New-Lbl '需要 Android 11 或更新版本' 16 38; $l2.ForeColor = $cMuted
         $cb.Location = New-Object System.Drawing.Point(16, 64); $cb.Size = New-Object System.Drawing.Size(288, 28)
-        $lblMode = New-Lbl '窗口比例' 16 110
-        $cbMode.Location = New-Object System.Drawing.Point(84, 107); $cbMode.Size = New-Object System.Drawing.Size(220, 26)
-        $chkFixed = New-Chk '固定分辨率（窗口缩放时尺寸不变）' $settings.ndFixed 16 143
-        $capMode = New-Caption "勾选「固定分辨率」后，拖动窗口边缘只改变电脑上的显示大小。`n应用分身若黑屏，请改用普通投屏，在手机上打开分身。" 16 167
+        $btnMore.Location = '16,96'; $btnManual.Location = '106,96'; $btnManage.Location = '222,96'
+        $lblMode = New-Lbl '窗口比例' 16 140
+        $cbMode.Location = New-Object System.Drawing.Point(84, 137); $cbMode.Size = New-Object System.Drawing.Size(220, 26)
+        $chkFixed = New-Chk '固定分辨率（窗口缩放时尺寸不变）' $settings.ndFixed 16 173
+        $capMode = New-Caption "勾选「固定分辨率」后，拖动窗口边缘只改变电脑上的显示大小。`n应用分身若黑屏，请改用普通投屏，在手机上打开分身。" 16 197
         $capMode.MaximumSize = New-Object System.Drawing.Size(288, 0)
-        $lblAudio = New-Lbl '声音' 16 235
-        $cbAudio = New-Combo @('自动（同设备避免重音）', '播放（允许此窗口出声）', '静音（这扇窗不出声）') @('auto', 'on', 'off') $ndAudioState.Val 84 232 220
+        $lblAudio = New-Lbl '声音' 16 265
+        $cbAudio = New-Combo @('自动（同设备避免重音）', '播放（允许此窗口出声）', '静音（这扇窗不出声）') @('auto', 'on', 'off') $ndAudioState.Val 84 262 220
         $cbAudio.Add_SelectedIndexChanged({ $ndAudioState.Val = [string]$cbAudio.Vals[$cbAudio.SelectedIndex] }.GetNewClosure())
-        $btnGo = New-PrimaryBtn '打开独立窗口' 16 274 288 38 11
-        $dlg.Controls.AddRange(@($l1, $l2, $cb, $lblMode, $cbMode, $chkFixed, $capMode, $lblAudio, $cbAudio, $btnGo))
+        $btnGo = New-PrimaryBtn '打开独立窗口' 16 304 288 38 11
+        $dlg.Controls.AddRange(@($l1, $l2, $cb, $btnMore, $btnManual, $btnManage, $lblMode, $cbMode, $chkFixed, $capMode, $lblAudio, $cbAudio, $btnGo))
     }
 
     # 空字符串是用户明确清空后的值，不能再用值的真假来判断是否确认过。
     $state = @{ Target = $null; Label = $null; CustomSize = $null; CustomDpi = $null; CustomConfirmed=$false }
-    $ndBusy = $false
     $btnGo.Add_Click({
-        if ($ndBusy) { return }
-        $ndBusy = $true
+        if ($appActionState.Busy) { return }
+        $appActionState.Busy = $true
         try {
-        $sel = [string]$cb.SelectedItem
-        if ($sel -eq '管理我的常用应用…') {
-            Show-ManageApps $dlg
-            & $refreshApps
-            return
-        }
-        $ndModeSel = [string]$cbMode.Vals[$cbMode.SelectedIndex]
-        if ($ndModeSel -eq 'custom') {
-            $askSize = if ($state.CustomConfirmed) { [string]$state.CustomSize } else { [string]$settings.ndSize }
-            $askDpi = if ($state.CustomConfirmed) { [string]$state.CustomDpi } else { [string]$settings.ndDpi }
-            $ask = Show-CustomDisplaySize $dlg $askSize $askDpi
-            if (-not $ask) { return }   # 取消：留在独立窗口面板，比例/声音不丢
-            $state.CustomSize = [string]$ask.Size; $state.CustomDpi = [string]$ask.Dpi
-            $state.CustomConfirmed=$true
-            $i = $cbMode.SelectedIndex
-            $cbMode.Items[3] = $(if ($ask.Size) { "自定义 $($ask.Size)" } else { '自定义…' })
-            $cbMode.SelectedIndex = $i
-        }
-        if ($sel -like '更多应用*') {
-            $oldText = $btnGo.Text
-            $btnGo.Text = '正在读取应用列表…'; $btnGo.Enabled = $false; $dlg.Refresh()
-            try { $app = Show-AppPicker $dlg $serial } finally { $btnGo.Text = $oldText; $btnGo.Enabled = $true; $dlg.Refresh() }
-            if (-not $app) { return }
-            $state.Label = $app.Name
-            $state.Target = "+$($app.Pkg)"
-            if (-not $apps.Contains($app.Name) -and -not $script:customApps.Contains($app.Name)) {
-                if ([System.Windows.Forms.MessageBox]::Show("要把「$($app.Name)」加到常用列表吗？以后可直接在下拉里选它。", '常用应用', 'YesNo', 'Question') -eq 'Yes') {
-                    $script:customApps[$app.Name] = $app.Pkg; Save-Settings
-                }
+            $selectedApp = $cb.SelectedItem
+            if (-not $selectedApp) { return }
+            $ndModeSel = [string]$cbMode.Vals[$cbMode.SelectedIndex]
+            if ($ndModeSel -eq 'custom') {
+                $askSize = if ($state.CustomConfirmed) { [string]$state.CustomSize } else { [string]$settings.ndSize }
+                $askDpi = if ($state.CustomConfirmed) { [string]$state.CustomDpi } else { [string]$settings.ndDpi }
+                $ask = Show-CustomDisplaySize $dlg $askSize $askDpi
+                if (-not $ask) { return }   # 取消：留在独立窗口面板，比例/声音不丢
+                $state.CustomSize = [string]$ask.Size; $state.CustomDpi = [string]$ask.Dpi
+                $state.CustomConfirmed=$true
+                $i = $cbMode.SelectedIndex
+                $cbMode.Items[3] = $(if ($ask.Size) { "自定义 $($ask.Size)" } else { '自定义…' })
+                $cbMode.SelectedIndex = $i
             }
-        }
-        elseif ($sel -like '手动输入*') {
-            $name = if (Get-Command Show-InputDialog -ErrorAction SilentlyContinue) {
-                Show-InputDialog $dlg '独立窗口 · 打开 App' "输入 App 名字（如 chrome）或完整包名（如 com.tencent.mm）。`n中文 App 建议用包名，更准确。" ''
-            } else {
-                [Microsoft.VisualBasic.Interaction]::InputBox("输入 App 名字（如 chrome）或完整包名（如 com.tencent.mm）。`n中文 App 建议用包名，更准确。", '独立窗口 · 打开 App', '')
-            }
-            if ([string]::IsNullOrWhiteSpace($name)) { return }
-            $name = $name.Trim()
-            $state.Label = $name
-            $state.Target = if ($name -match '\.') { "+$name" } else { "+?$name" }
-        }
-        elseif ($apps.Contains($sel)) { $state.Target = '+' + $apps[$sel]; $state.Label = $sel }
-        elseif ($script:customApps.Contains($sel)) { $state.Target = '+' + $script:customApps[$sel]; $state.Label = $sel }
-        else { return }
-        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close()
-        } finally { $ndBusy = $false }
+            $state.Label = $selectedApp.Name
+            $state.Target = $selectedApp.Target
+            $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK; $dlg.Close()
+        } finally { $appActionState.Busy = $false }
     })
     $dlg.AcceptButton = $btnGo
     New-EscCancel $dlg

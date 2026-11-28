@@ -5,8 +5,8 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path (Split-Path $PSScriptRoot) 'scrcpy-helper.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join "`n") }
 foreach ($name in @(
-    'Show-NewDisplay','Get-NewDisplayArgs','Get-DisplayCompatibilityArgs','Get-HwDecArgs',
-    'Get-VideoArgs','Get-ControlArgs','New-Lbl','New-Combo','New-Chk','New-Caption'
+    'Show-NewDisplay','Show-AppPicker','Show-ManageApps','Get-NewDisplayArgs','Get-DisplayCompatibilityArgs','Get-HwDecArgs',
+    'Get-VideoArgs','Get-ControlArgs','New-Lbl','New-Combo','New-Chk','New-Caption','New-Txt'
 )) {
     $definition = $ast.Find({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
@@ -24,6 +24,7 @@ function Check($Condition, [string]$Message) {
 $apps = [ordered]@{ 'Test app' = 'com.example.app' }
 $script:customApps = [ordered]@{}
 $cMuted = [Drawing.Color]::Gray
+$cWhite = [Drawing.Color]::White
 $form = @{}
 $btnNd = @{}
 $fixture = @{}
@@ -39,9 +40,11 @@ function Resolve-TargetForFeature {
     return $Devices[0]
 }
 function New-Dialog {
-    $fixture.Pickers++
+    param($Title)
+    if ($Title -eq '独立窗口') { $fixture.Pickers++ }
     $dialog = [pscustomobject]@{
-        AcceptButton=$null; DialogResult=[Windows.Forms.DialogResult]::Cancel
+        Title=$Title; AcceptButton=$null; CancelButton=$null
+        Cursor=[Windows.Forms.Cursors]::Default; DialogResult=[Windows.Forms.DialogResult]::Cancel
         Controls=[Collections.ArrayList]::new()
     }
     $dialog | Add-Member ScriptMethod ShowDialog {
@@ -50,18 +53,23 @@ function New-Dialog {
             $fixed = $this.Controls | Where-Object { $_ -is [Windows.Forms.CheckBox] }
             $fixed.Checked = -not $fixed.Checked
         }
-        & $this.AcceptButton.Action
+        if ($fixture.DialogActions -and $fixture.DialogActions.ContainsKey($this.Title)) {
+            & $fixture.DialogActions[$this.Title] $this
+        } else { & $this.AcceptButton.Action }
         return $this.DialogResult
     }
     $dialog | Add-Member ScriptMethod Close {}
-    $fixture.Picker = $dialog
+    if ($Title -eq '独立窗口') { $fixture.Picker = $dialog }
     return $dialog
 }
 function New-PrimaryBtn {
-    $button = [pscustomobject]@{ Action=$null }
+    param($Text)
+    $button = [pscustomobject]@{ Text=$Text; Action=$null; Enabled=$true; Location=$null; DialogResult=$null }
     $button | Add-Member ScriptMethod Add_Click { param($Action) $this.Action = $Action }
     return $button
 }
+function New-LinkBtn($Text) { New-PrimaryBtn $Text }
+function New-SecondaryBtn($Text) { New-PrimaryBtn $Text }
 function New-EscCancel {}
 function Get-FriendlyName { return 'Test phone' }
 function Get-DeviceDisplay { return @{ W=1080; H=2340; Dpi=420 } }
@@ -70,6 +78,7 @@ function Save-Settings { $fixture.Saves++ }
 function Show-ResultDialog {
     param($Owner, $Title, $Heading, $Body)
     $fixture.Message = $Body
+    $fixture.Heading = $Heading
     return 'ok'
 }
 function Start-Scrcpy {
@@ -131,6 +140,113 @@ foreach ($preset in @(
                 if ($control -is [Windows.Forms.Control]) { $control.Dispose() }
             }
         }
+    }
+}
+function Invoke-UiCommand {
+    param($Owner, $Exe, $Options, $StatusText)
+    Check (($Options -join '|') -eq '-s|test-device|--list-apps') 'App picker did not list apps from the selected device'
+    return @{ Stdout=" - Test app com.example.second`n - Another app com.example.third"; Stderr='' }
+}
+function Test-CommandSuccess { return $true }
+function Show-InputDialog { return $fixture.Inputs.Dequeue() }
+
+$settings = @{ ndMode='settings'; ndFixed=$true; ndNoDecor=$false; ndAudio='auto'; audioOn=$true }
+$fixture = @{
+    Scans=0; Pickers=0; Starts=0; Saves=0
+    DialogActions=@{
+        '独立窗口' = {
+            param($window)
+            $appsCombo = @($window.Controls | Where-Object { $_ -is [Windows.Forms.ComboBox] })[0]
+            Check ($appsCombo.Items.Count -eq 1) 'App actions were mixed into the app selection'
+            $more = $window.Controls | Where-Object { $_.Text -ceq '更多应用' }
+            & $more.Action
+            Check ($appsCombo.SelectedItem.Target -ceq '+com.example.app') 'Cancel changed the selected app'
+            & $more.Action
+            Check ($fixture.Starts -eq 0 -and $fixture.Saves -eq 0 -and $script:customApps.Count -eq 0) 'Browsing launched or saved an app'
+            Check ($appsCombo.SelectedItem.Target -ceq '+com.example.second') 'Selecting an installed app lost its package'
+            Check ($appsCombo.GetItemText($appsCombo.SelectedItem) -ceq 'Test app (com.example.second)') 'Same-name apps were not distinguished in the dropdown'
+            & $window.AcceptButton.Action
+        }
+        '更多应用' = {
+            param($picker)
+            $fixture.Visits++
+            if ($fixture.Visits -eq 1) { return }
+            $search = $picker.Controls | Where-Object { $_ -is [Windows.Forms.TextBox] }
+            $search.Text = '['
+            Check (-not $picker.AcceptButton.Enabled) 'An unmatched search allowed selection'
+            $search.Text = 'com.example.second'
+            Check ($picker.AcceptButton.Enabled) 'Package-name search did not find the matching app'
+            & $picker.AcceptButton.Action
+        }
+    }
+    Visits=0
+}
+try {
+    & $click
+    Check ($fixture.Starts -eq 1 -and $fixture.Options -contains '--start-app=+com.example.second') 'The chosen installed app did not launch'
+} finally {
+    foreach ($control in $fixture.Picker.Controls) {
+        if ($control -is [Windows.Forms.Control]) { $control.Dispose() }
+    }
+}
+
+$script:customApps['Keys'] = 'com.example.saved'
+$fixture = @{
+    Scans=0; Pickers=0; Starts=0; Saves=0
+    Inputs=[Collections.Queue]::new()
+    DialogActions=@{
+        '独立窗口' = {
+            param($window)
+            $appsCombo = @($window.Controls | Where-Object { $_ -is [Windows.Forms.ComboBox] })[0]
+            $appsCombo.SelectedIndex = 1
+            $manage = $window.Controls | Where-Object { $_.Text -ceq '管理常用' }
+            & $manage.Action
+            Check ($appsCombo.SelectedItem.Target -ceq '+com.example.saved') 'Managing favorites changed the selected app'
+            Check ($appsCombo.Items.Count -eq 3) 'Saved favorites did not refresh in the dropdown'
+            $manual = $window.Controls | Where-Object { $_.Text -ceq '手动输入' }
+            $fixture.Inputs.Enqueue('example')
+            & $manual.Action
+            Check ($appsCombo.SelectedItem.Target -ceq '+?example') 'Manual search was not staged for launch'
+            Check ($fixture.Starts -eq 0) 'An app action unexpectedly launched scrcpy'
+        }
+        '管理常用' = {
+            param($manager)
+            $fromPhone = $manager.Controls | Where-Object { $_.Text -ceq '从手机添加' }
+            $manualAdd = $manager.Controls | Where-Object { $_.Text -ceq '手动添加' }
+            $remove = $manager.Controls | Where-Object { $_.Text -ceq '移除常用' }
+            Check (-not $remove.Enabled) 'Remove was enabled without a selection'
+            & $fromPhone.Action
+            Check ($script:customApps['Test app (com.example.second)'] -ceq 'com.example.second') 'Adding a same-name favorite overwrote or lost an app'
+            & $fromPhone.Action
+            Check ($fixture.Saves -eq 1 -and $fixture.Heading -ceq '这个应用已在常用列表中') 'A duplicate package was saved'
+            $fixture.Inputs.Enqueue('Keys')
+            $fixture.Inputs.Enqueue('com.example.other')
+            & $manualAdd.Action
+            Check ($script:customApps['Keys'] -ceq 'com.example.saved' -and $fixture.Saves -eq 1) 'Manual add overwrote an existing favorite'
+            $fixture.Inputs.Enqueue('Values')
+            $fixture.Inputs.Enqueue('com.example.manual')
+            & $manualAdd.Action
+            Check ($script:customApps['Values'] -ceq 'com.example.manual' -and $remove.Enabled) 'Manual favorite was not saved and selected'
+            & $fromPhone.Action
+            Check ($fixture.Saves -eq 2) 'A favorite named Values bypassed package deduplication'
+            & $remove.Action
+            Check (-not $script:customApps.Contains('Values') -and $fixture.Saves -eq 3) 'Removing an app did not update favorites'
+        }
+        '从手机添加' = {
+            param($picker)
+            Check ($picker.AcceptButton.Text -ceq '加入常用') 'Favorite picker did not identify the effect of confirming'
+            $search = $picker.Controls | Where-Object { $_ -is [Windows.Forms.TextBox] }
+            $search.Text = 'com.example.second'
+            & $picker.AcceptButton.Action
+        }
+    }
+}
+try {
+    & $click
+    Check ($fixture.Starts -eq 0) 'Leaving app selection launched scrcpy'
+} finally {
+    foreach ($control in $fixture.Picker.Controls) {
+        if ($control -is [Windows.Forms.Control]) { $control.Dispose() }
     }
 }
 'PASS independent window regression on PowerShell ' + $PSVersionTable.PSVersion
