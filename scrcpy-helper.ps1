@@ -495,6 +495,58 @@ function Get-CommandDetail {
     return (@($Result.Stdout,$Result.Stderr) -join "`n").Trim()
 }
 
+function Invoke-FindPhone {
+    param($Owner, [string]$Serial)
+    # 把音量恢复留在手机端，避免数据线拔掉或等待框取消后，电脑无法再发出恢复命令。
+    $remote = @'
+volume() { cmd media_session volume --stream 5 "$@"; }
+volume_index() { sed -n 's/.*volume is \([0-9][0-9]*\) in range \[[0-9][0-9]*\.\.[0-9][0-9]*\].*/\1/p'; }
+restore_volume() {
+    result=$(volume --set "$original" --get 2>&1)
+    if [ "$(printf '%s\n' "$result" | volume_index)" != "$original" ]; then
+        printf '%s\n' FIND_PHONE_RESTORE_FAILED "$result"
+    fi
+}
+
+range=$(volume --get 2>&1 | sed -n 's/.*volume is \([0-9][0-9]*\) in range \[[0-9][0-9]*\.\.\([0-9][0-9]*\)\].*/\1 \2/p')
+set -- $range
+raised=0
+# 音量为零时跳过调整，避免联动改变静音或振动模式。
+if [ "$#" -eq 2 ] && [ "$1" -gt 0 ] && [ "$1" -le "$2" ]; then
+    original=$1
+    maximum=$2
+    if [ "$original" != "$maximum" ]; then
+        trap 'restore_volume' EXIT
+        trap 'exit 1' HUP INT TERM
+        raised=1
+        result=$(volume --set "$maximum" --get 2>&1)
+        current=$(printf '%s\n' "$result" | volume_index)
+    else
+        current=$original
+    fi
+    if [ "$current" = "$maximum" ]; then
+        echo FIND_PHONE_MAX_VOLUME
+    fi
+fi
+
+notification=$(cmd notification post -v -t '寻找手机' scrcpy-helper-find-phone '电脑正在寻找这台手机。' 2>&1)
+if printf '%s\n' "$notification" | grep -q '^posted:'; then
+    echo FIND_PHONE_POSTED
+else
+    printf '%s\n' "$notification"
+fi
+if cmd vibrator_manager synced oneshot 1200 >/dev/null 2>&1 ||
+   cmd vibrator vibrate 1200 >/dev/null 2>&1; then
+    echo FIND_PHONE_VIBRATION_REQUESTED
+fi
+if [ "$raised" -eq 1 ]; then
+    sleep 3
+fi
+'@
+    $remote = $remote.Replace("`r`n", "`n")
+    return (Invoke-UiCommand -Owner $Owner -FilePath $adb -ArgumentList @('-s', $Serial, 'shell', '-T', $remote) -TimeoutMs 12000 -StatusText '正在发送寻找提示…')
+}
+
 function Invoke-ConnectDevices {
     param($Adb, [string[]]$Addresses, $Control, [int]$BudgetMs = 15000, [switch]$Probe)
     $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -3667,9 +3719,9 @@ function Reconnect-LastAsync {
 
 # 多设备时让用户挑一台投屏，返回序列号 / 地址，取消返回 $null。
 function Select-Device {
-    param($owner, $devs, $title = '选择设备')
+    param($owner, $devs, $title = '选择设备', $Prompt = '检测到多台设备，选择要投屏的一台：', $ButtonText = '投屏这台')
     $dlg = New-Dialog $title 340 296 $owner
-    $lbl = New-Lbl '检测到多台设备，选择要投屏的一台：' 16 14
+    $lbl = New-Lbl $Prompt 16 14
     $lb = New-Object System.Windows.Forms.ListBox
     $lb.Location = '16,42'; $lb.Size = '308,160'
     $lb.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
@@ -3678,7 +3730,7 @@ function Select-Device {
         [void]$lb.Items.Add("$(Get-FriendlyName $s)   ·   $tp   ·   $s")
     }
     if ($lb.Items.Count -gt 0) { $lb.SelectedIndex = 0 }
-    $btnGo = New-PrimaryBtn '投屏这台' 16 218 308 34 10
+    $btnGo = New-PrimaryBtn $ButtonText 16 218 308 34 10
     $result = @{ s = $null }
     $pick = { if ($lb.SelectedIndex -ge 0) { $result.s = $devs[$lb.SelectedIndex]; $dlg.Close() } }
     $btnGo.Add_Click($pick); $lb.Add_DoubleClick($pick)
@@ -5943,9 +5995,11 @@ try {
     $lblSection.ForeColor = $cInk
     $form.Controls.Add($lblSection)
 
+    $btnFindPhone = New-LinkBtn '寻找手机' 298 11 80
+    $tt.SetToolTip($btnFindPhone, '让当前手机以最大通知音量播放提示音，并短振。实际效果取决于手机的系统设置。')
     $btnShortcuts = New-LinkBtn '快捷键' 382 11 72 'keyboard'
     $btnSettings  = New-LinkBtn '设置'   458 11 62 'settings'
-    $form.Controls.AddRange(@($btnShortcuts, $btnSettings))
+    $form.Controls.AddRange(@($btnFindPhone, $btnShortcuts, $btnSettings))
 
     # 设备与运行态卡片
     $pnlDevCard = New-Object System.Windows.Forms.Panel
@@ -6434,6 +6488,41 @@ try {
         $script:mainFlow.RefreshPending = $false
         Start-DeviceScan -Owner $form -Kind 'status' -OnDone $renderStatus
     }
+    $btnFindPhone.Add_Click({ Invoke-MainFlow -WithDevices -Source $btnFindPhone ({
+        param($devices)
+        $devs = @($devices)
+        if ($devs.Count -eq 0) {
+            [void](Show-ResultDialog $form '寻找手机' '没检测到手机' '请用数据线连接并允许 USB 调试，或点「无线连接…」。')
+            return
+        }
+        $serial = if ($devs -contains $script:uiState.SelectedSerial) { $script:uiState.SelectedSerial }
+                  elseif ($devs.Count -eq 1) { $devs[0] }
+                  else { Select-Device $form $devs '寻找手机 · 选择设备' '检测到多台设备，选择要寻找的一台：' '寻找这台' }
+        if (-not $serial) { return }
+
+        $result = Invoke-FindPhone $form $serial
+        if ($result.Cancelled) { return }
+        $detail = Get-CommandDetail $result
+        if (-not (Test-CommandSuccess $result)) {
+            [void](Show-ResultDialog $form '寻找手机' '无法确认寻找提示已发送' '请确认手机仍在线后重试。如通知音量发生变化，可在手机上调回。' $detail)
+            return
+        }
+        if ($result.Stdout -match '(?m)^FIND_PHONE_RESTORE_FAILED\r?$') {
+            [void](Show-ResultDialog $form '寻找手机' '未能恢复通知音量' '请在手机上检查通知音量。' $detail)
+            return
+        }
+        if ($result.Stdout -match '(?m)^FIND_PHONE_POSTED\r?$') {
+            $hint = if ($result.Stdout -match '(?m)^FIND_PHONE_MAX_VOLUME\r?$') { '已发送寻找提示。' }
+                    else { '已发送寻找提示，未确认通知音量已调至最大。' }
+        } elseif ($result.Stdout -match '(?m)^FIND_PHONE_VIBRATION_REQUESTED\r?$') {
+            $hint = '无法发送通知提示音，已请求手机短振。'
+        } else {
+            [void](Show-ResultDialog $form '寻找手机' '手机未接受寻找提示' '请检查手机的系统通知设置和连接状态。' $detail)
+            return
+        }
+        & $script:showTempHint $hint $cMuted 6000
+        $script:hintKeepAfterFlow = $true
+    }) })
     $btnShortcuts.Add_Click({ Invoke-MainFlow ({ Show-Shortcuts $form }) })
     $btnSettings.Add_Click({
         Invoke-MainFlow ({ Show-Settings $form })
@@ -6572,7 +6661,7 @@ try {
     $script:fmFlow = @{ Busy = $false }
     $script:busyCards    = @($btnCastHero, $btnWirelessHero, $btnFiles, $btnCamera, $btnRecord, $btnNd)
     $script:busyCapsules = @($btnCapAudio, $btnCapScreenOff, $btnCapOnTop, $btnCapRes)
-    $script:busyLinks    = @($btnShortcuts, $btnSettings, $btnDevices)
+    $script:busyLinks    = @($btnFindPhone, $btnShortcuts, $btnSettings, $btnDevices)
     $script:busySnap = @()
     function Set-BusyLook {
         param([bool]$On, $Source)
