@@ -209,7 +209,7 @@ $script:autoConnectStarted = $false                      # 启动自动连接每
 # 同步执行外部命令并捕获标准输入/输出/错误，支持取消标志和超时熔断，从源头隐藏控制台窗口且不阻塞 UI。
 function Invoke-ShortCommand {
     param([string]$FilePath, [string[]]$ArgumentList = @(),
-          [ValidateRange(1,15000)][int]$TimeoutMs = 15000, $Control)
+          [ValidateRange(1,60000)][int]$TimeoutMs = 15000, $Control)
     $result = [pscustomobject]@{ Started = $false; ExitCode = $null; TimedOut = $false; Cancelled = $false; Stdout = ''; Stderr = ''; Error = '' }
     $proc = $null
     $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -3456,7 +3456,7 @@ function Show-AppPicker {
     $lbl = New-Lbl '按应用名称或包名搜索' 16 14
     $btnRefresh = New-LinkBtn '刷新应用列表' 336 8 108
     $txt = New-Txt 16 40 308
-    $chkFavorites = New-Chk '只看常用' ($appList.Current.Apps.Count -eq 0) 344 42
+    $chkFavorites = New-Chk '只看常用' $false 344 42
     $lblSortHint = New-Caption '拖动常用应用调整顺序。' 16 71
     $lblStatus = New-Caption '' 192 71
     $lb = New-Object System.Windows.Forms.ListBox
@@ -3541,9 +3541,7 @@ function Show-AppPicker {
         $current = if ($lb.SelectedIndex -ge 0) { $shown[$lb.SelectedIndex] }
         $btnRefresh.Enabled = $false
         try {
-            $hadPhoneApps = $appList.Current.Apps.Count -gt 0
             $appList.Current = Read-PhoneAppList $dlg $serial -Refresh
-            if (-not $hadPhoneApps -and $appList.Current.Apps.Count -gt 0) { $chkFavorites.Checked = $false }
             & $fill $current.Name $current.Pkg
         } finally { $btnRefresh.Enabled = $true }
     })

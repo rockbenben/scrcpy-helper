@@ -6,7 +6,8 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
 if ($errors.Count) { throw ($errors.Message -join "`n") }
 foreach ($name in @(
     'Show-NewDisplay','Show-AppPicker','Read-PhoneAppList','Get-AppFavorites','Move-AppFavorite','Add-AppFavorite','Get-NewDisplayArgs','Get-DisplayCompatibilityArgs','Get-HwDecArgs',
-    'Get-VideoArgs','Get-ControlArgs','New-Lbl','New-Combo','New-Chk','New-Caption','New-Txt'
+    'Get-VideoArgs','Get-ControlArgs','New-Lbl','New-Combo','New-Chk','New-Caption','New-Txt',
+    'Invoke-UiCommand','Invoke-ShortCommand'
 )) {
     $definition = $ast.Find({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
@@ -145,6 +146,16 @@ foreach ($preset in @(
         }
     }
 }
+function Wait-UiTask {
+    param($Owner, $StatusText, $Inputs, $Work)
+    $Control = @{ Cancelled=$false; Process=$null }
+    & $Work
+}
+# Exercise the real command helper with a local child so its timeout validation cannot be bypassed by the app-list mock.
+$child = (Get-Process -Id $PID).Path
+$command = Invoke-UiCommand $null $child @('-NoProfile','-NonInteractive','-Command', '[Console]::WriteLine("app-list-probe")') -TimeoutMs 60000
+Check ($command.Started -and $command.ExitCode -eq 0 -and $command.Stdout.Trim() -ceq 'app-list-probe') 'The app list timeout was rejected before the command started'
+
 function Invoke-UiCommand {
     param($Owner, $Exe, $Options, $StatusText, $TimeoutMs)
     Check (($Options -join '|') -eq '-s|test-device|--list-apps') 'App picker did not list apps from the selected device'
@@ -280,13 +291,16 @@ $fixture = @{
             $manualAdd = $picker.Controls | Where-Object { $_.Text -ceq '手动添加' }
             Check ($filter.Text -ceq '只看常用') 'More apps did not offer a favorites filter'
             if ($fixture.FailedList) {
-                Check ($filter.Checked -and $list.Items.Count -eq 2) 'Query failure hid saved or built-in favorites'
+                Check (-not $filter.Checked -and $list.Items.Count -eq 2) 'Query failure changed the default app filter or hid available apps'
                 Check ($picker.Controls.Text -ccontains '读取手机应用列表超时。') 'The timeout was not reported within More apps'
                 $refresh = $picker.Controls | Where-Object { $_.Text -ceq '刷新应用列表' }
                 $search.Text = 'com.example.second'
+                $filter.Checked = $true
                 $fixture.FailedList = $false
                 & $refresh.Action
-                Check (-not $filter.Checked -and $list.Items.Count -eq 1 -and $search.Text -ceq 'com.example.second') 'Retry did not restore matching phone apps'
+                Check ($filter.Checked -and $list.Items.Count -eq 0 -and $search.Text -ceq 'com.example.second') 'Retry changed the filter or search text'
+                $filter.Checked = $false
+                Check ($list.Items.Count -eq 1) 'Retry did not restore matching phone apps'
                 $fixture.FailedList = $true
                 & $refresh.Action
                 Check ($list.Items.Count -eq 1 -and $picker.Controls.Text -ccontains '读取手机应用列表超时。') 'A failed refresh discarded the last good device list'
