@@ -23,6 +23,7 @@ function Check($Condition, [string]$Message) {
 }
 $apps = [ordered]@{ 'Test app' = 'com.example.app' }
 $script:customApps = [ordered]@{}
+$script:hiddenBuiltInApps = @{}
 $cMuted = [Drawing.Color]::Gray
 $cWhite = [Drawing.Color]::White
 $form = @{}
@@ -213,7 +214,7 @@ $script:customApps.Clear()
 $script:customApps['Keys'] = 'com.example.saved'
 $script:customApps['To remove'] = 'com.example.fourth'
 $fixture = @{
-    Scans=0; Pickers=0; Starts=0; Saves=0; FailedList=$false
+    Scans=0; Pickers=0; Starts=0; Saves=0; FailedList=$false; BuiltInAction=''
     Inputs=[Collections.Queue]::new()
     DialogActions=@{
         '独立窗口' = {
@@ -228,10 +229,21 @@ $fixture = @{
             $fixture.FailedList = $true
             & $more.Action
             Check ($fixture.Heading -ceq '读取手机应用列表失败') 'Phone app query failure was not reported'
+            $fixture.FailedList = $false
+            $fixture.BuiltInAction = 'remove'
+            & $more.Action
+            Check ($appsCombo.Items.Target -cnotcontains '+com.example.app') 'Removing a built-in app did not refresh the dropdown'
+            $fixture.BuiltInAction = 'restore'
+            & $more.Action
+            Check ($appsCombo.Items.Target -ccontains '+com.example.app') 'Restoring a built-in app did not refresh the dropdown'
+            Check ($appsCombo.SelectedItem.Target -ceq '+com.example.saved' -and $fixture.Saves -eq 7) 'Editing built-in favorites changed the selected app or did not save twice'
+            $fixture.BuiltInAction = 'empty'
+            & $more.Action
+            Check ($appsCombo.Items.Count -eq 0 -and -not $window.AcceptButton.Enabled) 'An empty favorites list still offered to launch an app'
             $manual = $window.Controls | Where-Object { $_.Text -ceq '手动输入' }
             $fixture.Inputs.Enqueue('example')
             & $manual.Action
-            Check ($appsCombo.SelectedItem.Target -ceq '+?example') 'Manual search was not staged for launch'
+            Check ($appsCombo.SelectedItem.Target -ceq '+?example' -and $window.AcceptButton.Enabled) 'Manual search was not staged for launch'
             Check ($fixture.Starts -eq 0) 'An app action unexpectedly launched scrcpy'
         }
         '更多应用' = {
@@ -244,6 +256,34 @@ $fixture = @{
             Check ($filter.Text -ceq '只看常用') 'More apps did not offer a favorites filter'
             if ($fixture.FailedList) {
                 Check ($filter.Checked -and $list.Items.Count -eq 2) 'Query failure hid saved or built-in favorites'
+                return
+            }
+            if ($fixture.BuiltInAction -eq 'empty') {
+                $search.Text = 'com.example.app'
+                & $remove.Action
+                $search.Text = 'com.example.saved'
+                & $remove.Action
+                return
+            }
+            if ($fixture.BuiltInAction) {
+                $search.Text = 'com.example.app'
+                $filter.Checked = $true
+                if ($fixture.BuiltInAction -eq 'remove') {
+                    Check ($list.Items.Count -eq 1 -and $remove.Enabled) 'Built-in favorites were not removable'
+                    & $remove.Action
+                    Check ($list.Items.Count -eq 0 -and $script:hiddenBuiltInApps.ContainsKey('com.example.app')) 'Built-in favorite remained in the favorites filter'
+                } else {
+                    Check ($list.Items.Count -eq 0) 'Reopening resurfaced a hidden built-in favorite'
+                }
+                $filter.Checked = $false
+                $addBack = $picker.Controls | Where-Object { $_.Text -ceq '加入常用' }
+                Check ($list.Items.Count -eq 1 -and $addBack.Enabled) 'A removed built-in app was not searchable in the full list'
+                if ($fixture.BuiltInAction -eq 'restore') {
+                    & $addBack.Action
+                    $filter.Checked = $true
+                    Check ($list.Items.Count -eq 1 -and $remove.Enabled -and -not $script:hiddenBuiltInApps.ContainsKey('com.example.app')) 'Built-in favorite was not restored'
+                    Check ($script:customApps.psbase.Count -eq 1) 'Restoring a built-in favorite created a duplicate custom item'
+                }
                 return
             }
             Check (-not $filter.Checked) 'More apps did not initially show installed apps'
@@ -263,7 +303,7 @@ $fixture = @{
             Check ($list.Items.Count -eq 1 -and $picker.AcceptButton.Enabled -and $favorite.Enabled) 'Removing a favorite hid the installed app'
             $filter.Checked = $true
             $search.Text = 'com.example.app'
-            Check ($list.Items.Count -eq 1 -and -not $remove.Enabled -and -not $favorite.Enabled) 'A built-in favorite could be added or removed'
+            Check ($list.Items.Count -eq 1 -and $remove.Enabled -and -not $favorite.Enabled) 'A built-in favorite was not recognized as removable'
             $search.Text = ''
             $fixture.Inputs.Enqueue('Keys')
             $fixture.Inputs.Enqueue('com.example.other')

@@ -26,6 +26,7 @@ function Reset-SettingsState {
     $script:settings = [ordered]@{}
     foreach ($key in $defaults.Keys) { $script:settings[$key] = $defaults[$key] }
     $script:customApps = [ordered]@{}
+    $script:hiddenBuiltInApps = @{}
     $script:knownDevices = [ordered]@{}
     $script:deviceNames = [ordered]@{}
     $script:camResByDevice = [ordered]@{}
@@ -47,6 +48,7 @@ function Check-ValidSettings {
     Check ($script:knownDevices['192.0.2.7:5555'] -ceq '客厅手机' -and
         $script:knownDevices['adb-example._adb-tls-connect._tcp'] -ceq $dateAlias) 'A saved device nickname changed'
     Check ($script:customApps.Count -eq 1 -and $script:customApps['Keys'] -ceq 'com.example.app') 'Custom app entries did not survive'
+    Check ($script:hiddenBuiltInApps.Count -eq 2 -and $script:hiddenBuiltInApps.ContainsKey('com.tencent.mm') -and $script:hiddenBuiltInApps.ContainsKey('com.taobao.taobao')) 'Hidden built-in favorites did not survive or accepted invalid entries'
     Check ($script:deviceNames.Count -eq 1 -and $script:deviceNames['usb-a'] -ceq '备用手机') 'Device labels did not survive'
     Check (($script:autoConnectExclude -join '|') -ceq '192.0.2.7:5555|192.0.2.8:5555') 'The exclusion list was lost or accepted invalid entries'
     Check ($script:camResByDevice.Count -eq 3 -and $script:camResByDevice['usb-a|back'] -ceq '1920x1080' -and
@@ -92,6 +94,7 @@ try {
     "adb-example._adb-tls-connect._tcp": "2026-01-01T00:00:00Z"
   },
   "customApps": {"broken": 1, "Keys": "com.example.app"},
+  "hiddenBuiltInApps": ["com.tencent.mm", ["nested"], 42, " ", "COM.TENCENT.MM", "com.taobao.taobao"],
   "deviceNames": {"broken": false, "usb-a": "备用手机"},
   "autoConnectExclude": ["192.0.2.7:5555", ["bad"], 42, null, "192.0.2.8:5555"],
   "camResByDevice": {
@@ -110,11 +113,18 @@ try {
     Check-ValidSettings
     Check (@(Get-ChildItem -LiteralPath $testRoot -Filter '*.bak').Count -eq 0) 'A recoverable field caused a whole-file backup'
 
+    $script:hiddenBuiltInApps.Remove('com.tencent.mm')
+    Save-Settings
+    Reset-SettingsState
+    Load-Settings
+    Check ($script:hiddenBuiltInApps.Count -eq 1 -and $script:hiddenBuiltInApps.ContainsKey('com.taobao.taobao')) 'Restoring a built-in favorite did not survive a restart'
+
     Reset-SettingsState
     [IO.File]::WriteAllText($cfgPath, '{"maxFps":2147483648,"knownDevices":["wrong shape"],"deviceNames":{"usb-a":"Still here"},"autoConnectExclude":"192.0.2.1:5555"}')
     Load-Settings
     Check ($settings.maxFps -eq $defaults.maxFps -and $script:knownDevices.Count -eq 0) 'Overflow or malformed device map was restored'
     Check ($script:deviceNames['usb-a'] -ceq 'Still here' -and $script:autoConnectExclude[0] -ceq '192.0.2.1:5555') 'Bad map shape prevented other memories from loading'
+    Check ($script:hiddenBuiltInApps.Count -eq 0) 'Legacy settings hid built-in favorites'
 
     foreach ($raw in @('{"knownDevices":{"192.0.2.7:5555":"Original phone"}', '[{"maxSize":720}]')) {
         Reset-SettingsState

@@ -191,6 +191,7 @@ $adb = Join-Path $PSScriptRoot 'adb.exe'
 $cfgPath = Join-Path $PSScriptRoot '投屏助手-设置.json'
 
 $script:customApps = [ordered]@{}   # 用户自定义的常用 App（名称 => 包名），随设置一起存进 投屏助手-设置.json
+$script:hiddenBuiltInApps = @{}    # 按包名记住移除项，避免应用改名后又出现在常用列表。
 $script:knownDevices = [ordered]@{} # 记住的无线设备（ip:port 或 mDNS 标识 => 备注名），连接成功自动记下，供「设备管理」切换/重连
 $script:deviceNames  = [ordered]@{} # 用户自定义的设备显示名（序列号/地址 => 名称），优先于型号显示，可在「设备管理」里重命名
 $script:autoConnectExclude = New-Object System.Collections.Generic.List[string]  # 不自动连接的无线地址（设备管理里可切换）
@@ -1417,6 +1418,9 @@ function Load-Settings {
             if ($entry.Name -and $value) { $maps[$key][$entry.Name] = $value }
         }
     }
+    foreach ($pkg in @($j.PSObject.Properties['hiddenBuiltInApps'].Value)) {
+        if ($pkg -is [string] -and -not [string]::IsNullOrWhiteSpace($pkg)) { $script:hiddenBuiltInApps[$pkg] = $true }
+    }
     foreach ($address in @($j.PSObject.Properties['autoConnectExclude'].Value)) {
         if ($address -is [string] -and $address) { [void]$script:autoConnectExclude.Add($address) }
     }
@@ -1457,6 +1461,7 @@ function Save-Settings {
         $o = [ordered]@{}
         foreach ($k in $settings.Keys) { $o[$k] = $settings[$k] }
         $o['customApps'] = $script:customApps
+        $o['hiddenBuiltInApps'] = @($script:hiddenBuiltInApps.psbase.Keys | Sort-Object)
         $o['knownDevices'] = $script:knownDevices
         $o['deviceNames'] = $script:deviceNames
         $o['autoConnectExclude'] = @($script:autoConnectExclude)
@@ -3335,9 +3340,17 @@ function Show-Settings {
 
 function Add-AppFavorite {
     param($owner, [string]$name, [string]$pkg, [switch]$FromPhone)
-    if ($apps.psbase.Values -contains $pkg -or $script:customApps.psbase.Values -contains $pkg) {
+    $builtInName = foreach ($key in $apps.psbase.Keys) {
+        if ($apps[$key] -eq $pkg) { $key; break }
+    }
+    if (($builtInName -and -not $script:hiddenBuiltInApps.ContainsKey($pkg)) -or $script:customApps.psbase.Values -contains $pkg) {
         [void](Show-ResultDialog $owner '更多应用' '这个应用已在常用列表中' $pkg '' @('ok'))
         return
+    }
+    if ($builtInName) {
+        $script:hiddenBuiltInApps.Remove($pkg)
+        Save-Settings
+        return $builtInName
     }
     if ($apps.Contains($name) -or $script:customApps.Contains($name)) {
         if (-not $FromPhone) {
@@ -3401,25 +3414,27 @@ function Show-AppPicker {
         $btnGo.Enabled = $null -ne $selectedApp
         $btnFavorite.Enabled = $btnGo.Enabled -and -not $selectedApp.Favorite
         $btnFavorite.Text = if ($selectedApp.Favorite) { '已在常用' } else { '加入常用' }
-        $btnRemove.Enabled = [bool]$selectedApp.Removable
+        $btnRemove.Enabled = [bool]$selectedApp.Favorite
     }
     $fill = {
         param([string]$preferredName, [string]$preferredPackage, [switch]$ClearSelection)
         $query = $txt.Text.Trim()
-        $favoritePackages = @{}
+        $listedPackages = @{}
         $entries = @(
             foreach ($map in @($apps, $script:customApps)) {
-                $removable = [object]::ReferenceEquals($map, $script:customApps)
+                $builtIn = [object]::ReferenceEquals($map, $apps)
                 foreach ($name in $map.psbase.Keys) {
                     $pkg = $map[$name]
-                    $favoritePackages[$pkg] = $true
-                    [pscustomobject]@{ Name=$name; Pkg=$pkg; Favorite=$true; Removable=$removable }
+                    $favorite = -not ($builtIn -and $script:hiddenBuiltInApps.ContainsKey($pkg))
+                    if (-not $favorite -and ($chkFavorites.Checked -or $script:customApps.psbase.Values -contains $pkg)) { continue }
+                    $listedPackages[$pkg] = $true
+                    [pscustomobject]@{ Name=$name; Pkg=$pkg; Favorite=$favorite; BuiltIn=$builtIn }
                 }
             }
             if (-not $chkFavorites.Checked) {
                 foreach ($pkg in $installed.psbase.Keys) {
-                    if (-not $favoritePackages.ContainsKey($pkg)) {
-                        [pscustomobject]@{ Name=$installed[$pkg]; Pkg=$pkg; Favorite=$false; Removable=$false }
+                    if (-not $listedPackages.ContainsKey($pkg)) {
+                        [pscustomobject]@{ Name=$installed[$pkg]; Pkg=$pkg; Favorite=$false; BuiltIn=$false }
                     }
                 }
             }
@@ -3458,7 +3473,8 @@ function Show-AppPicker {
     $btnRemove.Add_Click({
         if (-not $btnRemove.Enabled) { return }
         $entry = $shown[$lb.SelectedIndex]
-        $script:customApps.Remove($entry.Name)
+        if ($entry.BuiltIn) { $script:hiddenBuiltInApps[$entry.Pkg] = $true }
+        else { $script:customApps.Remove($entry.Name) }
         Save-Settings
         $result.FavoritesChanged = $true
         # 要先选中下一项再移除，避免连点时误删相邻的收藏。
@@ -3718,11 +3734,14 @@ function Show-NewDisplay {
         $selectedIndex = -1
         $matchingTargetIndex = -1
         $cb.BeginUpdate()
+        $cb.SelectedIndex = -1
         $cb.Items.Clear()
         foreach ($appMap in @($apps, $script:customApps)) {
+            $builtIn = [object]::ReferenceEquals($appMap, $apps)
             foreach ($name in $appMap.psbase.Keys) {
                 $pkg = $appMap[$name]
-                $label = if ([object]::ReferenceEquals($appMap, $script:customApps) -and $apps.Contains($name)) { "$name ($pkg)" } else { $name }
+                if ($builtIn -and $script:hiddenBuiltInApps.ContainsKey($pkg)) { continue }
+                $label = if (-not $builtIn -and $apps.Contains($name)) { "$name ($pkg)" } else { $name }
                 $item = [pscustomobject]@{ Name=$name; Target="+$pkg"; Label=$label; Temporary=$false }
                 $index = $cb.Items.Add($item)
                 if ($item.Target -eq $current.Target) {
@@ -3824,6 +3843,9 @@ function Show-NewDisplay {
         $btnGo = New-PrimaryBtn '打开独立窗口' 16 304 288 38 11
         $dlg.Controls.AddRange(@($l1, $l2, $cb, $btnMore, $btnManual, $lblMode, $cbMode, $chkFixed, $capMode, $lblAudio, $cbAudio, $btnGo))
     }
+
+    $btnGo.Enabled = $cb.SelectedIndex -ge 0
+    $cb.Add_SelectedIndexChanged({ $btnGo.Enabled = $cb.SelectedIndex -ge 0 })
 
     # 空字符串是用户明确清空后的值，不能再用值的真假来判断是否确认过。
     $state = @{ Target = $null; Label = $null; CustomSize = $null; CustomDpi = $null; CustomConfirmed=$false }
