@@ -3333,8 +3333,33 @@ function Show-Settings {
     [void]$dlg.ShowDialog($owner)
 }
 
+function Test-AppInFavorites {
+    param([string]$pkg)
+    return ($apps.psbase.Values -contains $pkg -or $script:customApps.psbase.Values -contains $pkg)
+}
+
+function Add-AppFavorite {
+    param($owner, [string]$name, [string]$pkg, [switch]$FromPhone)
+    if (Test-AppInFavorites $pkg) {
+        [void](Show-ResultDialog $owner '管理常用' '这个应用已在常用列表中' $pkg '' @('ok'))
+        return
+    }
+    if ($apps.Contains($name) -or $script:customApps.Contains($name)) {
+        if (-not $FromPhone) {
+            [void](Show-ResultDialog $owner '管理常用' '这个显示名称已被使用' '请用其他名称添加该应用。' '' @('ok'))
+            return
+        }
+        # 手机上的不同应用可以同名，用包名区分，避免覆盖已有条目。
+        $name = "$name ($pkg)"
+        while ($apps.Contains($name) -or $script:customApps.Contains($name)) { $name += ' ·' }
+    }
+    $script:customApps[$name] = $pkg
+    Save-Settings
+    return $name
+}
+
 # ---------------- 从手机已装 App 里挑一个（可搜索） ----------------
-# 用 scrcpy --list-apps 取得显示名和包名，避免同名应用选错。取消时返回 $null。
+# 用 scrcpy --list-apps 取得显示名和包名，避免同名应用选错。
 function Show-AppPicker {
     param($owner, $serial, [switch]$AddToFavorites)
     $title = if ($AddToFavorites) { '从手机添加' } else { '更多应用' }
@@ -3376,6 +3401,24 @@ function Show-AppPicker {
     $lblEmpty.Visible = $false
 
     $shown = New-Object System.Collections.ArrayList
+    $result = @{ SelectedApp=$null; AddedName=$null }
+    $btnGo = $null
+    if ($AddToFavorites) {
+        $btnFavorite = New-PrimaryBtn '加入常用' 16 342 218 34 10
+    } else {
+        $btnGo = New-PrimaryBtn '选择应用' 16 342 108 34 10
+        $btnFavorite = New-SecondaryBtn '加入常用' 132 342 104 34
+    }
+    $btnClose = New-SecondaryBtn '关闭' 242 342 82 34
+    $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+    $syncButtons = {
+        $hasSelection = $lb.SelectedIndex -ge 0 -and $lb.SelectedIndex -lt $shown.Count
+        $alreadyFavorite = $hasSelection -and (Test-AppInFavorites $shown[$lb.SelectedIndex].Pkg)
+        if ($btnGo) { $btnGo.Enabled = $hasSelection }
+        $btnFavorite.Enabled = $hasSelection -and -not $alreadyFavorite
+        $btnFavorite.Text = if ($alreadyFavorite) { '已在常用' } else { '加入常用' }
+    }
     $fill = {
         param($q)
         $ql = ([string]$q).ToLower()   # 字面子串匹配（大小写不敏感）：避免把 [ 等当通配符导致 -like 抛异常
@@ -3389,36 +3432,44 @@ function Show-AppPicker {
         $lb.EndUpdate()
         $has = $lb.Items.Count -gt 0
         if ($has) { $lb.SelectedIndex = 0 }
-        if ($lblEmpty) { $lblEmpty.Visible = -not $has }
-        if ($btnGo) { $btnGo.Enabled = $has }
+        $lblEmpty.Visible = -not $has
+        & $syncButtons
     }
-    $btnText = if ($AddToFavorites) { '加入常用' } else { '选择应用' }
-    $btnGo = New-PrimaryBtn $btnText 16 342 218 34 10
-    $btnCancel = New-SecondaryBtn '取消' 242 342 82 34
-    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     & $fill ''
     $txt.Add_TextChanged({ & $fill $txt.Text.Trim() })
-
-    $result = @{ app = $null }
-    $pick = {
-        if ($lb.SelectedIndex -lt 0 -or $lb.SelectedIndex -ge $shown.Count) { return }
-        $result.app = $shown[$lb.SelectedIndex]
-        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
-    }
-    $btnGo.Add_Click($pick)
-    $lb.Add_MouseDoubleClick({
-        param($sender, $mouseEvent)
-        $index = $sender.IndexFromPoint($mouseEvent.Location)
-        if ($index -lt 0) { return }
-        $sender.SelectedIndex = $index
-        & $pick
+    $lb.Add_SelectedIndexChanged($syncButtons)
+    $btnFavorite.Add_Click({
+        if (-not $btnFavorite.Enabled) { return }
+        $app = $shown[$lb.SelectedIndex]
+        $added = Add-AppFavorite $dlg $app.Name $app.Pkg -FromPhone
+        if ($added) { $result.AddedName = $added }
+        & $syncButtons
     })
-    $dlg.Controls.AddRange(@($lbl, $txt, $lb, $lblEmpty, $btnGo, $btnCancel))
+    $dlg.Controls.AddRange(@($lbl, $txt, $lb, $lblEmpty))
+    $dlg.AcceptButton = $btnFavorite
+    $dlg.CancelButton = $btnClose
+    if ($btnGo) {
+        $pick = {
+            if ($lb.SelectedIndex -lt 0 -or $lb.SelectedIndex -ge $shown.Count) { return }
+            $result.SelectedApp = $shown[$lb.SelectedIndex]
+            $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        }
+        $btnGo.Add_Click($pick)
+        $lb.Add_MouseDoubleClick({
+            param($sender, $mouseEvent)
+            $index = $sender.IndexFromPoint($mouseEvent.Location)
+            if ($index -lt 0) { return }
+            $sender.SelectedIndex = $index
+            & $pick
+        })
+        [void]$dlg.Controls.Add($btnGo)
+        $dlg.AcceptButton = $btnGo
+    }
+    $dlg.Controls.AddRange(@($btnFavorite, $btnClose))
     $lblEmpty.BringToFront()
-    $dlg.AcceptButton = $btnGo
-    $dlg.CancelButton = $btnCancel
-    if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { return $result.app }
-    return $null
+    # 关闭时仍须把新收藏通知父窗，已保存的收藏不依赖选择应用的结果。
+    [void]$dlg.ShowDialog($owner)
+    return $result
 }
 
 # ---------------- 管理「我的常用应用」：用户自己增删常用 App ----------------
@@ -3452,32 +3503,13 @@ function Show-ManageApps {
     $lb.Add_SelectedIndexChanged({ $btnDel.Enabled = $lb.SelectedIndex -ge 0 })
     & $refresh
 
-    $addFavorite = {
-        param([string]$name, [string]$pkg, [switch]$FromPhone)
-        if ($apps.Values -contains $pkg -or $script:customApps.psbase.Values -contains $pkg) {
-            [void](Show-ResultDialog $dlg '管理常用' '这个应用已在常用列表中' $pkg '' @('ok'))
-            return
-        }
-        if ($apps.Contains($name) -or $script:customApps.Contains($name)) {
-            if (-not $FromPhone) {
-                [void](Show-ResultDialog $dlg '管理常用' '这个显示名称已被使用' '请用其他名称添加该应用。' '' @('ok'))
-                return
-            }
-            # 手机上的不同应用可以同名，用包名区分，避免覆盖已有条目。
-            $name = "$name ($pkg)"
-            while ($apps.Contains($name) -or $script:customApps.Contains($name)) { $name += ' ·' }
-        }
-        $script:customApps[$name] = $pkg
-        Save-Settings
-        & $refresh $name
-    }
     $addState = @{ Busy=$false }
     $btnFromPhone.Add_Click({
         if ($addState.Busy) { return }
         $addState.Busy = $true
         try {
-            $app = Show-AppPicker $dlg $serial -AddToFavorites
-            if ($app) { & $addFavorite $app.Name $app.Pkg -FromPhone }
+            $picked = Show-AppPicker $dlg $serial -AddToFavorites
+            if ($picked.AddedName) { & $refresh $picked.AddedName }
         } finally { $addState.Busy = $false }
     })
     $btnAdd.Add_Click({
@@ -3490,7 +3522,8 @@ function Show-ManageApps {
             [void](Show-ResultDialog $dlg '手动添加' '请输入有效的包名' '例如 com.ss.android.lark。' '' @('ok'))
             return
         }
-        & $addFavorite $name.Trim() $pkg
+        $added = Add-AppFavorite $dlg $name.Trim() $pkg
+        if ($added) { & $refresh $added }
     })
     $btnDel.Add_Click({
         $keys = @($script:customApps.psbase.Keys)
@@ -3761,8 +3794,13 @@ function Show-NewDisplay {
         if ($appActionState.Busy) { return }
         $appActionState.Busy = $true
         try {
-            $app = Show-AppPicker $dlg $serial
-            if ($app) { & $refreshApps ([pscustomobject]@{ Name=$app.Name; Target="+$($app.Pkg)"; Label=$app.Name; Temporary=$true }) }
+            $picked = Show-AppPicker $dlg $serial
+            $app = $picked.SelectedApp
+            if ($app) {
+                & $refreshApps ([pscustomobject]@{ Name=$app.Name; Target="+$($app.Pkg)"; Label=$app.Name; Temporary=$true })
+            } elseif ($picked.AddedName) {
+                & $refreshApps
+            }
         } finally { $appActionState.Busy = $false }
     })
     $btnManual.Add_Click({

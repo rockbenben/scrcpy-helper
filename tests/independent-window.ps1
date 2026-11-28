@@ -5,7 +5,7 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path (Split-Path $PSScriptRoot) 'scrcpy-helper.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join "`n") }
 foreach ($name in @(
-    'Show-NewDisplay','Show-AppPicker','Show-ManageApps','Get-NewDisplayArgs','Get-DisplayCompatibilityArgs','Get-HwDecArgs',
+    'Show-NewDisplay','Show-AppPicker','Show-ManageApps','Test-AppInFavorites','Add-AppFavorite','Get-NewDisplayArgs','Get-DisplayCompatibilityArgs','Get-HwDecArgs',
     'Get-VideoArgs','Get-ControlArgs','New-Lbl','New-Combo','New-Chk','New-Caption','New-Txt'
 )) {
     $definition = $ast.Find({ param($node)
@@ -162,7 +162,11 @@ $fixture = @{
             & $more.Action
             Check ($appsCombo.SelectedItem.Target -ceq '+com.example.app') 'Cancel changed the selected app'
             & $more.Action
-            Check ($fixture.Starts -eq 0 -and $fixture.Saves -eq 0 -and $script:customApps.Count -eq 0) 'Browsing launched or saved an app'
+            Check ($fixture.Starts -eq 0 -and $fixture.Saves -eq 1) 'Adding a favorite launched an app or failed to save'
+            Check ($appsCombo.SelectedItem.Target -ceq '+com.example.app') 'Adding a favorite changed the selected app'
+            Check ($appsCombo.Items.Target -ccontains '+com.example.third') 'The newly added favorite did not appear in the app dropdown'
+            & $more.Action
+            Check ($fixture.Starts -eq 0 -and $fixture.Saves -eq 1) 'Selecting an app launched or saved it prematurely'
             Check ($appsCombo.SelectedItem.Target -ceq '+com.example.second') 'Selecting an installed app lost its package'
             Check ($appsCombo.GetItemText($appsCombo.SelectedItem) -ceq 'Test app (com.example.second)') 'Same-name apps were not distinguished in the dropdown'
             & $window.AcceptButton.Action
@@ -172,8 +176,21 @@ $fixture = @{
             $fixture.Visits++
             if ($fixture.Visits -eq 1) { return }
             $search = $picker.Controls | Where-Object { $_ -is [Windows.Forms.TextBox] }
+            $favorite = $picker.Controls | Where-Object { $_.Text -cin @('加入常用','已在常用') }
             $search.Text = '['
-            Check (-not $picker.AcceptButton.Enabled) 'An unmatched search allowed selection'
+            Check (-not $picker.AcceptButton.Enabled -and -not $favorite.Enabled) 'An unmatched search allowed selection or saving'
+            if ($fixture.Visits -eq 2) {
+                $search.Text = 'com.example.third'
+                Check $favorite.Enabled 'A new app could not be added from More apps'
+                & $favorite.Action
+                Check ($picker.DialogResult -eq [Windows.Forms.DialogResult]::Cancel -and $search.Text -ceq 'com.example.third') 'Adding a favorite closed the picker or reset the search'
+                Check ($favorite.Text -ceq '已在常用' -and -not $favorite.Enabled) 'A saved favorite remained actionable'
+                & $favorite.Action
+                Check ($fixture.Saves -eq 1 -and $fixture.Starts -eq 0) 'Adding twice wrote a duplicate or launched scrcpy'
+                return
+            }
+            $search.Text = 'com.example.third'
+            Check ($favorite.Text -ceq '已在常用' -and -not $favorite.Enabled -and $picker.AcceptButton.Enabled) 'A saved app could not still be selected on reopening'
             $search.Text = 'com.example.second'
             Check ($picker.AcceptButton.Enabled) 'Package-name search did not find the matching app'
             & $picker.AcceptButton.Action
@@ -190,6 +207,7 @@ try {
     }
 }
 
+$script:customApps.Clear()
 $script:customApps['Keys'] = 'com.example.saved'
 $fixture = @{
     Scans=0; Pickers=0; Starts=0; Saves=0
@@ -218,7 +236,7 @@ $fixture = @{
             & $fromPhone.Action
             Check ($script:customApps['Test app (com.example.second)'] -ceq 'com.example.second') 'Adding a same-name favorite overwrote or lost an app'
             & $fromPhone.Action
-            Check ($fixture.Saves -eq 1 -and $fixture.Heading -ceq '这个应用已在常用列表中') 'A duplicate package was saved'
+            Check ($fixture.Saves -eq 1) 'A duplicate package was saved'
             $fixture.Inputs.Enqueue('Keys')
             $fixture.Inputs.Enqueue('com.example.other')
             & $manualAdd.Action
@@ -234,10 +252,14 @@ $fixture = @{
         }
         '从手机添加' = {
             param($picker)
-            Check ($picker.AcceptButton.Text -ceq '加入常用') 'Favorite picker did not identify the effect of confirming'
             $search = $picker.Controls | Where-Object { $_ -is [Windows.Forms.TextBox] }
             $search.Text = 'com.example.second'
-            & $picker.AcceptButton.Action
+            if ($fixture.Saves -eq 0) {
+                Check ($picker.AcceptButton.Text -ceq '加入常用' -and $picker.AcceptButton.Enabled) 'Favorite picker did not identify the effect of confirming'
+                & $picker.AcceptButton.Action
+            } else {
+                Check ($picker.AcceptButton.Text -ceq '已在常用' -and -not $picker.AcceptButton.Enabled) 'Favorite picker allowed a duplicate package'
+            }
         }
     }
 }
