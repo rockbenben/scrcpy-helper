@@ -152,6 +152,14 @@ jobs:
         shell: pwsh
         run: ./tests/device-query-status.ps1
 
+      - name: Main window restore regression with Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/main-window-restore.ps1
+
+      - name: Main window restore regression with PowerShell 7
+        shell: pwsh
+        run: ./tests/main-window-restore.ps1
+
       - name: Automatic connection exclusion regression with Windows PowerShell 5.1
         shell: powershell
         run: ./tests/auto-connect-exclusion.ps1

@@ -5,7 +5,7 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path (Split-Path $PSScriptRoot) 'scrcpy-helper.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join "`n") }
 foreach ($name in @('Start-DeviceScan','Start-UiTask','Complete-MainFlow','Reconnect-LastAsync','Wait-DeviceScan','Invoke-DeviceScan',
-        'Test-Wireless','Test-TcpAddress','Test-MdnsSerial')) {
+        'Test-Wireless','Test-TcpAddress','Test-MdnsSerial','Update-FmDeviceList','Update-FmButtons')) {
     $definition = $ast.Find({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true)
@@ -286,6 +286,7 @@ foreach ($case in $results) {
     $btnUpload = @{ Enabled=$true }; $btnNew = @{ Enabled=$true }
     $btnDownload = @{}; $btnDel = @{}; $btnRename = @{}; $btnUp = @{}; $btnGo = @{}
     $lnkHome = @{}; $lnkDl = @{}; $lnkDcim = @{}; $lnkPic = @{}; $lnkRoot = @{}
+    $deviceControls = @($btnUpload, $btnNew, $btnGo, $txtPath, $lnkHome, $lnkDl, $lnkDcim, $lnkPic, $lnkRoot)
     $script:fmShellMode = 'cached'
     & $refreshButton
     Check ($fixture.QueryErrors -eq [int]($case.Outcome -eq 'failed')) "File manager query feedback was wrong for $label"

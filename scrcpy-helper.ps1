@@ -6871,7 +6871,14 @@ try {
     $form.Controls.Add($pnlFooter)
 
     # 动态布局：设备卡（无副条 / 引导条 / 运行条）展开或收起时，保持等比间距并调整窗口高度
+    $script:mainLayoutPending = $false
     $layoutMainBody = {
+        # 最小化时 ClientSize 可能变成 0，写回去会挤窄还原后的窗体；隐藏时子控件的 Visible 也会变成 false。
+        if (-not $form.Visible -or $form.WindowState -ne [System.Windows.Forms.FormWindowState]::Normal) {
+            $script:mainLayoutPending = $true
+            return
+        }
+        $script:mainLayoutPending = $false
         $s = $script:dpiScale
         $g12 = [int][Math]::Round(12 * $s)
         $g10 = [int][Math]::Round(10 * $s)
@@ -8021,6 +8028,7 @@ try {
         $tray.Visible = $false
         $form.Show()
         $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+        if ($script:mainLayoutPending) { & $layoutMainBody }
         $form.Activate()
     }
     $miTrayRestore.Add_Click($restoreFromTray)
@@ -8061,9 +8069,13 @@ try {
     # Win11 习惯：单击托盘图标也还原；右键仍由系统弹菜单
     $tray.Add_MouseClick({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { & $restoreFromTray } })
     $miTrayExit.Add_Click({ $form.Close() })
-    # 最小化时收进托盘：延迟到本轮 Resize 消息处理完再 Hide，避免在系统最小化过程中同步隐藏
+    # 等 Windows 完成尺寸切换后，再布局或隐藏窗体。
     $form.Add_Resize({
-        if ($settings.minToTray -and $form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+        if ($script:mainLayoutPending -and $form.WindowState -eq [System.Windows.Forms.FormWindowState]::Normal) {
+            [void]$form.BeginInvoke([System.Action]{
+                if (-not $form.IsDisposed -and $script:mainLayoutPending) { & $layoutMainBody }
+            })
+        } elseif ($settings.minToTray -and $form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
             [void]$form.BeginInvoke([System.Action]{
                 if (-not $form.IsDisposed -and $settings.minToTray -and $form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
                     $form.Hide()
