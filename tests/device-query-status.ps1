@@ -86,6 +86,9 @@ function Invoke-ShortCommand {
     Check ($FilePath -ceq $adb -and ($ArgumentList -join ' ') -ceq 'devices') 'Unexpected ADB command'
     $result = @{ Started=$true; ExitCode=0; TimedOut=$false; Cancelled=$false; Stdout=''; Stderr=''; Error='' }
     $command = if ($fixture.Commands) { $fixture.Commands.Dequeue() } else { $fixture.Command }
+    if ($command.ReadyAfterMs -gt $TimeoutMs) {
+        return [pscustomobject]@{ Started=$true; TimedOut=$true; Cancelled=$false; ExitCode=$null; Stdout=''; Stderr=''; Error='' }
+    }
     foreach ($key in $command.Keys) { $result[$key] = $command[$key] }
     $Control.Cancelled = $result.Cancelled
     return [pscustomobject]$result
@@ -241,6 +244,12 @@ function Fm-ListDir {
         $fixture.ScanInputs = $Inputs
     }
     Start-DeviceScan -Owner $form -Kind 'status'
+    $fixture.Command = @{ ReadyAfterMs=5200; Stdout="${header}old-usb`tdevice`r`n" }
+    $scanInputs = $fixture.ScanInputs
+    $result = Invoke-DeviceScan @scanInputs -InfoCache $script:devInfo -Control @{ Cancelled=$false }
+    Check ($result.Success -and $result.Devices -contains 'old-usb') 'A slow ADB cold start was interrupted before the USB device could appear'
+    $result = Wait-DeviceScan $form
+    Check ($result.Success -and $result.Devices -contains 'old-usb') 'A manual device query interrupted a slow ADB cold start'
     foreach ($second in @(@{ Stdout=$header }, @{ ExitCode=1; Stderr='still unavailable' })) {
         $fixture.Commands = [Collections.Queue]::new()
         $fixture.Commands.Enqueue(@{ TimedOut=$true })

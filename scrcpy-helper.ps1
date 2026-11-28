@@ -271,7 +271,8 @@ function Invoke-DeviceScan {
         return (Invoke-ShortCommand -FilePath $AdbPath -ArgumentList $Arguments -TimeoutMs ([Math]::Min($Limit,$left)) -Control $Control)
     }
     function Read-Devices {
-        $r = Run-Adb @('devices')
+        # 冷启动时 ADB 要初始化 USB 才回报就绪；3 秒可能先杀掉等回执的客户端，连带服务崩溃。
+        $r = Run-Adb @('devices') 7000
         if ($r.Cancelled) { $scan.Cancelled = $true; return $false }
         if (-not $r.Started -or $r.ExitCode -ne 0 -or $r.TimedOut -or $r.Stdout -notmatch '(?m)^List of devices attached[ \t]*\r?$') {
             $scan.Error = if ($r.Error) { $r.Error }
