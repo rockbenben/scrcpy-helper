@@ -1,10 +1,12 @@
 . (Join-Path $PSScriptRoot 'file-manager-test-support.ps1')
-$download = [scriptblock]::Create((Get-FileManagerAction 'doDownload').Replace('New-Object System.Windows.Forms.FolderBrowserDialog', 'New-TestFolderDialog'))
+. (Get-TestFolderPicker)
+$download = [scriptblock]::Create((Get-FileManagerAction 'doDownload'))
 $upload = [scriptblock]::Create((Get-FileManagerAction 'doUpload'))
 $dlg = @{ Visible=$true; IsDisposed=$false }
 $state = @{ Serial='fixture'; Path='/sdcard' }
-$lblInfo = @{}; $progState = @{}
-$beginProgress = {}; $endProgress = {}; $setDeviceLock = {}; $refresh = {}
+$lblInfo = @{}; $cmbDev = @{ Enabled=$true }; $refresh = {}
+$progState = @{ Bar=[Windows.Forms.ProgressBar]::new(); Pct=[Windows.Forms.Label]::new() }
+$settings = @{ lastDownloadDir=$root }
 $cGreen = [Drawing.Color]::Green; $cRed = [Drawing.Color]::Red
 $fixture = @{}
 function Reset-Fixture([string]$Name) {
@@ -14,14 +16,22 @@ function Reset-Fixture([string]$Name) {
     $fixture.Confirmations=[Collections.ArrayList]::new()
     $fixture.Writes=[Collections.ArrayList]::new()
     $dlg.Visible=$true; $dlg.IsDisposed=$false
+    $state.Serial='fixture'; $state.Path='/sdcard'; $cmbDev.Enabled=$true
     $path = Join-Path $root $Name
     [void][IO.Directory]::CreateDirectory($path)
     return $path
 }
 function New-TestFolderDialog {
     $dialog = [pscustomobject]@{ SelectedPath=$selected; Description=''; ShowNewFolderButton=$false }
-    $dialog | Add-Member ScriptMethod ShowDialog { param($owner) return [Windows.Forms.DialogResult]::OK }
-    $dialog | Add-Member ScriptMethod Dispose {}
+    $dialog | Add-Member ScriptMethod ShowDialog {
+        param($owner)
+        $fixture.InitialFolder = $this.SelectedPath
+        if ($fixture.CancelFolder) { return [Windows.Forms.DialogResult]::Cancel }
+        if ($fixture.ChangeSelection) { $state.Serial = 'other'; $lv.SelectedItems = @() }
+        $this.SelectedPath = $selected
+        return [Windows.Forms.DialogResult]::OK
+    }
+    $dialog | Add-Member ScriptMethod Dispose { $fixture.FolderDisposed = $true }
     return $dialog
 }
 function Show-ResultDialog {
@@ -57,6 +67,8 @@ function Invoke-FmTask {
 function Fm-Transfer {
     param($Argv, $dlg, $status, $tip, $prog, $WorkingDirectory)
     $fixture.Transfers++
+    Check ($Argv[0] -ceq '-s' -and $Argv[1] -ceq 'fixture') 'Transfer reread the active device after the request started'
+    Check (-not $cmbDev.Enabled -and $prog.Bar.Visible) 'Transfer did not lock the device or show progress'
     if ($Argv[2] -eq 'push') {
         Check ($Argv[-1] -ceq ($fixture.Stage + '/')) 'ADB push must only write to this transfer staging directory'
         if ($fixture.UploadLate) { $fixture.Remote[$fixture.UploadLate]='FM_FILE' }
@@ -80,6 +92,12 @@ $files = @(
     [pscustomobject]@{ Tag=@{ Name='a.txt'; Path='/sdcard/a.txt'; IsDir=$false; IsLink=$false; Size='8' } },
     [pscustomobject]@{ Tag=@{ Name='b.txt'; Path='/sdcard/b.txt'; IsDir=$false; IsLink=$false; Size='8' } }
 )
+$selected = Reset-Fixture 'cancel-folder'
+$lv = @{ SelectedItems=$files }
+$fixture.CancelFolder = $true
+& $download
+Check ($fixture.InitialFolder -eq $root -and $fixture.FolderDisposed -and $settings.lastDownloadDir -eq $root -and
+    $fixture.Checks -eq 0 -and $fixture.Transfers -eq 0) 'Cancelling the folder chooser changed settings or started the request'
 foreach ($case in @('new', 'overwrite', 'skip', 'cancel', 'late-yes', 'late-skip', 'late-cancel', 'race', 'linked-root')) {
     $physical = Reset-Fixture $case
     $selected = $physical
@@ -89,6 +107,7 @@ foreach ($case in @('new', 'overwrite', 'skip', 'cancel', 'late-yes', 'late-skip
     }
     if ($case -notin @('new', 'race', 'linked-root')) { [IO.File]::WriteAllText((Join-Path $physical 'a.txt'), 'old-a') }
     $fixture.InjectLate = $case.StartsWith('late-')
+    $fixture.ChangeSelection = $case -eq 'new'
     $fixture.RaceOnCommit = ($case -eq 'race')
     if ($case -eq 'skip') { $fixture.Choices=@('skip') }
     if ($case -eq 'cancel') { $fixture.Choices=@('cancel') }
@@ -96,6 +115,7 @@ foreach ($case in @('new', 'overwrite', 'skip', 'cancel', 'late-yes', 'late-skip
     if ($case -eq 'late-cancel') { $fixture.Choices=@('overwrite', 'cancel') }
     $lv = @{ SelectedItems=$files }
     & $download
+    Check ($settings.lastDownloadDir -eq $selected -and $cmbDev.Enabled -and -not $progState.Bar.Visible) 'Download did not remember the folder or clear its busy state'
     $a = Join-Path $physical 'a.txt'; $b = Join-Path $physical 'b.txt'
     if ($case -eq 'cancel') {
         Check ($fixture.Transfers -eq 0 -and [IO.File]::ReadAllText($a) -eq 'old-a') 'Cancel changed an existing file'
@@ -126,6 +146,8 @@ foreach ($phase in @('snapshot', 'transfer', 'conflicts', 'copy')) {
 function Fm-Shell {
     param($Serial, $Command, $Owner)
     $fixture.Checks++
+    Check ($Serial -ceq 'fixture') 'Upload checks did not use the request device'
+    if ($fixture.ChangeSelection) { $state.Serial = 'other'; $state.Path = '/other' }
     if ($fixture.CloseAt -eq $fixture.Checks) {
         $fixture.Closed=$true; $dlg.IsDisposed=$true; $dlg.Visible=$false
         return @()
@@ -152,6 +174,7 @@ function Get-FixtureUploadPath([string]$Command) {
 }
 function Fm-ShellLong {
     param($Serial, $Command, $Owner, $Status, $Tip)
+    Check ($Serial -ceq 'fixture' -and $Command.StartsWith("cd '/sdcard'")) 'Upload commit did not use the request device and directory'
     $path = Get-FixtureUploadPath $Command
     $staged = $fixture.Stage + $path.Substring('/sdcard'.Length)
     Check ($Command.Contains((Fm-ShQuote $staged))) 'Commit did not use the staged file for this path'
@@ -177,6 +200,7 @@ foreach ($name in @('nested/child.txt', 'new.txt', 'late.txt')) {
 }
 foreach ($case in @('new-file', 'overwrite-file', 'skip-file', 'cancel-file', 'new-folder', 'merge-folder', 'merge-skip', 'merge-late-skip', 'merge-late-yes', 'link-file', 'nested-link', 'close-first-check', 'close-second-check', 'close-during-push')) {
     $null = Reset-Fixture ('upload-' + $case)
+    $fixture.ChangeSelection = $case -eq 'new-file'
     $path = if ($case -match 'folder|^merge-|nested-link|close-second-check') { $folder } else { $local }
     $remote = Fm-ChildPath '/sdcard' ([IO.Path]::GetFileName($path))
     $conflict = "$remote/nested/child.txt"

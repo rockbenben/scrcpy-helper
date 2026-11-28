@@ -5571,6 +5571,416 @@ function Fm-Transfer {
     return @{ Ok = ($code -eq 0 -and -not $aborted); Code = $code; Aborted = $aborted; Detail = (($out + "`n" + $err).Trim()) }
 }
 
+function Get-FmNavigationPath {
+    param([string]$path, [string]$currentPath, [switch]$FromPathBox)
+    # 继续容忍手输时贴进来的外侧空白，但路径框原样回车应重新打开当前目录。
+    if ($FromPathBox -and $path -cne $currentPath) { $path = $path.Trim() }
+    return (Fm-NormPath $path)
+}
+
+function Get-FmSelectedFolderPath {
+    param($selectedItems)
+    # 跟原来的双击保持一致：只有「恰好选中一项，且是文件夹 / 链接」才算有目标。
+    # 多选、选中的是文件、空目录占位行都返回 $null —— 不猜意图，也就不会误进别的目录。
+    if ($selectedItems.Count -ne 1) { return $null }
+    $t = $selectedItems[0].Tag
+    if ($t -and ($t.IsDir -or $t.IsLink)) { return $t.Path }
+    return $null
+}
+
+function Select-FmUploadPaths {
+    param($dlg)
+    $ofd = New-Object System.Windows.Forms.OpenFileDialog
+    $ofd.Title = '选择要传到手机的文件（可多选）'
+    $ofd.Multiselect = $true
+    $ofd.Filter = '所有文件 (*.*)|*.*'
+    try {
+        if ($ofd.ShowDialog($dlg) -eq [System.Windows.Forms.DialogResult]::OK) { return @($ofd.FileNames) }
+    } finally { $ofd.Dispose() }
+}
+
+function Select-FmDownloadFolder {
+    param($dlg, [int]$count, $settings)
+    $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+    $fbd.Description = "选择保存到电脑的文件夹（共 $count 项）"
+    $fbd.ShowNewFolderButton = $true
+    if ($settings -and $settings.lastDownloadDir -and (Test-Path -LiteralPath $settings.lastDownloadDir -PathType Container)) { $fbd.SelectedPath = $settings.lastDownloadDir }
+    try {
+        if ($fbd.ShowDialog($dlg) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        $dest = $fbd.SelectedPath
+    } finally { $fbd.Dispose() }
+    if (-not (Test-Path -LiteralPath $dest)) { return }
+    if ($settings -and $settings.lastDownloadDir -ne $dest) {
+        $settings.lastDownloadDir = $dest
+        if (Get-Command Save-Settings -ErrorAction SilentlyContinue) { Save-Settings }
+    }
+    return $dest
+}
+
+function New-FmWindowState {
+    param([string[]]$devices, [string]$selectedSerial, [string]$defaultSerial)
+    $startSerial = if ($selectedSerial -and ($devices -contains $selectedSerial)) { $selectedSerial }
+        elseif ($defaultSerial -and ($devices -contains $defaultSerial)) { $defaultSerial }
+        else { $devices[0] }
+    return @{ Path = '/sdcard'; Serial = $startSerial; Serials = @($devices); Rebuilding = $false; DropPaths = @() }
+}
+
+function Update-FmDeviceList {
+    param($state, $cmbDev, $devices)
+    $state.Rebuilding = $true
+    try {
+        $state.Serials = @($devices)
+        $cmbDev.Items.Clear()
+        foreach ($s in $state.Serials) { [void]$cmbDev.Items.Add("$(Get-FriendlyName $s -CachedOnly)   ·   $s") }
+        $j = [array]::IndexOf($state.Serials, $state.Serial)
+        if ($j -lt 0 -and $state.Serials.Count -gt 0) { $j = 0 }
+        $state.Serial = if ($j -ge 0) { $state.Serials[$j] } else { '' }
+        $cmbDev.SelectedIndex = $j
+    } finally { $state.Rebuilding = $false }
+}
+
+function Set-FmSelectedDevice {
+    param($state, $cmbDev, $lblInfo, [bool]$busy)
+    if ($state.Rebuilding -or $cmbDev.SelectedIndex -lt 0) { return $false }
+    $pick = [string]$state.Serials[$cmbDev.SelectedIndex]
+    # 等待 ADB 时仍可能收到切换事件，忙时拨回原设备，避免影响当前批次。
+    if ($busy) {
+        if ($pick -ne $state.Serial) {
+            $j = [array]::IndexOf($state.Serials, $state.Serial)
+            if ($j -ge 0 -and $j -ne $cmbDev.SelectedIndex) {
+                $state.Rebuilding = $true
+                try { $cmbDev.SelectedIndex = $j } finally { $state.Rebuilding = $false }
+            }
+            try {
+                $lblInfo.ForeColor = $cMuted
+                $lblInfo.Text = '正在处理，等这一批完成再切换设备'
+            } catch {}
+        }
+        return $false
+    }
+    $state.Serial = $pick
+    return $true
+}
+
+function Start-FmProgress {
+    param($progState, [int]$count)
+    $bar = $progState.Bar
+    $pct = $progState.Pct
+    $progState.Total = [Math]::Max(1, $count)
+    $progState.Index = 0
+    $bar.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+    $bar.Value = 0
+    $pct.Text = '0%'
+    $bar.Visible = $true; $pct.Visible = $true
+    $bar.Refresh(); $pct.Refresh()
+}
+
+function Complete-FmProgress {
+    param($progState, [bool]$allOk)
+    $bar = $progState.Bar
+    $pct = $progState.Pct
+    # 成功才归到满格再隐藏：单项传输可能 120ms 内就结束、一次 tick 都没赶上，也别留下半截的条；
+    # 有失败项时不冒充 100%，直接收起，错误详情由下面的结果弹窗负责。
+    try {
+        if ($allOk -and $bar.Visible) {
+            $bar.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+            $bar.Value = 100; $pct.Text = '100%'
+            $bar.Refresh(); $pct.Refresh()
+        }
+    } catch {}
+    try { $bar.Visible = $false; $pct.Visible = $false; $pct.Text = '' } catch {}
+}
+
+# 等待 adb 时会泵消息，锁控件与设备切换的事件守卫配合，避免一批操作跑到两台手机上。
+function Set-FmDeviceLock {
+    param($dlg, $cmbDev, [bool]$on)
+    try {
+        if ($dlg.IsDisposed) { return }
+        $cmbDev.Enabled = (-not $on)
+    } catch {}
+}
+
+function Update-FmButtons {
+    param($state, $lv, $deviceControls, $btnDownload, $btnDel, $btnRename, $btnUp)
+    # 框选松手时会批量改 Selected，会逐项触发 SelectedIndexChanged；那期间跳过重算，结束后手动调一次。
+    if ($state.RubberBusy) { return }
+    # 刷新确认没有设备后仍可留在窗口等待重连，但此时没有文件操作目标。
+    $hasDevice = [bool]$state.Serial
+    foreach ($control in $deviceControls) {
+        $control.Enabled = $hasDevice
+    }
+    $lv.AllowDrop = $hasDevice
+    $sel = @($lv.SelectedItems | Where-Object { $_.Tag })
+    $btnDownload.Enabled = ($sel.Count -gt 0)
+    $btnDel.Enabled = ($sel.Count -gt 0)
+    # 重命名只认恰好一项：多选时没有一个明确的「旧名字」，按钮和 F2 一起禁用。
+    $btnRename.Enabled = ($sel.Count -eq 1)
+    $btnUp.Enabled = ($hasDevice -and $state.Path -ne '/')
+}
+
+function Get-FmUploadPaths {
+    param($paths)
+    # 去掉结尾的 \ / 再取名字：盘符根 C:\ 的 GetFileName 是空串，直接 push 会把整个盘推上去。
+    return @($paths | Where-Object { $_ } | ForEach-Object {
+        $t = ([string]$_).TrimEnd([char[]]@([char]92, [char]47))
+        if ($t -and (Test-Path -LiteralPath $t) -and [System.IO.Path]::GetFileName($t)) { $t }
+    })
+}
+
+function Invoke-FmUploadRequest {
+    param($request, $dlg, $lblInfo, $progState, $cmbDev, [scriptblock]$refresh)
+    $batchSerial = $request.Serial
+    $batchPath = $request.Path
+    $list = $request.Paths
+    $names = @($list | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+    try { Assert-FmNames $names } catch {
+        [void](Show-ResultDialog $dlg '上传' '请先处理重名或不支持的名称' $_.Exception.Message '' @('ok'))
+        return
+    }
+    $fail = @(); $aborted = $false
+    Start-FmProgress $progState $list.Count
+    try {
+        Set-FmDeviceLock $dlg $cmbDev $true
+        $plans = @()
+        foreach ($f in $list) {
+            $name = [System.IO.Path]::GetFileName($f)
+            if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; return }
+            $snapshot = Invoke-FmTask $dlg -Functions @('Fm-ValidName','Assert-FmNames','Get-FmUploadTree') -Inputs @{ Local=$f; Name=$name } -Work {
+                try {
+                    $item = Get-Item -LiteralPath $Inputs.Local -Force -ErrorAction Stop
+                    $entries = @(Get-FmUploadTree $item $Inputs.Name $Control)
+                    [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$true; Entries=$entries }
+                } catch { [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$false; Error=$_.Exception.Message } }
+            }
+            if ($dlg.IsDisposed -or -not $dlg.Visible -or $snapshot.Cancelled) { $aborted = $true; return }
+            if (-not $snapshot.Ok) { $fail += "$name → $($snapshot.Error)"; continue }
+            $conflicts = @()
+            $missingDirs = @{}
+            $badTarget = $null
+            foreach ($entry in $snapshot.Entries) {
+                $slash = $entry.Relative.LastIndexOf('/')
+                $parent = if ($slash -ge 0) { $entry.Relative.Substring(0, $slash) } else { '' }
+                $type = if ($missingDirs.ContainsKey($parent)) { 'FM_NEW' } else {
+                    Invoke-FmUploadEntry $dlg $batchSerial $batchPath $entry
+                }
+                if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; return }
+                if ($type -eq 'FM_NEW') {
+                    if ($entry.IsDir) { $missingDirs[$entry.Relative] = $true }
+                } elseif ($type -eq 'FM_FILE' -and -not $entry.IsDir) {
+                    $conflicts += $entry.Relative
+                } elseif ($type -ne 'FM_DIR' -or -not $entry.IsDir) {
+                    $badTarget = $entry.Relative
+                    break
+                }
+            }
+            if ($badTarget) { $fail += "$badTarget → 无法安全写入目标"; continue }
+            $plans += @{ Local=$f; Name=$name; Entries=$snapshot.Entries; Conflicts=$conflicts }
+        }
+        $approved = @{}
+        $skipped = @{}
+        $allConflicts = @($plans | ForEach-Object { $_.Conflicts })
+        if ($allConflicts.Count) {
+            $choice = Fm-ConfirmOverwrite $dlg '上传' $allConflicts "手机上的 $batchPath"
+            if ($choice -eq 'cancel' -or $dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; return }
+            $decisions = if ($choice -eq 'overwrite') { $approved } else { $skipped }
+            foreach ($path in $allConflicts) { $decisions[$path] = $true }
+        }
+        $okN = 0; $i = 0
+        foreach ($plan in $plans) {
+            if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+            $i++
+            $name = $plan.Name
+            if ($skipped.ContainsKey($name)) { continue }
+            # push 只写入本次独占的暂存目录，ADB 自带的目录合并不会直接碰到用户文件。
+            $stage = Fm-ChildPath $batchPath ('.scrcpy-upload-' + [guid]::NewGuid().ToString('N'))
+            $qStage = Fm-ShQuote $stage
+            $created = @(Fm-Shell $batchSerial "mkdir $qStage && echo FM_OK" $dlg)
+            if ($created -cnotcontains 'FM_OK') {
+                if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                $fail += "$name → 无法建立上传暂存目录"; continue
+            }
+            try {
+                $progState.Index = $i; $progState.WatchPath = ''; $progState.TotalBytes = 0L
+                $r = Fm-Transfer (@('-s', $batchSerial, 'push', $plan.Local, ($stage + '/'))) $dlg $lblInfo "正在上传 ($i/$($list.Count))：$name" $progState
+                if ($r.Aborted -or $dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                if (-not $r.Ok) { $fail += "$name → $($r.Detail)"; continue }
+                $itemOk = $true
+                foreach ($entry in $plan.Entries) {
+                    if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                    $path = $entry.Relative
+                    if ($skipped.ContainsKey($path)) { continue }
+                    $result = Invoke-FmUploadEntry $dlg $batchSerial $batchPath $entry $stage ($approved.ContainsKey($path)) $lblInfo
+                    if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                    if ($result -eq 'FM_FILE') {
+                        $choice = Fm-ConfirmOverwrite $dlg '上传' @($path) "手机上的 $batchPath"
+                        if ($choice -eq 'cancel' -or $dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                        if ($choice -eq 'skip') { continue }
+                        $result = Invoke-FmUploadEntry $dlg $batchSerial $batchPath $entry $stage $true $lblInfo
+                        if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+                    }
+                    if ($result -ne 'FM_OK') {
+                        $fail += "$path → 无法安全写入目标"
+                        $itemOk = $false
+                        break
+                    }
+                }
+                if ($aborted) { break }
+                if ($itemOk) { $okN++ }
+            } finally {
+                # 暂存文件由本批拥有，关掉文件窗口后也要尝试清理。
+                $cleanup = Invoke-FmShell $null $batchSerial "rm -rf $qStage"
+                if (-not $cleanup.Ok -and -not $aborted) { $fail += "$stage → 无法清理上传暂存目录" }
+            }
+        }
+        # 关窗 / 中止后整批到此为止：不刷新、不弹结果框，窗体可能已经没了。
+        if ($aborted -or $dlg.IsDisposed -or -not $dlg.Visible) { return }
+        & $refresh
+        if ($fail.Count -gt 0) {
+            [void](Show-ResultDialog $dlg '上传' "有 $($fail.Count) 项没传成功" '点「查看原因」看哪些文件没传过去。手机不允许写入时，可换到「内部存储 > Download」再试。' ($fail -join "`r`n") @('ok'))
+        } else {
+            $lblInfo.ForeColor = $cGreen
+            $lblInfo.Text = "已上传 $okN 项到 $batchPath"
+        }
+    } finally {
+        Complete-FmProgress $progState (-not $aborted -and $fail.Count -eq 0)
+        Set-FmDeviceLock $dlg $cmbDev $false
+    }
+}
+
+function Invoke-FmDownloadRequest {
+    param($request, $dlg, $lblInfo, $progState, $cmbDev)
+    $batchSerial = $request.Serial
+    $entries = $request.Entries
+    $dest = $request.Destination
+    $relativeTargets = @{}
+    try {
+        $dest = Get-FmSaveRoot $dest
+        Assert-FmNames @($entries | ForEach-Object { $_.Name })
+        foreach ($item in $entries) {
+            if ($item.IsLink) { throw '下载暂不支持链接，请选择原文件。' }
+            if ($item.IsDir) { $relativeTargets[$item.Name] = @(Assert-FmRemoteTree $dlg $batchSerial $item.Path) }
+        }
+    } catch {
+        if ($dlg.IsDisposed -or -not $dlg.Visible) { return }
+        [void](Show-ResultDialog $dlg '下载' '无法安全保存这批文件' $_.Exception.Message '' @('ok'))
+        return
+    }
+    $approvedTargets = @{}
+    $skippedTargets = @{}
+    # 同名目录可以共存，只有将被替换或挡住写入的具体路径才算冲突。
+    $conflicts = @(foreach ($item in $entries) {
+        $target = Join-Path $dest $item.Name
+        $targets = @{}
+        $targets[$target] = [bool]$item.IsDir
+        foreach ($entry in $relativeTargets[$item.Name]) {
+            $targets[(Join-Path $target $entry.Relative)] = $entry.IsDir
+        }
+        $check = Get-FmTargetPaths $dlg $target -Paths $targets
+        if ($dlg.IsDisposed -or -not $dlg.Visible -or $check.Cancelled) { return }
+        if (-not $check.Ok) {
+            [void](Show-ResultDialog $dlg '下载' '无法安全保存这批文件' $check.Error '' @('ok'))
+            return
+        }
+        $check.Paths
+    })
+    if ($conflicts.Count -gt 0) {
+        $choice = Fm-ConfirmOverwrite $dlg '下载' $conflicts "电脑上的 $dest"
+        if ($choice -eq 'cancel') { return }
+        if ($choice -eq 'skip') {
+            foreach ($path in $conflicts) { $skippedTargets[$path] = $true }
+            $entries = @($entries | Where-Object { -not $skippedTargets.ContainsKey([IO.Path]::GetFullPath((Join-Path $dest $_.Name))) })
+            if ($entries.Count -eq 0) { $lblInfo.ForeColor = $cMuted; $lblInfo.Text = '同名项都跳过了，没有下载任何文件'; return }
+        } else {
+            foreach ($path in $conflicts) { $approvedTargets[$path] = $true }
+        }
+    }
+    Start-FmProgress $progState $entries.Count
+    try {
+        Set-FmDeviceLock $dlg $cmbDev $true
+        $okN = 0; $fail = @(); $i = 0; $aborted = $false
+        foreach ($e in $entries) {
+            # 每项开始前先看窗口：关窗后不再启动新的 pull，短传输也不会漏网。
+            if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
+            $i++
+            # 设备端合法、Windows 非法的名字（: * ? " < > |、结尾的点或空格）会让 adb 报
+            # 「cannot create ...」这种看不懂的错。提前拦下并说明原因，别把锅甩给存储权限。
+            if ($e.Name -match '[:*?"<>|]' -or $e.Name -match '[. ]$') {
+                $fail += "$($e.Name) → 文件名含 Windows 不允许的字符，无法直接保存；请在手机上改名后再下载"
+                continue
+            }
+            $local = Join-Path $dest $e.Name
+            # Unicode 父目录由 Windows 设置，adb 只接收相对临时名，无需写盘符根目录。
+            $stageName = '__scrcpy_pull_' + [guid]::NewGuid().ToString('N')
+            $stage = Join-Path $dest $stageName
+            # 中转文件在电脑上边写边长，用「当前大小 ÷ 手机上列出的大小」得到真实百分比；
+            # 文件夹没有单一大小，退回按项数步进。
+            $sz = 0L
+            if (-not $e.IsDir) { [void][long]::TryParse([string]$e.Size, [ref]$sz) }
+            $progState.Index = $i
+            $progState.WatchPath = $(if ($sz -gt 0) { $stage } else { '' })
+            $progState.TotalBytes = $sz
+            $r = $null
+            try {
+                # 只把纯 ASCII 路径交给 adb；成功后由 Move-FmPulledItem 改成真正的中文名。
+                $r = Fm-Transfer (@('-s', $batchSerial, 'pull', $e.Path, $stageName)) $dlg $lblInfo "正在下载 ($i/$($entries.Count))：$($e.Name)" $progState $dest
+                if (-not $r.Aborted) {
+                    $commit = $null
+                    if ($r.Ok) {
+                        $check = Get-FmTargetPaths $dlg $local $stage $approvedTargets -Skipped $skippedTargets
+                        if ($dlg.IsDisposed -or -not $dlg.Visible -or $check.Cancelled) { $aborted=$true; break }
+                        if (-not $check.Ok) { $fail += "$($e.Name) → $($check.Error)"; continue }
+                        $conflicts = @($check.Paths)
+                        if ($conflicts.Count -gt 0) {
+                            $answer = Fm-ConfirmOverwrite $dlg '下载' $conflicts "电脑上的 $dest"
+                            if ($dlg.IsDisposed -or -not $dlg.Visible -or $answer -eq 'cancel') { $aborted = $true; break }
+                            if ($answer -eq 'skip') {
+                                foreach ($path in $conflicts) { $skippedTargets[$path] = $true }
+                                if ($skippedTargets.ContainsKey([IO.Path]::GetFullPath($local))) { continue }
+                            } else {
+                                foreach ($path in $conflicts) { $approvedTargets[$path] = $true }
+                            }
+                        }
+                        $commit = Invoke-FmTask $dlg -Functions @('Fm-ValidName','Assert-FmNames','Assert-FmLocalPath','Assert-FmTree','Test-FmOverwrite','Copy-FmFile','Merge-FmDirectory','Move-FmPulledItem') -Inputs @{ From=$stage; To=$local; Overwrite=$approvedTargets; Skipped=$skippedTargets } -Work {
+                            $ok=Move-FmPulledItem $Inputs.From $Inputs.To $Inputs.Overwrite $Control $Inputs.Skipped
+                            [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$ok; Cancelled=[bool]$Control.Cancelled }
+                        }
+                    }
+                    if ($dlg.IsDisposed -or -not $dlg.Visible -or ($commit -and $commit.Cancelled)) { $aborted=$true; break }
+                    if ($commit -and $commit.Ok) { $okN++ }
+                    else {
+                        $detail = if ($r.Detail) { ([string]$r.Detail).Replace($stage, $local) } else { '手机上的文件没保存到指定位置' }
+                        $fail += "$($e.Name) → $detail"
+                    }
+                }
+            } finally {
+                # 失败 / 取消后清掉中转残留，别在用户目录里留下 __scrcpy_pull_xxx。
+                if (Test-Path -LiteralPath $stage) {
+                    $cleanup = Invoke-FmTask $null -Inputs @{ Path=$stage; Parent=$dest } -Work {
+                        try {
+                            $path=[IO.Path]::GetFullPath($Inputs.Path)
+                            if ([IO.Path]::GetDirectoryName($path).TrimEnd('\') -ne [IO.Path]::GetFullPath($Inputs.Parent).TrimEnd('\') -or [IO.Path]::GetFileName($path) -notmatch '^__scrcpy_pull_[a-f0-9]{32}$') { throw '无效暂存路径' }
+                            if ([IO.Directory]::Exists($path)) { [IO.Directory]::Delete($path,$true) }
+                            elseif ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
+                            [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$true }
+                        } catch { [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$false } }
+                    }
+                }
+            }
+            if ($r -and $r.Aborted) { $aborted = $true; break }
+        }
+        # 关窗 / 中止后整批到此为止，不碰可能已经释放的控件。
+        if ($aborted -or $dlg.IsDisposed -or -not $dlg.Visible) { return }
+        if ($fail.Count -gt 0) {
+            [void](Show-ResultDialog $dlg '下载' "有 $($fail.Count) 项没下载成功" '确认电脑磁盘空间充足、保存位置可写；手机上的文件若刚被移走，点「刷新」后再试。' ($fail -join "`r`n") @('ok'))
+        }
+        $lblInfo.ForeColor = $(if ($fail.Count -gt 0) { $cRed } else { $cGreen })
+        $lblInfo.Text = "已下载 $okN 项到 $dest"
+    } finally {
+        Complete-FmProgress $progState (-not $aborted -and $fail.Count -eq 0)
+        Set-FmDeviceLock $dlg $cmbDev $false
+    }
+}
+
 function Show-FileManager {
     param($owner, [string[]]$devices)
     # 新版 main 的 Ensure-Devices 只启动后台扫描、靠 OnDone / OnFinally 交付结果，不再同步返回数组。
@@ -5614,8 +6024,7 @@ function Show-FileManager {
     })
     $fmtip = New-Object System.Windows.Forms.ToolTip
     $fmtip.AutoPopDelay = 12000
-    $startSerial = if ($script:uiState -and $script:uiState.SelectedSerial -and ($devs -contains $script:uiState.SelectedSerial)) { $script:uiState.SelectedSerial } elseif ($settings.defaultDevice -and ($devs -contains $settings.defaultDevice)) { $settings.defaultDevice } else { $devs[0] }
-    $state = @{ Path = '/sdcard'; Serial = $startSerial; Serials = @($devs); Rebuilding = $false; DropPaths = @() }
+    $state = New-FmWindowState $devs $script:uiState.SelectedSerial $settings.defaultDevice
 
     # —— 第一行：设备（多设备时直接在这里切，不用退回主界面）——
     $lblDev = New-Lbl '设备' 16 14
@@ -5708,58 +6117,9 @@ function Show-FileManager {
 
     # —— 传输进度：一个对象在整批上传/下载里复用，逐项改 Index / WatchPath / TotalBytes ——
     $progState = @{ Bar = $barFm; Pct = $lblPct; Index = 0; Total = 1; WatchPath = ''; TotalBytes = 0L }
-    $beginProgress = {
-        param($n)
-        $progState.Total = [Math]::Max(1, [int]$n)
-        $progState.Index = 0
-        $barFm.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
-        $barFm.Value = 0
-        $lblPct.Text = '0%'
-        $barFm.Visible = $true; $lblPct.Visible = $true
-        $barFm.Refresh(); $lblPct.Refresh()
-    }
-    $endProgress = {
-        param([bool]$allOk = $true)
-        # 成功才归到满格再隐藏：单项传输可能 120ms 内就结束、一次 tick 都没赶上，也别留下半截的条；
-        # 有失败项时不冒充 100%，直接收起，错误详情由下面的结果弹窗负责。
-        try {
-            if ($allOk -and $barFm.Visible) {
-                $barFm.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
-                $barFm.Value = 100; $lblPct.Text = '100%'
-                $barFm.Refresh(); $lblPct.Refresh()
-            }
-        } catch {}
-        try { $barFm.Visible = $false; $lblPct.Visible = $false; $lblPct.Text = '' } catch {}
-    }
 
-    # 批量操作期间锁死设备下拉框：Fm-Transfer / Fm-ShellLong 等待时靠 DoEvents 泵消息，
-    # 那段时间窗口仍「活着」，用户能切设备。锁控件 + 事件守卫 + 快照三道一起做，
-    # 才不会把同一批文件分头发到两台手机上。
-    $setDeviceLock = {
-        param([bool]$on)
-        try {
-            if ($dlg.IsDisposed) { return }
-            $cmbDev.Enabled = (-not $on)
-        } catch {}
-    }
-
-    # —— 状态 / 按钮可用性 ——
-    $updateButtons = {
-        # 框选松手时会批量改 Selected，会逐项触发 SelectedIndexChanged；那期间跳过重算，结束后手动调一次。
-        if ($state.RubberBusy) { return }
-        # 刷新确认没有设备后仍可留在窗口等待重连，但此时没有文件操作目标。
-        $hasDevice = [bool]$state.Serial
-        foreach ($control in @($btnUpload,$btnNew,$btnGo,$txtPath,$lnkHome,$lnkDl,$lnkDcim,$lnkPic,$lnkRoot)) {
-            $control.Enabled = $hasDevice
-        }
-        $lv.AllowDrop = $hasDevice
-        $sel = @($lv.SelectedItems | Where-Object { $_.Tag })
-        $btnDownload.Enabled = ($sel.Count -gt 0)
-        $btnDel.Enabled = ($sel.Count -gt 0)
-        # 重命名只认恰好一项：多选时没有一个明确的「旧名字」，按钮和 F2 一起禁用。
-        $btnRename.Enabled = ($sel.Count -eq 1)
-        $btnUp.Enabled = ($hasDevice -and $state.Path -ne '/')
-    }
+    $deviceControls = @($btnUpload, $btnNew, $btnGo, $txtPath, $lnkHome, $lnkDl, $lnkDcim, $lnkPic, $lnkRoot)
+    $updateButtons = { Update-FmButtons $state $lv $deviceControls $btnDownload $btnDel $btnRename $btnUp }
 
     # —— 读目录 ——
     $refresh = {
@@ -5828,9 +6188,7 @@ function Show-FileManager {
     $enter = {
         param([string]$p, [switch]$FromPathBox)
         if (-not $state.Serial) { return }
-        # 继续容忍手输时贴进来的外侧空白，但路径框原样回车应重新打开当前目录。
-        if ($FromPathBox -and $p -cne $state.Path) { $p = $p.Trim() }
-        $state.Path = Fm-NormPath $p
+        $state.Path = Get-FmNavigationPath $p $state.Path -FromPathBox:$FromPathBox
         & $refresh
     }
 
@@ -5839,12 +6197,7 @@ function Show-FileManager {
         if ($state.Path -ne '/') { & $enter (Fm-ParentPath $state.Path) }
     }
     $selectedFolder = {
-        # 跟原来的双击保持一致：只有「恰好选中一项，且是文件夹 / 链接」才算有目标。
-        # 多选、选中的是文件、空目录占位行都返回 $null —— 不猜意图，也就不会误进别的目录。
-        if ($lv.SelectedItems.Count -ne 1) { return $null }
-        $t = $lv.SelectedItems[0].Tag
-        if ($t -and ($t.IsDir -or $t.IsLink)) { return $t.Path }
-        return $null
+        Get-FmSelectedFolderPath $lv.SelectedItems
     }
     $openSelected = {
         $p = & $selectedFolder
@@ -5854,286 +6207,27 @@ function Show-FileManager {
     # —— 上传：按钮选文件，或直接把文件拖进列表 ——
     $doUpload = {
         param($paths)
-        # 整批从这一刻起就钉死目标：同名检查、确认框、每一项 push 都用这两个快照值，
-        # 不重新读 $state。等待期间 DoEvents 会让设备下拉框事件插进来，重读就会换手机 / 换目录。
-        $batchSerial = [string]$state.Serial
-        $batchPath = [string]$state.Path
-        # 去掉结尾的 \ / 再取名字：盘符根 C:\ 的 GetFileName 是空串，直接 push 会把整个盘推上去。
-        $list = @($paths | Where-Object { $_ } | ForEach-Object {
-            $t = ([string]$_).TrimEnd([char[]]@([char]92, [char]47))
-            if ($t -and (Test-Path -LiteralPath $t) -and [System.IO.Path]::GetFileName($t)) { $t }
-        })
-        if ($list.Count -eq 0) { return }
-        $names = @($list | ForEach-Object { [System.IO.Path]::GetFileName($_) })
-        try { Assert-FmNames $names } catch {
-            [void](Show-ResultDialog $dlg '上传' '请先处理重名或不支持的名称' $_.Exception.Message '' @('ok'))
-            return
-        }
-        $fail = @(); $aborted = $false
-        & $beginProgress $list.Count
-        try {
-            & $setDeviceLock $true
-            $plans = @()
-            foreach ($f in $list) {
-                $name = [System.IO.Path]::GetFileName($f)
-                if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; return }
-                $snapshot = Invoke-FmTask $dlg -Functions @('Fm-ValidName','Assert-FmNames','Get-FmUploadTree') -Inputs @{ Local=$f; Name=$name } -Work {
-                    try {
-                        $item = Get-Item -LiteralPath $Inputs.Local -Force -ErrorAction Stop
-                        $entries = @(Get-FmUploadTree $item $Inputs.Name $Control)
-                        [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$true; Entries=$entries }
-                    } catch { [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$false; Error=$_.Exception.Message } }
-                }
-                if ($dlg.IsDisposed -or -not $dlg.Visible -or $snapshot.Cancelled) { $aborted = $true; return }
-                if (-not $snapshot.Ok) { $fail += "$name → $($snapshot.Error)"; continue }
-                $conflicts = @()
-                $missingDirs = @{}
-                $badTarget = $null
-                foreach ($entry in $snapshot.Entries) {
-                    $slash = $entry.Relative.LastIndexOf('/')
-                    $parent = if ($slash -ge 0) { $entry.Relative.Substring(0, $slash) } else { '' }
-                    $type = if ($missingDirs.ContainsKey($parent)) { 'FM_NEW' } else {
-                        Invoke-FmUploadEntry $dlg $batchSerial $batchPath $entry
-                    }
-                    if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; return }
-                    if ($type -eq 'FM_NEW') {
-                        if ($entry.IsDir) { $missingDirs[$entry.Relative] = $true }
-                    } elseif ($type -eq 'FM_FILE' -and -not $entry.IsDir) {
-                        $conflicts += $entry.Relative
-                    } elseif ($type -ne 'FM_DIR' -or -not $entry.IsDir) {
-                        $badTarget = $entry.Relative
-                        break
-                    }
-                }
-                if ($badTarget) { $fail += "$badTarget → 无法安全写入目标"; continue }
-                $plans += @{ Local=$f; Name=$name; Entries=$snapshot.Entries; Conflicts=$conflicts }
-            }
-            $approved = @{}
-            $skipped = @{}
-            $allConflicts = @($plans | ForEach-Object { $_.Conflicts })
-            if ($allConflicts.Count) {
-                $choice = Fm-ConfirmOverwrite $dlg '上传' $allConflicts "手机上的 $batchPath"
-                if ($choice -eq 'cancel' -or $dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; return }
-                $decisions = if ($choice -eq 'overwrite') { $approved } else { $skipped }
-                foreach ($path in $allConflicts) { $decisions[$path] = $true }
-            }
-            $okN = 0; $i = 0
-            foreach ($plan in $plans) {
-                if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
-                $i++
-                $name = $plan.Name
-                if ($skipped.ContainsKey($name)) { continue }
-                # push 只写入本次独占的暂存目录，ADB 自带的目录合并不会直接碰到用户文件。
-                $stage = Fm-ChildPath $batchPath ('.scrcpy-upload-' + [guid]::NewGuid().ToString('N'))
-                $qStage = Fm-ShQuote $stage
-                $created = @(Fm-Shell $batchSerial "mkdir $qStage && echo FM_OK" $dlg)
-                if ($created -cnotcontains 'FM_OK') {
-                    if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
-                    $fail += "$name → 无法建立上传暂存目录"; continue
-                }
-                try {
-                    $progState.Index = $i; $progState.WatchPath = ''; $progState.TotalBytes = 0L
-                    $r = Fm-Transfer (@('-s', $batchSerial, 'push', $plan.Local, ($stage + '/'))) $dlg $lblInfo "正在上传 ($i/$($list.Count))：$name" $progState
-                    if ($r.Aborted -or $dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
-                    if (-not $r.Ok) { $fail += "$name → $($r.Detail)"; continue }
-                    $itemOk = $true
-                    foreach ($entry in $plan.Entries) {
-                        if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
-                        $path = $entry.Relative
-                        if ($skipped.ContainsKey($path)) { continue }
-                        $result = Invoke-FmUploadEntry $dlg $batchSerial $batchPath $entry $stage ($approved.ContainsKey($path)) $lblInfo
-                        if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
-                        if ($result -eq 'FM_FILE') {
-                            $choice = Fm-ConfirmOverwrite $dlg '上传' @($path) "手机上的 $batchPath"
-                            if ($choice -eq 'cancel' -or $dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
-                            if ($choice -eq 'skip') { continue }
-                            $result = Invoke-FmUploadEntry $dlg $batchSerial $batchPath $entry $stage $true $lblInfo
-                            if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
-                        }
-                        if ($result -ne 'FM_OK') {
-                            $fail += "$path → 无法安全写入目标"
-                            $itemOk = $false
-                            break
-                        }
-                    }
-                    if ($aborted) { break }
-                    if ($itemOk) { $okN++ }
-                } finally {
-                    # 暂存文件由本批拥有，关掉文件窗口后也要尝试清理。
-                    $cleanup = Invoke-FmShell $null $batchSerial "rm -rf $qStage"
-                    if (-not $cleanup.Ok -and -not $aborted) { $fail += "$stage → 无法清理上传暂存目录" }
-                }
-            }
-            # 关窗 / 中止后整批到此为止：不刷新、不弹结果框，窗体可能已经没了。
-            if ($aborted -or $dlg.IsDisposed -or -not $dlg.Visible) { return }
-            & $refresh
-            if ($fail.Count -gt 0) {
-                [void](Show-ResultDialog $dlg '上传' "有 $($fail.Count) 项没传成功" '点「查看原因」看哪些文件没传过去。手机不允许写入时，可换到「内部存储 > Download」再试。' ($fail -join "`r`n") @('ok'))
-            } else {
-                $lblInfo.ForeColor = $cGreen
-                $lblInfo.Text = "已上传 $okN 项到 $batchPath"
-            }
-        } finally {
-            & $endProgress (-not $aborted -and $fail.Count -eq 0)
-            & $setDeviceLock $false
-        }
+        # 在检查和传输开始前固定设备和目录，等待期间泵消息也不能改变这一批的目标。
+        $request = @{ Serial = [string]$state.Serial; Path = [string]$state.Path; Paths = @(Get-FmUploadPaths $paths) }
+        if ($request.Paths.Count -eq 0) { return }
+        Invoke-FmUploadRequest $request $dlg $lblInfo $progState $cmbDev $refresh
     }
     $pickAndUpload = {
-        $ofd = New-Object System.Windows.Forms.OpenFileDialog
-        $ofd.Title = '选择要传到手机的文件（可多选）'
-        $ofd.Multiselect = $true
-        $ofd.Filter = '所有文件 (*.*)|*.*'
-        if ($ofd.ShowDialog($dlg) -eq [System.Windows.Forms.DialogResult]::OK) { & $doUpload $ofd.FileNames }
-        $ofd.Dispose()
+        $paths = @(Select-FmUploadPaths $dlg)
+        if ($paths.Count -gt 0) { & $doUpload $paths }
     }
 
     # —— 下载：多选后挑一个电脑目录，逐项 pull；用「本地是否出现同名项」再验一次，
     #    因为部分老 adb 传输出错时退出码仍是 0。——
     $doDownload = {
-        # 整批固定目标设备；每条来源路径取自列表项的 Tag.Path 快照，保存位置取自下面选中的 $dest，
-        # 两者都不再读 $state，所以中途切设备 / 跳目录都不会把后续项拉到别的手机上。
-        $batchSerial = [string]$state.Serial
-        $sel = @($lv.SelectedItems | Where-Object { $_.Tag })
-        if ($sel.Count -eq 0) { return }
-        $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
-        $fbd.Description = "选择保存到电脑的文件夹（共 $($sel.Count) 项）"
-        $fbd.ShowNewFolderButton = $true
-        if ($settings -and $settings.lastDownloadDir -and (Test-Path -LiteralPath $settings.lastDownloadDir -PathType Container)) { $fbd.SelectedPath = $settings.lastDownloadDir }
-        if ($fbd.ShowDialog($dlg) -ne [System.Windows.Forms.DialogResult]::OK) { $fbd.Dispose(); return }
-        $dest = $fbd.SelectedPath
-        $fbd.Dispose()
-        if (-not (Test-Path -LiteralPath $dest)) { return }
-        if ($settings -and $settings.lastDownloadDir -ne $dest) {
-            $settings.lastDownloadDir = $dest
-            if (Get-Command Save-Settings -ErrorAction SilentlyContinue) { Save-Settings }
-        }
-        $relativeTargets = @{}
-        try {
-            $dest = Get-FmSaveRoot $dest
-            Assert-FmNames @($sel | ForEach-Object { $_.Tag.Name })
-            foreach ($item in $sel) {
-                if ($item.Tag.IsLink) { throw '下载暂不支持链接，请选择原文件。' }
-                if ($item.Tag.IsDir) { $relativeTargets[$item.Tag.Name] = @(Assert-FmRemoteTree $dlg $batchSerial $item.Tag.Path) }
-            }
-        } catch {
-            if ($dlg.IsDisposed -or -not $dlg.Visible) { return }
-            [void](Show-ResultDialog $dlg '下载' '无法安全保存这批文件' $_.Exception.Message '' @('ok'))
-            return
-        }
-        $approvedTargets = @{}
-        $skippedTargets = @{}
-        # 同名目录可以共存，只有将被替换或挡住写入的具体路径才算冲突。
-        $conflicts = @(foreach ($item in $sel) {
-            $target = Join-Path $dest $item.Tag.Name
-            $targets = @{}
-            $targets[$target] = [bool]$item.Tag.IsDir
-            foreach ($entry in $relativeTargets[$item.Tag.Name]) {
-                $targets[(Join-Path $target $entry.Relative)] = $entry.IsDir
-            }
-            $check = Get-FmTargetPaths $dlg $target -Paths $targets
-            if ($dlg.IsDisposed -or -not $dlg.Visible -or $check.Cancelled) { return }
-            if (-not $check.Ok) {
-                [void](Show-ResultDialog $dlg '下载' '无法安全保存这批文件' $check.Error '' @('ok'))
-                return
-            }
-            $check.Paths
-        })
-        if ($conflicts.Count -gt 0) {
-            $choice = Fm-ConfirmOverwrite $dlg '下载' $conflicts "电脑上的 $dest"
-            if ($choice -eq 'cancel') { return }
-            if ($choice -eq 'skip') {
-                foreach ($path in $conflicts) { $skippedTargets[$path] = $true }
-                $sel = @($sel | Where-Object { -not $skippedTargets.ContainsKey([IO.Path]::GetFullPath((Join-Path $dest $_.Tag.Name))) })
-                if ($sel.Count -eq 0) { $lblInfo.ForeColor = $cMuted; $lblInfo.Text = '同名项都跳过了，没有下载任何文件'; return }
-            } else {
-                foreach ($path in $conflicts) { $approvedTargets[$path] = $true }
-            }
-        }
-        & $beginProgress $sel.Count
-        try {
-            & $setDeviceLock $true
-            $okN = 0; $fail = @(); $i = 0; $aborted = $false
-            foreach ($it in $sel) {
-                # 每项开始前先看窗口：关窗后不再启动新的 pull，短传输也不会漏网。
-                if ($dlg.IsDisposed -or -not $dlg.Visible) { $aborted = $true; break }
-                $i++; $e = $it.Tag
-                # 设备端合法、Windows 非法的名字（: * ? " < > |、结尾的点或空格）会让 adb 报
-                # 「cannot create ...」这种看不懂的错。提前拦下并说明原因，别把锅甩给存储权限。
-                if ($e.Name -match '[:*?"<>|]' -or $e.Name -match '[. ]$') {
-                    $fail += "$($e.Name) → 文件名含 Windows 不允许的字符，无法直接保存；请在手机上改名后再下载"
-                    continue
-                }
-                $local = Join-Path $dest $e.Name
-                # Unicode 父目录由 Windows 设置，adb 只接收相对临时名，无需写盘符根目录。
-                $stageName = '__scrcpy_pull_' + [guid]::NewGuid().ToString('N')
-                $stage = Join-Path $dest $stageName
-                # 中转文件在电脑上边写边长，用「当前大小 ÷ 手机上列出的大小」得到真实百分比；
-                # 文件夹没有单一大小，退回按项数步进。
-                $sz = 0L
-                if (-not $e.IsDir) { [void][long]::TryParse([string]$e.Size, [ref]$sz) }
-                $progState.Index = $i
-                $progState.WatchPath = $(if ($sz -gt 0) { $stage } else { '' })
-                $progState.TotalBytes = $sz
-                $r = $null
-                try {
-                    # 只把纯 ASCII 路径交给 adb；成功后由 Move-FmPulledItem 改成真正的中文名。
-                    $r = Fm-Transfer (@('-s', $batchSerial, 'pull', $e.Path, $stageName)) $dlg $lblInfo "正在下载 ($i/$($sel.Count))：$($e.Name)" $progState $dest
-                    if (-not $r.Aborted) {
-                        $commit = $null
-                        if ($r.Ok) {
-                            $check = Get-FmTargetPaths $dlg $local $stage $approvedTargets -Skipped $skippedTargets
-                            if ($dlg.IsDisposed -or -not $dlg.Visible -or $check.Cancelled) { $aborted=$true; break }
-                            if (-not $check.Ok) { $fail += "$($e.Name) → $($check.Error)"; continue }
-                            $conflicts = @($check.Paths)
-                            if ($conflicts.Count -gt 0) {
-                                $answer = Fm-ConfirmOverwrite $dlg '下载' $conflicts "电脑上的 $dest"
-                                if ($dlg.IsDisposed -or -not $dlg.Visible -or $answer -eq 'cancel') { $aborted = $true; break }
-                                if ($answer -eq 'skip') {
-                                    foreach ($path in $conflicts) { $skippedTargets[$path] = $true }
-                                    if ($skippedTargets.ContainsKey([IO.Path]::GetFullPath($local))) { continue }
-                                } else {
-                                    foreach ($path in $conflicts) { $approvedTargets[$path] = $true }
-                                }
-                            }
-                            $commit = Invoke-FmTask $dlg -Functions @('Fm-ValidName','Assert-FmNames','Assert-FmLocalPath','Assert-FmTree','Test-FmOverwrite','Copy-FmFile','Merge-FmDirectory','Move-FmPulledItem') -Inputs @{ From=$stage; To=$local; Overwrite=$approvedTargets; Skipped=$skippedTargets } -Work {
-                                $ok=Move-FmPulledItem $Inputs.From $Inputs.To $Inputs.Overwrite $Control $Inputs.Skipped
-                                [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$ok; Cancelled=[bool]$Control.Cancelled }
-                            }
-                        }
-                        if ($dlg.IsDisposed -or -not $dlg.Visible -or ($commit -and $commit.Cancelled)) { $aborted=$true; break }
-                        if ($commit -and $commit.Ok) { $okN++ }
-                        else {
-                            $detail = if ($r.Detail) { ([string]$r.Detail).Replace($stage, $local) } else { '手机上的文件没保存到指定位置' }
-                            $fail += "$($e.Name) → $detail"
-                        }
-                    }
-                } finally {
-                    # 失败 / 取消后清掉中转残留，别在用户目录里留下 __scrcpy_pull_xxx。
-                    if (Test-Path -LiteralPath $stage) {
-                        $cleanup = Invoke-FmTask $null -Inputs @{ Path=$stage; Parent=$dest } -Work {
-                            try {
-                                $path=[IO.Path]::GetFullPath($Inputs.Path)
-                                if ([IO.Path]::GetDirectoryName($path).TrimEnd('\') -ne [IO.Path]::GetFullPath($Inputs.Parent).TrimEnd('\') -or [IO.Path]::GetFileName($path) -notmatch '^__scrcpy_pull_[a-f0-9]{32}$') { throw '无效暂存路径' }
-                                if ([IO.Directory]::Exists($path)) { [IO.Directory]::Delete($path,$true) }
-                                elseif ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
-                                [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$true }
-                            } catch { [pscustomobject]@{ Info=@{}; Connected=@(); Ok=$false } }
-                        }
-                    }
-                }
-                if ($r -and $r.Aborted) { $aborted = $true; break }
-            }
-            # 关窗 / 中止后整批到此为止，不碰可能已经释放的控件。
-            if ($aborted -or $dlg.IsDisposed -or -not $dlg.Visible) { return }
-            if ($fail.Count -gt 0) {
-                [void](Show-ResultDialog $dlg '下载' "有 $($fail.Count) 项没下载成功" '确认电脑磁盘空间充足、保存位置可写；手机上的文件若刚被移走，点「刷新」后再试。' ($fail -join "`r`n") @('ok'))
-            }
-            $lblInfo.ForeColor = $(if ($fail.Count -gt 0) { $cRed } else { $cGreen })
-            $lblInfo.Text = "已下载 $okN 项到 $dest"
-        } finally {
-            & $endProgress (-not $aborted -and $fail.Count -eq 0)
-            & $setDeviceLock $false
-        }
+        # 先固定设备和列表条目，再打开模态保存窗口，免得后续操作读到别的设备或目录。
+        $serial = [string]$state.Serial
+        $entries = @($lv.SelectedItems | Where-Object { $_.Tag } | ForEach-Object { $_.Tag })
+        if ($entries.Count -eq 0) { return }
+        $dest = Select-FmDownloadFolder $dlg $entries.Count $settings
+        if (-not $dest) { return }
+        $request = @{ Serial = $serial; Entries = $entries; Destination = $dest }
+        Invoke-FmDownloadRequest $request $dlg $lblInfo $progState $cmbDev
     }
 
     # —— 新建文件夹 ——
@@ -6247,7 +6341,7 @@ function Show-FileManager {
             if ($ask2 -ne [System.Windows.Forms.DialogResult]::Yes) { return }
         }
         $okN = 0; $fail = @(); $i = 0; $uncertain = $false; $aborted = $false
-        & $setDeviceLock $true
+        Set-FmDeviceLock $dlg $cmbDev $true
         try {
             foreach ($it in $sel) {
                 # 关窗后绝不启动下一条 rm：删除是不可恢复操作，比传输更需要这条前置检查。
@@ -6271,7 +6365,7 @@ function Show-FileManager {
                     if ($out -notmatch '(?m)^FM_FAIL\r?$' -or $e.IsDir) { $uncertain = $true; break }
                 }
             }
-        } finally { & $setDeviceLock $false }
+        } finally { Set-FmDeviceLock $dlg $cmbDev $false }
         if ($dlg.IsDisposed -or -not $dlg.Visible) {
             # 关窗中止时已经没有可挂靠的窗体了，用一个不挂 Owner 的提示把风险说清楚，
             # 否则用户下次打开看到的只是「少了一些文件」，不知道是删了一半。
@@ -6463,26 +6557,7 @@ function Show-FileManager {
     $lnkPic.Add_Click({ Invoke-MainFlow ({ & $enter '/sdcard/Pictures' }) $dlg $script:fmFlow })
     $lnkRoot.Add_Click({ Invoke-MainFlow ({ & $enter '/' }) $dlg $script:fmFlow })
     $cmbDev.Add_SelectedIndexChanged({
-        if ($state.Rebuilding -or $cmbDev.SelectedIndex -lt 0) { return }
-        $pick = [string]$state.Serials[$cmbDev.SelectedIndex]
-        # Fm-Transfer / Fm-ShellLong 等待时会 DoEvents，这个事件照样会插进来。忙时绝不能改
-        # $state.Serial / $script:fmShellMode：正在跑的批量循环一旦重读，下一项就发到另一台手机上。
-        # 同时把下拉框拨回当前设备，别让用户以为切换已经生效。
-        if ($script:fmFlow.Busy) {
-            if ($pick -ne $state.Serial) {
-                $j = [array]::IndexOf($state.Serials, $state.Serial)
-                if ($j -ge 0 -and $j -ne $cmbDev.SelectedIndex) {
-                    $state.Rebuilding = $true
-                    try { $cmbDev.SelectedIndex = $j } finally { $state.Rebuilding = $false }
-                }
-                try {
-                    $lblInfo.ForeColor = $cMuted
-                    $lblInfo.Text = '正在处理，等这一批完成再切换设备'
-                } catch {}
-            }
-            return
-        }
-        $state.Serial = $pick
+        if (-not (Set-FmSelectedDevice $state $cmbDev $lblInfo $script:fmFlow.Busy)) { return }
         $script:fmShellMode = $null
         Invoke-MainFlow ({ & $refresh }) $dlg $script:fmFlow
     })
@@ -6500,16 +6575,7 @@ function Show-FileManager {
         }
         # 同时清掉 shell 写法缓存：上次探测若正好赶上设备重连失败，会一直用错写法直到关窗。
         $script:fmShellMode = $null
-        $state.Rebuilding = $true
-        try {
-            $state.Serials = @($snapshot.Devices)
-            $cmbDev.Items.Clear()
-            foreach ($s in $state.Serials) { [void]$cmbDev.Items.Add("$(Get-FriendlyName $s -CachedOnly)   ·   $s") }
-            $j = [array]::IndexOf($state.Serials, $state.Serial)
-            if ($j -lt 0 -and $state.Serials.Count -gt 0) { $j = 0 }
-            $state.Serial = if ($j -ge 0) { $state.Serials[$j] } else { '' }
-            $cmbDev.SelectedIndex = $j
-        } finally { $state.Rebuilding = $false }
+        Update-FmDeviceList $state $cmbDev $snapshot.Devices
         & $refresh
     }) $dlg $script:fmFlow })
     $btnClose.Add_Click({ $dlg.Close() })

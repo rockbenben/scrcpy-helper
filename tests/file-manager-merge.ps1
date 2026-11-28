@@ -1,10 +1,10 @@
 . (Join-Path $PSScriptRoot 'file-manager-test-support.ps1')
-$body = Get-FileManagerAction 'doDownload'
-$download = [scriptblock]::Create($body.Replace('New-Object System.Windows.Forms.FolderBrowserDialog', 'New-TestFolderDialog'))
+. (Get-TestFolderPicker)
+$download = [scriptblock]::Create((Get-FileManagerAction 'doDownload'))
 $dlg = @{ Visible=$true; IsDisposed=$false }
 $state = @{ Serial='fixture'; Path='/sdcard' }
-$lblInfo = @{}; $progState = @{}
-$beginProgress = {}; $endProgress = {}; $setDeviceLock = {}; $refresh = {}
+$lblInfo = @{}; $cmbDev = @{ Enabled=$true }
+$progState = @{ Bar=[Windows.Forms.ProgressBar]::new(); Pct=[Windows.Forms.Label]::new() }
 $cGreen = [Drawing.Color]::Green; $cRed = [Drawing.Color]::Red
 $fixture = @{ Prompts=0; Errors=0; Transfers=0; Late=$false }
 $lv = @{ SelectedItems=@([pscustomobject]@{ Tag=@{ Name='album'; Path='/sdcard/album'; IsDir=$true; IsLink=$false; Size='0' } }) }

@@ -98,4 +98,32 @@ foreach ($path in @('/offline','/truncated','/denied','/diagnostic')) {
     $result = Fm-ListDir $dlg 'fixture' $path
     Check (-not $result.Ok -and $result.Items.Count -eq 0 -and -not $result.NeedLegacy) "Failed or incomplete directory read appeared successful: $path"
 }
+
+function Get-FriendlyName {
+    param($serial, [switch]$CachedOnly)
+    Check $CachedOnly 'Rebuilding the device list triggered an extra device query'
+    return $serial
+}
+$windowState = New-FmWindowState @('first', 'selected') 'selected' 'first'
+Check ($windowState.Serial -ceq 'selected' -and $windowState.Path -ceq '/sdcard') 'The file window lost the device selected in the main window'
+$combo = [Windows.Forms.ComboBox]::new()
+try {
+    $changes = [Collections.ArrayList]::new()
+    $combo.Add_SelectedIndexChanged({ [void]$changes.Add([bool]$windowState.Rebuilding) })
+    Update-FmDeviceList $windowState $combo @('first', 'selected')
+    Check ($combo.SelectedIndex -eq 1 -and $changes.Count -gt 0 -and $changes -notcontains $false) 'Rebuilding the device list did not preserve the selected device or guard events'
+    $combo.SelectedIndex = 0
+    Check ((-not (Set-FmSelectedDevice $windowState $combo $lblInfo $true)) -and $windowState.Serial -ceq 'selected' -and
+        $combo.SelectedIndex -eq 1 -and $changes[-1] -and -not $windowState.Rebuilding) 'Switching during a transfer changed the active device'
+    $combo.SelectedIndex = 0
+    Check ((Set-FmSelectedDevice $windowState $combo $lblInfo $false) -and $windowState.Serial -ceq 'first') 'An idle window could not switch devices'
+    Update-FmDeviceList $windowState $combo @('other')
+    Check ($windowState.Serial -ceq 'other' -and $combo.SelectedIndex -eq 0) 'A missing device did not fall back to the first available device'
+    Update-FmDeviceList $windowState $combo @()
+    $fileList = @{ SelectedItems=@(); AllowDrop=$true }
+    $upload = @{}; $download = @{}; $delete = @{}; $rename = @{}; $up = @{}
+    Update-FmButtons $windowState $fileList @($upload) $download $delete $rename $up
+    Check (-not $windowState.Serial -and $combo.SelectedIndex -eq -1 -and -not $fileList.AllowDrop -and
+        -not ($upload.Enabled -or $download.Enabled -or $delete.Enabled -or $rename.Enabled -or $up.Enabled)) 'Losing the last device left file operations enabled'
+} finally { $combo.Dispose() }
 'PASS file manager directory regression on PowerShell ' + $PSVersionTable.PSVersion
