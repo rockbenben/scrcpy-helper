@@ -2410,6 +2410,15 @@ function Draw-Glyph {
                     $g.DrawLine($pen, [float]$x1, [float]$y1, [float]$x2, [float]$y2)
                 }
             }
+            'bell' {
+                $g.DrawLine($pen, [float]($x + $w * 0.50), [float]($y + $h * 0.08), [float]($x + $w * 0.50), [float]($y + $h * 0.17))
+                $bp = New-Object System.Drawing.Drawing2D.GraphicsPath
+                $bp.AddArc([float]($x + $w * 0.24), [float]($y + $h * 0.17), [float]($w * 0.52), [float]($h * 0.48), [float]180, [float]180)
+                $bp.AddLine([float]($x + $w * 0.84), [float]($y + $h * 0.72), [float]($x + $w * 0.16), [float]($y + $h * 0.72))
+                $bp.CloseFigure()
+                $g.DrawPath($pen, $bp); $bp.Dispose()
+                $g.DrawArc($pen, [float]($x + $w * 0.39), [float]($y + $h * 0.65), [float]($w * 0.22), [float]($h * 0.23), [float]20, [float]140)
+            }
         }
     } finally {
         $pen.Dispose(); $brush.Dispose(); $g.SmoothingMode = $oldSmooth
@@ -6356,7 +6365,7 @@ try {
     $lblSection.ForeColor = $cInk
     $form.Controls.Add($lblSection)
 
-    $btnFindPhone = New-LinkBtn '寻找手机' 298 11 80
+    $btnFindPhone = New-LinkBtn '寻找手机' 108 11 94 'bell'
     $findPhoneTip = '以最大闹钟音量循环播放手机当前的来电铃声，直到点「停止响铃」。'
     $tt.SetToolTip($btnFindPhone, $findPhoneTip)
     $btnShortcuts = New-LinkBtn '快捷键' 382 11 72 'keyboard'
@@ -6594,6 +6603,37 @@ try {
         $btnCapRes.Invalidate()
     }
 
+    $script:phoneRing = $null
+    $syncFindPhoneButton = {
+        $ring = $script:phoneRing
+        $ringActive = ($null -ne $ring -and -not $ring.Finished)
+        if ($ringActive) {
+            $stopping = ($ring.Phase -eq 'stopping')
+            $btnFindPhone.Text = if ($stopping) { '正在停止…' } else { '停止响铃' }
+            $btnFindPhone.Enabled = (-not $stopping)
+            $btnFindPhone.BackColor = $cRedStripBg
+            $btnFindPhone.ForeColor = $cRed
+            $btnFindPhone.FlatAppearance.BorderColor = $cRedBorder
+            $btnFindPhone.FlatAppearance.MouseOverBackColor = $cRedBg
+            $btnFindPhone.BtnPaint.HasBorder = $true
+            $btnFindPhone.BtnPaint.Glyph = 'stop'
+            $ringName = if ($ring.DeviceName) { $ring.DeviceName } else { '手机' }
+            $tt.SetToolTip($btnFindPhone, $(if ($stopping) { "正在停止「$ringName」响铃并恢复闹钟音量…" } else { "停止「$ringName」响铃并恢复原来的闹钟音量。" }))
+        } else {
+            $btnFindPhone.Text = '寻找手机'
+            $btnFindPhone.Enabled = $true
+            $btnFindPhone.BackColor = $cPaper
+            $btnFindPhone.FlatAppearance.BorderColor = [System.Drawing.Color]::Transparent
+            $btnFindPhone.FlatAppearance.MouseOverBackColor = $cSoft
+            $btnFindPhone.BtnPaint.HasBorder = $false
+            $btnFindPhone.BtnPaint.Glyph = 'bell'
+            $hasOnline = (@($script:uiState.OnlineDevices).Count -gt 0)
+            $btnFindPhone.ForeColor = if ($script:mainFlow -and $script:mainFlow.Busy) { $cBusyLink } elseif ($hasOnline) { $cText2 } else { $cMuted }
+            $tt.SetToolTip($btnFindPhone, $findPhoneTip)
+        }
+        $btnFindPhone.Invalidate()
+    }
+
     $script:recCardState = @{ Active = $false; Bg = $false }
     $script:trayTextCache = ''
     $syncLiveSession = {
@@ -6602,22 +6642,49 @@ try {
         $activeRecProcs = @($activeProcs | Where-Object { $_.Rec })
         $recCount = $activeRecProcs.Count
         $hasBgRec = (@($activeRecProcs | Where-Object { $_.RecBg }).Count -gt 0)
-        $showSess = ($activeProcs.Count -gt 0)
+        $ring = $script:phoneRing
+        $ringActive = ($null -ne $ring -and -not $ring.Finished)
+        $ringStopping = ($ringActive -and $ring.Phase -eq 'stopping')
+        $ringName = if ($ringActive -and $ring.DeviceName) { $ring.DeviceName } else { '手机' }
+        $showSess = ($activeProcs.Count -gt 0 -or $ringActive)
         if ($showSess) {
-            $camCount = @($script:camSessions | Where-Object { -not $_.Stopped -and $_.Proc -and -not (Test-ProcessExited $_.Proc) }).Count
-            $firstSerial = [string]$activeProcs[0].Serial
-            $firstName = if ($firstSerial) { Get-FriendlyName $firstSerial -CachedOnly } else { '设备' }
-            if ($activeProcs.Count -eq 1) {
-                if ($recCount -gt 0) {
-                    $lblSession.Text = $(if ($activeRecProcs[0].RecBg) { "后台录屏中 · $firstName" } else { "录屏中 · $firstName" })
-                } elseif ($camCount -gt 0) {
-                    $lblSession.Text = "摄像头运行中 · $firstName"
+            if ($activeProcs.Count -gt 0) {
+                $camCount = @($script:camSessions | Where-Object { -not $_.Stopped -and $_.Proc -and -not (Test-ProcessExited $_.Proc) }).Count
+                $firstSerial = [string]$activeProcs[0].Serial
+                $firstName = if ($firstSerial) { Get-FriendlyName $firstSerial -CachedOnly } else { '设备' }
+                if ($activeProcs.Count -eq 1) {
+                    if ($recCount -gt 0) {
+                        $sessText = $(if ($activeRecProcs[0].RecBg) { "后台录屏中 · $firstName" } else { "录屏中 · $firstName" })
+                    } elseif ($camCount -gt 0) {
+                        $sessText = "摄像头运行中 · $firstName"
+                    } else {
+                        $sessText = "投屏中 · $firstName"
+                    }
                 } else {
-                    $lblSession.Text = "投屏中 · $firstName"
+                    $sessText = $(if ($recCount -gt 0) { "运行中 · 共 $($activeProcs.Count) 个会话（含录屏）" } else { "运行中 · 共 $($activeProcs.Count) 个会话" })
                 }
+                if ($ringActive) {
+                    $sessText += $(if ($ringStopping) { ' · 正在停止响铃' } else { ' · 正在响铃' })
+                }
+                $lblSession.Text = $sessText
+                $btnQuickStop.Text = '■ 停止'
+                $btnQuickStop.Enabled = $true
             } else {
-                $lblSession.Text = $(if ($recCount -gt 0) { "运行中 · 共 $($activeProcs.Count) 个会话（含录屏）" } else { "运行中 · 共 $($activeProcs.Count) 个会话" })
+                $lblSession.Text = if ($ringStopping) { "正在停止响铃 · $ringName" } else { "正在响铃 · $ringName" }
+                $btnQuickStop.Text = if ($ringStopping) { '停止中…' } else { '■ 停止' }
+                $btnQuickStop.Enabled = (-not $ringStopping)
             }
+            if ($ringActive -and $activeProcs.Count -eq 0) {
+                $tt.SetToolTip($btnQuickStop, "停止「$ringName」响铃并恢复原来的闹钟音量。")
+            } elseif ($ringActive) {
+                $tt.SetToolTip($btnQuickStop, '停止当前运行的投屏、录制与寻找手机响铃。')
+            } else {
+                $tt.SetToolTip($btnQuickStop, '停止当前全部投屏、录制和摄像头会话。')
+            }
+        } else {
+            $btnQuickStop.Text = '■ 停止'
+            $btnQuickStop.Enabled = $true
+            $tt.SetToolTip($btnQuickStop, '停止当前全部投屏、录制和摄像头会话。')
         }
         $recActive = ($recCount -gt 0)
         if ($recActive -ne $script:recCardState.Active -or $hasBgRec -ne $script:recCardState.Bg) {
@@ -6782,6 +6849,7 @@ try {
         $lblCardMeta.Text = $script:uiState.DevMeta
         $pnlDevTop.Invalidate(); $btnDevName.Invalidate()
         $btnCastHero.Invalidate(); $btnWirelessHero.Invalidate()
+        & $syncFindPhoneButton
         & $syncLiveSession
         & $layoutMainBody
     }
@@ -6850,7 +6918,12 @@ try {
         $script:mainFlow.RefreshPending = $false
         Start-DeviceScan -Owner $form -Kind 'status' -OnDone $renderStatus
     }
-    $script:phoneRing = $null
+    $requestStopPhoneRing = {
+        if (-not $script:phoneRing -or $script:phoneRing.Finished) { return }
+        Stop-PhoneRing $script:phoneRing
+        & $syncFindPhoneButton
+        & $syncLiveSession
+    }
     $phoneRingTimer = New-Object System.Windows.Forms.Timer
     $phoneRingTimer.Interval = 150
     $phoneRingTimer.Add_Tick({
@@ -6860,9 +6933,8 @@ try {
         if ($ring.Finished) {
             $phoneRingTimer.Stop()
             $script:phoneRing = $null
-            $btnFindPhone.Enabled = $true
-            $btnFindPhone.Text = '寻找手机'
-            $tt.SetToolTip($btnFindPhone, $findPhoneTip)
+            & $syncFindPhoneButton
+            & $syncLiveSession
             if ($ring.Failed) {
                 if ($ring.Detail -match 'FIND_PHONE_RESTORE_FAILED') {
                     $heading = '未能恢复闹钟音量'
@@ -6881,14 +6953,13 @@ try {
                 else { & $script:showTempHint $heading $cRed 8000 }
             } else { & $script:showTempHint '已停止响铃。' $cMuted 6000 }
         } elseif ($phase -eq 'starting' -and $ring.Phase -eq 'playing') {
-            & $script:showTempHint "「$($ring.DeviceName)」正在响铃，点「停止响铃」结束。" $cMuted 6000
+            & $script:showTempHint "「$($ring.DeviceName)」正在响铃，点「停止响铃」结束。" $cRed $null
+            & $syncLiveSession
         }
     })
     $btnFindPhone.Add_Click({
         if ($script:phoneRing) {
-            Stop-PhoneRing $script:phoneRing
-            $btnFindPhone.Text = '正在停止…'
-            $btnFindPhone.Enabled = $false
+            & $requestStopPhoneRing
             return
         }
         Invoke-MainFlow -WithDevices -Source $btnFindPhone ({
@@ -6909,8 +6980,10 @@ try {
                 return
             }
             $script:phoneRing.DeviceName = Get-FriendlyName $serial -CachedOnly
-            $btnFindPhone.Text = '停止响铃'
-            $tt.SetToolTip($btnFindPhone, "停止「$($script:phoneRing.DeviceName)」响铃并恢复原来的闹钟音量。")
+            & $syncFindPhoneButton
+            & $syncLiveSession
+            & $script:showTempHint "正在让「$($script:phoneRing.DeviceName)」响铃…" $cMuted $null
+            $script:hintKeepAfterFlow = $true
             $phoneRingTimer.Start()
         })
     })
@@ -7003,14 +7076,23 @@ try {
         [void](Show-ResultDialog $form '如何开启 USB 调试' '三步开启调试权限' "1. 打开手机「设置 > 关于手机」，连续点击 7 次「版本号」开启开发者模式。`n2. 返回「设置 > 开发者选项」，打开「USB 调试」。`n3. 用支持数据传输的 USB 线连接电脑，并在手机弹窗点击「允许 USB 调试」。`n`n完整说明见同目录「使用说明.txt」第一节。" '' @('ok'))
     }) })
 
-    $btnQuickStop.Add_Click({ Invoke-MainFlow ({
-        $res = Stop-DevicesUi $form -All
-        & $syncLiveSession
-        if ($res -and $res.Success) {
-            & $script:showTempHint '已停止当前运行的投屏 / 录制会话' $cGreen 4000
-            $script:hintKeepAfterFlow = $true
+    $btnQuickStop.Add_Click({
+        Update-ProcessLifecycle
+        $activeProcs = @($scrcpyProcs | Where-Object { $_.Proc -and -not (Test-ProcessExited $_.Proc) })
+        if ($activeProcs.Count -eq 0 -and $script:phoneRing -and -not $script:phoneRing.Finished) {
+            & $requestStopPhoneRing
+            return
         }
-    }) })
+        Invoke-MainFlow ({
+            $res = Stop-DevicesUi $form -All
+            if ($script:phoneRing -and -not $script:phoneRing.Finished) { & $requestStopPhoneRing }
+            & $syncLiveSession
+            if ($res -and $res.Success) {
+                & $script:showTempHint '已停止当前运行的投屏 / 录制会话' $cGreen 4000
+                $script:hintKeepAfterFlow = $true
+            }
+        })
+    })
 
     $btnCapAudio.Add_Click({
         if ($script:mainFlow.Busy) { return }
@@ -7067,7 +7149,10 @@ try {
         if (-not $On) {
             foreach ($b in $script:busyCards) { if ($b.CardData) { $b.CardData.Dimmed = $false; $b.Invalidate() } }
             foreach ($c in $script:busyCapsules) { if ($c.CapData) { $c.CapData.Dimmed = $false; $c.Invalidate() } }
-            foreach ($l in $script:busyLinks) { $l.ForeColor = if ($l -eq $btnDevices) { $cInk } else { $cText2 }; $l.Invalidate() }
+            foreach ($l in $script:busyLinks) {
+                if ($l -eq $btnFindPhone) { & $syncFindPhoneButton }
+                else { $l.ForeColor = if ($l -eq $btnDevices) { $cInk } else { $cText2 }; $l.Invalidate() }
+            }
             return
         }
         foreach ($b in $script:busyCards) {
@@ -7075,7 +7160,11 @@ try {
             if ($b.CardData) { $b.CardData.Dimmed = $true; $b.Invalidate() }
         }
         foreach ($c in $script:busyCapsules) { if ($c.CapData) { $c.CapData.Dimmed = $true; $c.Invalidate() } }
-        foreach ($l in $script:busyLinks) { $l.ForeColor = $cBusyLink; $l.Invalidate() }
+        $ringActive = ($null -ne $script:phoneRing -and -not $script:phoneRing.Finished)
+        foreach ($l in $script:busyLinks) {
+            if ($l -eq $btnFindPhone -and $ringActive) { continue }
+            $l.ForeColor = $cBusyLink; $l.Invalidate()
+        }
     }
     function Invoke-MainFlow {
         param([scriptblock]$Body, $Owner, $Flag, $Source, [switch]$WithDevices)
