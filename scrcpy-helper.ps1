@@ -495,56 +495,251 @@ function Get-CommandDetail {
     return (@($Result.Stdout,$Result.Stderr) -join "`n").Trim()
 }
 
-function Invoke-FindPhone {
-    param($Owner, [string]$Serial)
-    # 把音量恢复留在手机端，避免数据线拔掉或等待框取消后，电脑无法再发出恢复命令。
+function Start-PhoneRing {
+    param([string]$Serial)
+    # 单文件发行包携带下方 Java 源码编译出的 DEX。手机用自带的 app_process 播放，无需安装应用。
+    <#
+// 从这一段复制为 ScrcpyPhoneRing.java。使用 Android SDK 36 的 android.jar 和 D8 36.0.0。
+// javac -g:none --release 8 -classpath <android.jar> ScrcpyPhoneRing.java
+// d8 --release --min-api 23 --lib <android.jar> ScrcpyPhoneRing.class
+// 将生成的 classes.dex 转为 Base64，替换下方 $player 的内容。
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioTrack;
+import java.io.FileDescriptor;
+import java.io.FileOutputStream;
+import java.nio.charset.StandardCharsets;
+
+public final class ScrcpyPhoneRing {
+    public static void main(String[] args) throws Exception {
+        final int sampleRate = 48000;
+        final int pulseFrames = sampleRate / 4;
+        final int fadeFrames = sampleRate / 100;
+        short[] samples = new short[sampleRate * 3 / 2];
+        for (int i = 0; i < samples.length; ++i) {
+            int pulse = i / pulseFrames;
+            int frame = i % pulseFrames;
+            if (pulse >= 4 || pulse % 2 != 0) {
+                continue;
+            }
+            double frequency = pulse == 0 ? 1050 : 1550;
+            double envelope = Math.min(1.0, Math.min(frame, pulseFrames - 1 - frame) / (double) fadeFrames);
+            samples[i] = (short) (28000 * envelope * Math.sin(2 * Math.PI * frequency * frame / sampleRate));
+        }
+
+        AudioTrack track = new AudioTrack.Builder()
+                .setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build())
+                .setAudioFormat(new AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build())
+                .setBufferSizeInBytes(samples.length * 2)
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build();
+        try {
+            if (track.write(samples, 0, samples.length) != samples.length ||
+                    track.setLoopPoints(0, samples.length, -1) != AudioTrack.SUCCESS) {
+                throw new IllegalStateException("AudioTrack could not loop the alert");
+            }
+
+            track.play();
+            if (track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) {
+                throw new IllegalStateException("AudioTrack did not start");
+            }
+            // Write to the ADB shell pipe without Android's Java stream redirection.
+            FileOutputStream stdout = new FileOutputStream(FileDescriptor.out);
+            byte[] heartbeat = "FIND_PHONE_PLAYING\n".getBytes(StandardCharsets.US_ASCII);
+            for (;;) {
+                stdout.write(heartbeat);
+                Thread.sleep(1500);
+            }
+        } finally {
+            track.release();
+        }
+    }
+}
+    #>
+    $player = @'
+ZGV4CjAzNQBVFL5/41eNtSFxPTg7CcmKzHGfewiegamUCwAAcAAAAHhWNBIAAAAAAAAAANwKAAA/AAAAcAAAABkAAABsAQAAFQAA
+ANABAAACAAAAzAIAAB8AAADcAgAAAQAAANQDAACgBwAA9AMAAFYGAABeBgAAgwYAAJ0GAACgBgAApAYAAKkGAAC+BgAAwQYAAMYG
+AADMBgAA0gYAANUGAADYBgAA3AYAAOAGAADzBgAAHAcAAD0HAABiBwAAfwcAAKMHAAC/BwAA2wcAAPUHAAARCAAAKAgAAEsIAABd
+CAAAcQgAAIUIAACZCAAAtQgAANoIAADkCAAA5wgAAOsIAADvCAAA8wgAAAgJAAAMCQAAEwkAAB0JAAArCQAAMQkAADYJAAA7CQAA
+QQkAAEoJAABeCQAAbgkAAIQJAACUCQAApAkAALEJAADACQAAzwkAAOAJAADqCQAA7wkAAPYJAAD9CQAABAoAAAMAAAAHAAAACwAA
+AA8AAAAQAAAAEQAAABIAAAATAAAAFAAAABUAAAAWAAAAFwAAABgAAAAZAAAAGgAAABsAAAAcAAAAHQAAAB4AAAAfAAAAIAAAACIA
+AAAlAAAAJgAAACcAAAAEAAAAAAAAAOAFAAAFAAAAAAAAAOgFAAAHAAAAAQAAAAAAAAAIAAAAAQAAAPAFAAAJAAAAAQAAAPgFAAAK
+AAAAAQAAAAQGAAANAAAABAAAABAGAAAMAAAABQAAAAAAAAANAAAABgAAABAGAAAMAAAABwAAAAAAAAANAAAACAAAABAGAAAOAAAA
+CAAAABgGAAAOAAAACAAAACAGAAAMAAAACQAAAAAAAAAiAAAAFQAAAAAAAAAjAAAAFQAAACgGAAAkAAAAFQAAADAGAAAkAAAAFQAA
+ADgGAAAkAAAAFQAAAEAGAAAkAAAAFQAAAEgGAAAOAAAAFgAAAFAGAAALAAsALQAAABQAEwAhAAAAAwAOAAAAAAADABMAKwAAAAQA
+DgAAAAAABAAHACgAAAAEAAYANAAAAAQABgA5AAAABgAOAAAAAAAGAAkAKAAAAAYACAAzAAAABgAIADUAAAAGAAgANwAAAAgADgAA
+AAAACAANACgAAAAIAAsAMAAAAAgADAAxAAAACAAKADIAAAAIAAoAOAAAAAkAAgAqAAAACQAOAC4AAAAJAA4ALwAAAAkABAA2AAAA
+CQAFAD0AAAAMABAAAAAAAAwAEgA9AAAADgARAAAAAAAPAAEALAAAAA8AAwAsAAAADwAAADoAAAAQAA4AAAAAABEAFAApAAAAEgAP
+ADsAAAADAAAAEQAAABAAAAAAAAAA/////8QKAACuCgAAAAAAAAEAAQABAAAAAAAAAAQAAABwEBwAAAAOAAsAAQAEAAEAAAAAANwA
+AAAUCkAZAQAjoBgAEgEBEhJDNaJKANMk4C7UJeAuNTRBANwDBAI4AwMAKDs5BAgAGAMAAAAAAGiQQCgGGAMAAAAAADiYQNFW3y5x
+IBoAZQAKBoNmGQh+QM6GGQjwP3FAGQCYdgsGGAgAAAAAAFjbQM2GGAgYLURU+yEZQM2Dg1jNgxgIAAAAAABw50DOg3EgGwBDAAsD
+zTaKY48zUQMAAtgCAgEotiICCABwEAsAAgAiBAQAcBACAAQAbiAFADQADARuIAQANAAMBG4QAwAEAAwEbiANAEIADAIiBAYAcBAG
+AAQAEiVuIAkAVAAMBBQFgLsAAG4gCgBUAAwEbiAIADQADANuEAcAAwAMA24gDgAyAAwCFAOAMgIAbiAPADIADAJuIBAAEgAMAm4Q
+DAACAAwCbkAVAAKhCgAzoDMAEvBuQBQAEgoKCjkKLABuEBIAAgBuEBEAAgAKChIwMwoaACIKDABiAAAAcCAWAAoAGgAGAGIBAQBu
+IB0AEAAMAG4gFwAKABYD3AVxIB4AQwAo+CIKDgAaAAIAcCAYAAoAJwoiCg4AGgABAHAgGAAKACcKDQpuEBMAAgAnCpgAAAA/AAEA
+AQDXAQEAAAAAAAAAAgAAAAAAAAACAAAAAQABAAMAAAABAAEAAQAAAAMAAAAYAAEAAQAAAAEAAAABAAAAAQAAAAUAAAABAAAABwAA
+AAEAAAACAAAAAQAAAAsAAAABAAAAEQAAAAEAAAAWAAAAAQAAABcAAAABAAAAEwAGPGluaXQ+ACNBdWRpb1RyYWNrIGNvdWxkIG5v
+dCBsb29wIHRoZSBhbGVydAAYQXVkaW9UcmFjayBkaWQgbm90IHN0YXJ0AAFEAAJERAADREREABNGSU5EX1BIT05FX1BMQVlJTkcK
+AAFJAANJSUkABElJSUkABElMSUkAAUoAAUwAAkxJAAJMTAARTFNjcmNweVBob25lUmluZzsAJ0xhbmRyb2lkL21lZGlhL0F1ZGlv
+QXR0cmlidXRlcyRCdWlsZGVyOwAfTGFuZHJvaWQvbWVkaWEvQXVkaW9BdHRyaWJ1dGVzOwAjTGFuZHJvaWQvbWVkaWEvQXVkaW9G
+b3JtYXQkQnVpbGRlcjsAG0xhbmRyb2lkL21lZGlhL0F1ZGlvRm9ybWF0OwAiTGFuZHJvaWQvbWVkaWEvQXVkaW9UcmFjayRCdWls
+ZGVyOwAaTGFuZHJvaWQvbWVkaWEvQXVkaW9UcmFjazsAGkxkYWx2aWsvYW5ub3RhdGlvbi9UaHJvd3M7ABhMamF2YS9pby9GaWxl
+RGVzY3JpcHRvcjsAGkxqYXZhL2lvL0ZpbGVPdXRwdXRTdHJlYW07ABVMamF2YS9sYW5nL0V4Y2VwdGlvbjsAIUxqYXZhL2xhbmcv
+SWxsZWdhbFN0YXRlRXhjZXB0aW9uOwAQTGphdmEvbGFuZy9NYXRoOwASTGphdmEvbGFuZy9PYmplY3Q7ABJMamF2YS9sYW5nL1N0
+cmluZzsAEkxqYXZhL2xhbmcvVGhyZWFkOwAaTGphdmEvbmlvL2NoYXJzZXQvQ2hhcnNldDsAI0xqYXZhL25pby9jaGFyc2V0L1N0
+YW5kYXJkQ2hhcnNldHM7AAhVU19BU0NJSQABVgACVkoAAlZMAAJbQgATW0xqYXZhL2xhbmcvU3RyaW5nOwACW1MABWJ1aWxkAAhn
+ZXRCeXRlcwAMZ2V0UGxheVN0YXRlAARtYWluAANtaW4AA291dAAEcGxheQAHcmVsZWFzZQASc2V0QXVkaW9BdHRyaWJ1dGVzAA5z
+ZXRBdWRpb0Zvcm1hdAAUc2V0QnVmZmVyU2l6ZUluQnl0ZXMADnNldENoYW5uZWxNYXNrAA5zZXRDb250ZW50VHlwZQALc2V0RW5j
+b2RpbmcADXNldExvb3BQb2ludHMADXNldFNhbXBsZVJhdGUAD3NldFRyYW5zZmVyTW9kZQAIc2V0VXNhZ2UAA3NpbgAFc2xlZXAA
+BXZhbHVlAAV3cml0ZQCfAX5+RDh7ImJhY2tlbmQiOiJkZXgiLCJjb21waWxhdGlvbi1tb2RlIjoicmVsZWFzZSIsImhhcy1jaGVj
+a3N1bXMiOmZhbHNlLCJtaW4tYXBpIjoyMywic2hhLTEiOiJhN2FkMThhNzA0NjBiNzk5ZDA0ODJlNDk3YzEwOWE3NWJmN2Y5MWRl
+IiwidmVyc2lvbiI6IjguMTAuOS1kZXYifQACCgE8HAEYDQAAAgAAgYAE9AcBCYwIAQAAAKYKAAAAAAAAAAAAAAEAAAAAAAAAAQAA
+ALwKAAAPAAAAAAAAAAEAAAAAAAAAAQAAAD8AAABwAAAAAgAAABkAAABsAQAAAwAAABUAAADQAQAABAAAAAIAAADMAgAABQAAAB8A
+AADcAgAABgAAAAEAAADUAwAAASAAAAIAAAD0AwAAARAAAA4AAADgBQAAAiAAAD8AAABWBgAABCAAAAEAAACmCgAAACAAAAEAAACu
+CgAAAxAAAAEAAAC8CgAABiAAAAEAAADECgAAABAAAAEAAADcCgAA
+'@ -replace '\s'
+    # 音量恢复和临时文件清理留在手机上，ADB 断开后电脑无法代为收尾。
     $remote = @'
-volume() { cmd media_session volume --stream 5 "$@"; }
-volume_index() { sed -n 's/.*volume is \([0-9][0-9]*\) in range \[[0-9][0-9]*\.\.[0-9][0-9]*\].*/\1/p'; }
-restore_volume() {
-    result=$(volume --set "$original" --get 2>&1)
-    if [ "$(printf '%s\n' "$result" | volume_index)" != "$original" ]; then
-        printf '%s\n' FIND_PHONE_RESTORE_FAILED "$result"
+volume_range() {
+    cmd media_session volume --stream 4 "$@" --get |
+        sed -n 's/.*volume is \([0-9][0-9]*\) in range \[\([0-9][0-9]*\)\.\.\([0-9][0-9]*\)\].*/\1 \2 \3/p'
+}
+set_alarm_volume() {
+    # 部分系统只接受 audio 服务的改音量命令，旧版 Android 则只支持 media_session。
+    cmd audio set-volume 4 "$1" >/dev/null 2>&1
+    range=$(volume_range)
+    if [ "${range%% *}" != "$1" ]; then
+        range=$(volume_range --set "$1")
     fi
+    [ "${range%% *}" = "$1" ]
+}
+cleanup() {
+    # 部分 ROM 的 app_process 即便释放 AudioTrack 也会卡在退出阶段，直接结束本次的专用播放器。
+    if [ -n "$player_pid" ]; then
+        kill -KILL "$player_pid" 2>/dev/null
+        wait "$player_pid" 2>/dev/null
+    fi
+    if [ -n "$restore" ] && ! set_alarm_volume "$restore"; then
+        echo FIND_PHONE_RESTORE_FAILED >&2
+    fi
+    rm -f "$player"
+    rmdir "$workdir"
 }
 
-range=$(volume --get 2>&1 | sed -n 's/.*volume is \([0-9][0-9]*\) in range \[[0-9][0-9]*\.\.\([0-9][0-9]*\)\].*/\1 \2/p')
-set -- $range
-raised=0
-# 音量为零时跳过调整，避免联动改变静音或振动模式。
-if [ "$#" -eq 2 ] && [ "$1" -gt 0 ] && [ "$1" -le "$2" ]; then
-    original=$1
-    maximum=$2
-    if [ "$original" != "$maximum" ]; then
-        trap 'restore_volume' EXIT
-        trap 'exit 1' HUP INT TERM
-        raised=1
-        result=$(volume --set "$maximum" --get 2>&1)
-        current=$(printf '%s\n' "$result" | volume_index)
-    else
-        current=$original
-    fi
-    if [ "$current" = "$maximum" ]; then
-        echo FIND_PHONE_MAX_VOLUME
-    fi
-fi
+umask 077
+workdir=$(mktemp -d /data/local/tmp/scrcpy-helper-ring.XXXXXX) || exit 1
+player="$workdir/player.dex"
+restore=
+player_pid=
+trap cleanup EXIT
+# adb 断开时让播放器先通过 stdin 或心跳停下来，shell 才有机会恢复音量。
+trap '' HUP PIPE
+trap 'exit 1' INT TERM
+# Android 14 起，动态加载的 DEX 必须是只读文件。
+{ chmod 400 "$player" && printf '%s' '__PLAYER__' | base64 -d; } > "$player" || exit 1
 
-notification=$(cmd notification post -v -t '寻找手机' scrcpy-helper-find-phone '电脑正在寻找这台手机。' 2>&1)
-if printf '%s\n' "$notification" | grep -q '^posted:'; then
-    echo FIND_PHONE_POSTED
-else
-    printf '%s\n' "$notification"
+set -- $(volume_range)
+if [ "$#" -ne 3 ] || [ "$3" -le 0 ] || [ "$1" -lt "$2" ] || [ "$1" -gt "$3" ]; then
+    echo FIND_PHONE_VOLUME_UNAVAILABLE >&2
+    exit 1
 fi
-if cmd vibrator_manager synced oneshot 1200 >/dev/null 2>&1 ||
-   cmd vibrator vibrate 1200 >/dev/null 2>&1; then
-    echo FIND_PHONE_VIBRATION_REQUESTED
+if [ "$1" != "$3" ]; then
+    restore=$1
+    if ! set_alarm_volume "$3"; then
+        echo FIND_PHONE_VOLUME_UNAVAILABLE >&2
+        exit 1
+    fi
 fi
-if [ "$raised" -eq 1 ]; then
-    sleep 3
-fi
+CLASSPATH="$player" app_process /system/bin ScrcpyPhoneRing </dev/null &
+player_pid=$!
+# 等待电脑确认播放器仍在正常回报。电脑退出、断线或卡住时，手机会自己收尾。
+while IFS= read -r -t 10 heartbeat && [ "$heartbeat" = "." ]; do
+    kill -0 "$player_pid" 2>/dev/null || exit 1
+done
 '@
-    $remote = $remote.Replace("`r`n", "`n")
-    return (Invoke-UiCommand -Owner $Owner -FilePath $adb -ArgumentList @('-s', $Serial, 'shell', '-T', $remote) -TimeoutMs 12000 -StatusText '正在发送寻找提示…')
+    $remote = $remote.Replace("`r`n", "`n").Replace('__PLAYER__', $player)
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $adb
+    $psi.Arguments = (@(@('-s', $Serial, 'shell', '-T', $remote) | ForEach-Object { Fm-WinArg $_ }) -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+    $proc = [Diagnostics.Process]::Start($psi)
+    return @{
+        Process = $proc; Phase = 'starting'; Clock = [Diagnostics.Stopwatch]::StartNew()
+        Line = $proc.StandardOutput.ReadLineAsync(); Errors = $proc.StandardError.ReadToEndAsync()
+        Output = [Collections.Generic.List[string]]::new(); Failed = $false
+    }
+}
+
+function Stop-PhoneRing {
+    param([hashtable]$Ring)
+    if (-not $Ring -or $Ring.Phase -eq 'stopping') { return }
+    $Ring.Phase = 'stopping'
+    $Ring.Clock.Restart()
+    try { $Ring.Process.StandardInput.Close() } catch {}
+}
+
+function Update-PhoneRing {
+    param([hashtable]$Ring)
+    $proc = $Ring.Process
+    while ($Ring.Line -and $Ring.Line.IsCompleted) {
+        if ($Ring.Line.IsFaulted) {
+            $Ring.Output.Add($Ring.Line.Exception.GetBaseException().Message)
+            $Ring.Line = $null
+            break
+        }
+        $line = $Ring.Line.Result
+        $Ring.Line = if ($null -ne $line) { $proc.StandardOutput.ReadLineAsync() }
+        if ($line -eq 'FIND_PHONE_PLAYING') {
+            if ($Ring.Phase -ne 'stopping' -and -not $proc.HasExited) {
+                # 只给正在回报的播放器续期，避免 ADB 卡住时向它的输入管道堆数据。
+                try {
+                    $proc.StandardInput.Write(".`n")
+                    $Ring.Phase = 'playing'
+                    $Ring.Clock.Restart()
+                } catch {
+                    $Ring.Output.Add($_.Exception.Message)
+                    $Ring.Failed = $true
+                    Stop-PhoneRing $Ring
+                }
+            }
+        } elseif ($line) {
+            $Ring.Output.Add($line)
+        }
+    }
+    if ($proc.HasExited -and -not $Ring.Line -and $Ring.Errors.IsCompleted) {
+        if (-not $Ring.Errors.IsFaulted -and $Ring.Errors.Result) {
+            $Ring.Output.Add($Ring.Errors.Result.Trim())
+        }
+        $Ring.Detail = $Ring.Output -join "`n"
+        $Ring.Failed = $Ring.Failed -or $Ring.Phase -ne 'stopping' -or $proc.ExitCode -ne 0 -or
+            $Ring.Detail -match 'FIND_PHONE_RESTORE_FAILED'
+        $Ring.Finished = $true
+        $proc.Dispose()
+    } elseif ($Ring.Clock.ElapsedMilliseconds -gt 12000) {
+        $Ring.Failed = $true
+        if ($Ring.Phase -eq 'stopping') {
+            try { $proc.Kill() } catch {}
+            $Ring.Detail = '未收到手机已停止响铃及恢复音量的回报。'
+            $Ring.Finished = $true
+            $proc.Dispose()
+        } else {
+            $Ring.Output.Add('等待手机回报响铃状态超时。')
+            Stop-PhoneRing $Ring
+        }
+    }
 }
 
 function Invoke-ConnectDevices {
@@ -5996,7 +6191,8 @@ try {
     $form.Controls.Add($lblSection)
 
     $btnFindPhone = New-LinkBtn '寻找手机' 298 11 80
-    $tt.SetToolTip($btnFindPhone, '让当前手机以最大通知音量播放提示音，并短振。实际效果取决于手机的系统设置。')
+    $findPhoneTip = '以最大闹钟音量循环播放提示音，直到点「停止响铃」。'
+    $tt.SetToolTip($btnFindPhone, $findPhoneTip)
     $btnShortcuts = New-LinkBtn '快捷键' 382 11 72 'keyboard'
     $btnSettings  = New-LinkBtn '设置'   458 11 62 'settings'
     $form.Controls.AddRange(@($btnFindPhone, $btnShortcuts, $btnSettings))
@@ -6488,41 +6684,73 @@ try {
         $script:mainFlow.RefreshPending = $false
         Start-DeviceScan -Owner $form -Kind 'status' -OnDone $renderStatus
     }
-    $btnFindPhone.Add_Click({ Invoke-MainFlow -WithDevices -Source $btnFindPhone ({
-        param($devices)
-        $devs = @($devices)
-        if ($devs.Count -eq 0) {
-            [void](Show-ResultDialog $form '寻找手机' '没检测到手机' '请用数据线连接并允许 USB 调试，或点「无线连接…」。')
+    $script:phoneRing = $null
+    $phoneRingTimer = New-Object System.Windows.Forms.Timer
+    $phoneRingTimer.Interval = 150
+    $phoneRingTimer.Add_Tick({
+        $ring = $script:phoneRing
+        $phase = $ring.Phase
+        Update-PhoneRing $ring
+        if ($ring.Finished) {
+            $phoneRingTimer.Stop()
+            $script:phoneRing = $null
+            $btnFindPhone.Enabled = $true
+            $btnFindPhone.Text = '寻找手机'
+            $tt.SetToolTip($btnFindPhone, $findPhoneTip)
+            if ($ring.Failed) {
+                if ($ring.Detail -match 'FIND_PHONE_RESTORE_FAILED') {
+                    $heading = '未能恢复闹钟音量'
+                    $body = '请在手机上检查闹钟音量。'
+                } elseif ($ring.Detail -match 'FIND_PHONE_VOLUME_UNAVAILABLE') {
+                    $heading = '手机未能调至最大闹钟音量'
+                    $body = '请检查手机的音量和勿扰设置。'
+                } else {
+                    $heading = '手机响铃未能继续'
+                    $body = '请确认手机仍在线后重试。'
+                }
+                if ($form.Visible) { [void](Show-ResultDialog $form '寻找手机' $heading $body $ring.Detail) }
+                else { & $script:showTempHint $heading $cRed 8000 }
+            } else { & $script:showTempHint '已停止响铃。' $cMuted 6000 }
+        } elseif ($phase -eq 'starting' -and $ring.Phase -eq 'playing') {
+            & $script:showTempHint '手机正在响铃，点「停止响铃」结束。' $cMuted 6000
+        }
+    })
+    $btnFindPhone.Add_Click({
+        if ($script:phoneRing) {
+            Stop-PhoneRing $script:phoneRing
+            $btnFindPhone.Text = '正在停止…'
+            $btnFindPhone.Enabled = $false
             return
         }
-        $serial = if ($devs -contains $script:uiState.SelectedSerial) { $script:uiState.SelectedSerial }
-                  elseif ($devs.Count -eq 1) { $devs[0] }
-                  else { Select-Device $form $devs '寻找手机 · 选择设备' '检测到多台设备，选择要寻找的一台：' '寻找这台' }
-        if (-not $serial) { return }
-
-        $result = Invoke-FindPhone $form $serial
-        if ($result.Cancelled) { return }
-        $detail = Get-CommandDetail $result
-        if (-not (Test-CommandSuccess $result)) {
-            [void](Show-ResultDialog $form '寻找手机' '无法确认寻找提示已发送' '请确认手机仍在线后重试。如通知音量发生变化，可在手机上调回。' $detail)
-            return
+        Invoke-MainFlow -WithDevices -Source $btnFindPhone ({
+            param($devices)
+            $devs = @($devices)
+            if ($devs.Count -eq 0) {
+                [void](Show-ResultDialog $form '寻找手机' '没检测到手机' '请用数据线连接并允许 USB 调试，或点「无线连接…」。')
+                return
+            }
+            $serial = if ($devs -contains $script:uiState.SelectedSerial) { $script:uiState.SelectedSerial }
+                      elseif ($devs.Count -eq 1) { $devs[0] }
+                      else { Select-Device $form $devs '寻找手机 · 选择设备' '检测到多台设备，选择要寻找的一台：' '寻找这台' }
+            if (-not $serial) { return }
+            try { $script:phoneRing = Start-PhoneRing $serial }
+            catch {
+                [void](Show-ResultDialog $form '寻找手机' '无法启动响铃' '请确认手机仍在线后重试。' $_.Exception.Message)
+                return
+            }
+            $btnFindPhone.Text = '停止响铃'
+            $tt.SetToolTip($btnFindPhone, '停止响铃并恢复手机原来的闹钟音量。')
+            $phoneRingTimer.Start()
+        })
+    })
+    $form.Add_FormClosed({
+        $phoneRingTimer.Dispose()
+        if ($script:phoneRing) {
+            Stop-PhoneRing $script:phoneRing
+            $script:phoneRing.Process.Dispose()
+            $script:phoneRing = $null
         }
-        if ($result.Stdout -match '(?m)^FIND_PHONE_RESTORE_FAILED\r?$') {
-            [void](Show-ResultDialog $form '寻找手机' '未能恢复通知音量' '请在手机上检查通知音量。' $detail)
-            return
-        }
-        if ($result.Stdout -match '(?m)^FIND_PHONE_POSTED\r?$') {
-            $hint = if ($result.Stdout -match '(?m)^FIND_PHONE_MAX_VOLUME\r?$') { '已发送寻找提示。' }
-                    else { '已发送寻找提示，未确认通知音量已调至最大。' }
-        } elseif ($result.Stdout -match '(?m)^FIND_PHONE_VIBRATION_REQUESTED\r?$') {
-            $hint = '无法发送通知提示音，已请求手机短振。'
-        } else {
-            [void](Show-ResultDialog $form '寻找手机' '手机未接受寻找提示' '请检查手机的系统通知设置和连接状态。' $detail)
-            return
-        }
-        & $script:showTempHint $hint $cMuted 6000
-        $script:hintKeepAfterFlow = $true
-    }) })
+    })
     $btnShortcuts.Add_Click({ Invoke-MainFlow ({ Show-Shortcuts $form }) })
     $btnSettings.Add_Click({
         Invoke-MainFlow ({ Show-Settings $form })
