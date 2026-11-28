@@ -27,6 +27,7 @@ function Reset-SettingsState {
     foreach ($key in $defaults.Keys) { $script:settings[$key] = $defaults[$key] }
     $script:customApps = [ordered]@{}
     $script:hiddenBuiltInApps = @{}
+    $script:appFavoriteOrder = [Collections.Generic.List[string]]::new()
     $script:knownDevices = [ordered]@{}
     $script:deviceNames = [ordered]@{}
     $script:camResByDevice = [ordered]@{}
@@ -49,6 +50,7 @@ function Check-ValidSettings {
         $script:knownDevices['adb-example._adb-tls-connect._tcp'] -ceq $dateAlias) 'A saved device nickname changed'
     Check ($script:customApps.Count -eq 1 -and $script:customApps['Keys'] -ceq 'com.example.app') 'Custom app entries did not survive'
     Check ($script:hiddenBuiltInApps.Count -eq 2 -and $script:hiddenBuiltInApps.ContainsKey('com.tencent.mm') -and $script:hiddenBuiltInApps.ContainsKey('com.taobao.taobao')) 'Hidden built-in favorites did not survive or accepted invalid entries'
+    Check (($script:appFavoriteOrder -join '|') -ceq 'custom:Keys|builtin:com.tencent.mm|builtin:com.taobao.taobao') 'Favorite order changed or accepted invalid entries'
     Check ($script:deviceNames.Count -eq 1 -and $script:deviceNames['usb-a'] -ceq '备用手机') 'Device labels did not survive'
     Check (($script:autoConnectExclude -join '|') -ceq '192.0.2.7:5555|192.0.2.8:5555') 'The exclusion list was lost or accepted invalid entries'
     Check ($script:camResByDevice.Count -eq 3 -and $script:camResByDevice['usb-a|back'] -ceq '1920x1080' -and
@@ -95,6 +97,7 @@ try {
   },
   "customApps": {"broken": 1, "Keys": "com.example.app"},
   "hiddenBuiltInApps": ["com.tencent.mm", ["nested"], 42, " ", "COM.TENCENT.MM", "com.taobao.taobao"],
+  "appFavoriteOrder": ["custom:Keys", "builtin:com.tencent.mm", "invalid", ["custom:bad"], 42, "custom:Keys", "builtin:com.taobao.taobao"],
   "deviceNames": {"broken": false, "usb-a": "备用手机"},
   "autoConnectExclude": ["192.0.2.7:5555", ["bad"], 42, null, "192.0.2.8:5555"],
   "camResByDevice": {
@@ -124,7 +127,7 @@ try {
     Load-Settings
     Check ($settings.maxFps -eq $defaults.maxFps -and $script:knownDevices.Count -eq 0) 'Overflow or malformed device map was restored'
     Check ($script:deviceNames['usb-a'] -ceq 'Still here' -and $script:autoConnectExclude[0] -ceq '192.0.2.1:5555') 'Bad map shape prevented other memories from loading'
-    Check ($script:hiddenBuiltInApps.Count -eq 0) 'Legacy settings hid built-in favorites'
+    Check ($script:hiddenBuiltInApps.Count -eq 0 -and $script:appFavoriteOrder.Count -eq 0) 'Legacy settings changed the default favorites'
 
     foreach ($raw in @('{"knownDevices":{"192.0.2.7:5555":"Original phone"}', '[{"maxSize":720}]')) {
         Reset-SettingsState

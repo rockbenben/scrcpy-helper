@@ -192,6 +192,8 @@ $cfgPath = Join-Path $PSScriptRoot '投屏助手-设置.json'
 
 $script:customApps = [ordered]@{}   # 用户自定义的常用 App（名称 => 包名），随设置一起存进 投屏助手-设置.json
 $script:hiddenBuiltInApps = @{}    # 按包名记住移除项，避免应用改名后又出现在常用列表。
+$script:appFavoriteOrder = [Collections.Generic.List[string]]::new()
+$script:phoneAppListCache = @{}
 $script:knownDevices = [ordered]@{} # 记住的无线设备（ip:port 或 mDNS 标识 => 备注名），连接成功自动记下，供「设备管理」切换/重连
 $script:deviceNames  = [ordered]@{} # 用户自定义的设备显示名（序列号/地址 => 名称），优先于型号显示，可在「设备管理」里重命名
 $script:autoConnectExclude = New-Object System.Collections.Generic.List[string]  # 不自动连接的无线地址（设备管理里可切换）
@@ -1421,6 +1423,11 @@ function Load-Settings {
     foreach ($pkg in @($j.PSObject.Properties['hiddenBuiltInApps'].Value)) {
         if ($pkg -is [string] -and -not [string]::IsNullOrWhiteSpace($pkg)) { $script:hiddenBuiltInApps[$pkg] = $true }
     }
+    foreach ($id in @($j.PSObject.Properties['appFavoriteOrder'].Value)) {
+        if ($id -is [string] -and $id -match '^(?:builtin|custom):.+$' -and $script:appFavoriteOrder -notcontains $id) {
+            $script:appFavoriteOrder.Add($id)
+        }
+    }
     foreach ($address in @($j.PSObject.Properties['autoConnectExclude'].Value)) {
         if ($address -is [string] -and $address) { [void]$script:autoConnectExclude.Add($address) }
     }
@@ -1462,6 +1469,7 @@ function Save-Settings {
         foreach ($k in $settings.Keys) { $o[$k] = $settings[$k] }
         $o['customApps'] = $script:customApps
         $o['hiddenBuiltInApps'] = @($script:hiddenBuiltInApps.psbase.Keys | Sort-Object)
+        $o['appFavoriteOrder'] = @($script:appFavoriteOrder)
         $o['knownDevices'] = $script:knownDevices
         $o['deviceNames'] = $script:deviceNames
         $o['autoConnectExclude'] = @($script:autoConnectExclude)
@@ -3338,6 +3346,48 @@ function Show-Settings {
     [void]$dlg.ShowDialog($owner)
 }
 
+function Get-AppFavorites {
+    $remaining = [ordered]@{}
+    foreach ($map in @($apps, $script:customApps)) {
+        $builtIn = [object]::ReferenceEquals($map, $apps)
+        foreach ($name in $map.psbase.Keys) {
+            $pkg = $map[$name]
+            if ($builtIn -and $script:hiddenBuiltInApps.ContainsKey($pkg)) { continue }
+            # 内置项按包名记顺序，自定义项按显示名区分旧设置里同包名的多个快捷项。
+            $id = if ($builtIn) { "builtin:$pkg" } else { "custom:$name" }
+            $remaining[$id] = [pscustomobject]@{ Id=$id; Name=$name; Pkg=$pkg; Favorite=$true; BuiltIn=$builtIn }
+        }
+    }
+    $ordered = @(
+        foreach ($id in $script:appFavoriteOrder) {
+            if ($remaining.Contains($id)) {
+                $remaining[$id]
+                $remaining.Remove($id)
+            }
+        }
+        $remaining.psbase.Values
+    )
+    return @($ordered)
+}
+
+function Move-AppFavorite {
+    param([string]$sourceId, [string]$targetId)
+    if ($sourceId -eq $targetId) { return $false }
+    $order = [Collections.Generic.List[string]]::new()
+    foreach ($item in @(Get-AppFavorites)) { $order.Add($item.Id) }
+    $sourceIndex = $order.IndexOf($sourceId)
+    $targetIndex = $order.IndexOf($targetId)
+    if ($sourceIndex -lt 0 -or $targetIndex -lt 0) { return $false }
+
+    # 移到目标原来的行号，向下拖放在目标后面，向上拖放在目标前面。
+    $order.RemoveAt($sourceIndex)
+    $order.Insert($targetIndex, $sourceId)
+    $script:appFavoriteOrder.Clear()
+    $script:appFavoriteOrder.AddRange($order)
+    Save-Settings
+    return $true
+}
+
 function Add-AppFavorite {
     param($owner, [string]$name, [string]$pkg, [switch]$FromPhone)
     $builtInName = foreach ($key in $apps.psbase.Keys) {
@@ -3366,38 +3416,54 @@ function Add-AppFavorite {
     return $name
 }
 
-# ---------------- 从手机已装 App 和常用应用里挑一个（可搜索） ----------------
-function Show-AppPicker {
-    param($owner, $serial)
-    $title = '更多应用'
-    # 多设备连接时必须指定序列号，避免读取错误的手机。
+function Read-PhoneAppList {
+    param($owner, $serial, [switch]$Refresh)
+    $cached = if ($serial) { $script:phoneAppListCache[$serial] }
+    if (-not $Refresh -and $cached -and $cached.ExpiresAt -gt [DateTime]::UtcNow) { return $cached }
+
+    # 手机应用多或无线连接较慢时，默认命令超时可能赶不上 scrcpy 返回列表。
     $listArgs = if ($serial) { @('-s', $serial, '--list-apps') } else { @('--list-apps') }
     $oldCursor = $owner.Cursor
     $owner.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    try { $command = Invoke-UiCommand $owner $exe $listArgs -StatusText '正在读取手机应用列表…' }
+    try { $command = Invoke-UiCommand $owner $exe $listArgs -TimeoutMs 60000 -StatusText '正在读取手机应用列表…' }
     finally { $owner.Cursor = $oldCursor }
-    if ($command.Cancelled) { return $null }
 
-    $installed = @{}
     if (Test-CommandSuccess $command) {
+        $installed = @{}
         $raw = $command.Stdout + "`n" + $command.Stderr
         foreach ($line in ($raw -split "`n")) {
             if ($line -match '^\s*[-*]\s+(.*?)\s+([A-Za-z][A-Za-z0-9._]+)\s*$') {
                 $installed[$matches[2]] = $matches[1].Trim()
             }
         }
-    } else {
-        [void](Show-ResultDialog $owner $title '读取手机应用列表失败' '请确认手机仍在线。这里仍可查看常用应用，或用「手动添加」。' (Get-CommandDetail $command) @('ok'))
+        $result = @{ Apps=$installed; Status=''; Detail=''; ExpiresAt=[DateTime]::UtcNow.AddMinutes(2) }
+        if ($serial) { $script:phoneAppListCache[$serial] = $result }
+        return $result
     }
 
-    $dlg = New-Dialog $title 460 388 $owner
+    $status = if ($command.Cancelled) { '已取消读取手机应用列表。' }
+        elseif ($command.TimedOut) { '读取手机应用列表超时。' }
+        else { '读取手机应用列表失败。' }
+    $lastApps = if ($cached) { $cached.Apps } else { @{} }
+    return @{ Apps=$lastApps; Status=$status; Detail=(Get-CommandDetail $command) }
+}
+
+# ---------------- 从手机已装 App 和常用应用里挑一个（可搜索） ----------------
+function Show-AppPicker {
+    param($owner, $serial)
+    $appList = @{ Current=(Read-PhoneAppList $owner $serial) }
+    $dlg = New-Dialog '更多应用' 460 388 $owner
     $lbl = New-Lbl '按应用名称或包名搜索' 16 14
+    $btnRefresh = New-LinkBtn '刷新应用列表' 336 8 108
     $txt = New-Txt 16 40 308
-    $chkFavorites = New-Chk '只看常用' ($installed.Count -eq 0) 344 42
+    $chkFavorites = New-Chk '只看常用' ($appList.Current.Apps.Count -eq 0) 344 42
+    $lblSortHint = New-Caption '拖动常用应用调整顺序。' 16 71
+    $lblStatus = New-Caption '' 192 71
     $lb = New-Object System.Windows.Forms.ListBox
-    $lb.Location = '16,74'; $lb.Size = '428,256'
+    $lb.Location = '16,94'; $lb.Size = '428,236'
     $lb.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
-    $lblEmpty = New-Caption '没有匹配的应用' 24 84
+    $lb.AllowDrop = $true
+    $lblEmpty = New-Caption '没有匹配的应用' 24 104
     $lblEmpty.BackColor = $cWhite
 
     $btnGo = New-PrimaryBtn '选择应用' 16 342 102 34 10
@@ -3419,29 +3485,33 @@ function Show-AppPicker {
     $fill = {
         param([string]$preferredName, [string]$preferredPackage, [switch]$ClearSelection)
         $query = $txt.Text.Trim()
-        $listedPackages = @{}
-        $entries = @(
-            foreach ($map in @($apps, $script:customApps)) {
-                $builtIn = [object]::ReferenceEquals($map, $apps)
-                foreach ($name in $map.psbase.Keys) {
-                    $pkg = $map[$name]
-                    $favorite = -not ($builtIn -and $script:hiddenBuiltInApps.ContainsKey($pkg))
-                    if (-not $favorite -and ($chkFavorites.Checked -or $script:customApps.psbase.Values -contains $pkg)) { continue }
-                    $listedPackages[$pkg] = $true
-                    [pscustomobject]@{ Name=$name; Pkg=$pkg; Favorite=$favorite; BuiltIn=$builtIn }
+        $installed = $appList.Current.Apps
+        $favorites = @(Get-AppFavorites)
+        $entries = if ($chkFavorites.Checked) { $favorites } else {
+            $listedPackages = @{}
+            $all = @(
+                foreach ($entry in $favorites) {
+                    $listedPackages[$entry.Pkg] = $true
+                    $entry
                 }
-            }
-            if (-not $chkFavorites.Checked) {
+                foreach ($name in $apps.psbase.Keys) {
+                    $pkg = $apps[$name]
+                    if (-not $listedPackages.ContainsKey($pkg)) {
+                        $listedPackages[$pkg] = $true
+                        [pscustomobject]@{ Name=$name; Pkg=$pkg; Favorite=$false; BuiltIn=$true }
+                    }
+                }
                 foreach ($pkg in $installed.psbase.Keys) {
                     if (-not $listedPackages.ContainsKey($pkg)) {
                         [pscustomobject]@{ Name=$installed[$pkg]; Pkg=$pkg; Favorite=$false; BuiltIn=$false }
                     }
                 }
-            }
-        )
+            )
+            $all | Sort-Object Name, Pkg
+        }
         $preferredIndex = -1
         $lb.BeginUpdate(); $lb.Items.Clear(); $shown.Clear()
-        foreach ($entry in ($entries | Sort-Object Name, Pkg)) {
+        foreach ($entry in $entries) {
             $phoneName = [string]$installed[$entry.Pkg]
             if ($query -and $entry.Name.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
                 $entry.Pkg.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
@@ -3454,6 +3524,9 @@ function Show-AppPicker {
         $hasApps = $shown.Count -gt 0
         if ($hasApps -and -not $ClearSelection) { $lb.SelectedIndex = [Math]::Max(0, $preferredIndex) }
         $lblEmpty.Visible = -not $hasApps
+        $lblSortHint.Visible = $chkFavorites.Checked
+        $lblStatus.Text = $appList.Current.Status
+        if ($tt) { $tt.SetToolTip($lblStatus, $appList.Current.Detail) }
         & $syncButtons
     }
     & $fill
@@ -3463,6 +3536,17 @@ function Show-AppPicker {
         & $fill $current.Name $current.Pkg
     })
     $lb.Add_SelectedIndexChanged($syncButtons)
+    $btnRefresh.Add_Click({
+        if (-not $btnRefresh.Enabled) { return }
+        $current = if ($lb.SelectedIndex -ge 0) { $shown[$lb.SelectedIndex] }
+        $btnRefresh.Enabled = $false
+        try {
+            $hadPhoneApps = $appList.Current.Apps.Count -gt 0
+            $appList.Current = Read-PhoneAppList $dlg $serial -Refresh
+            if (-not $hadPhoneApps -and $appList.Current.Apps.Count -gt 0) { $chkFavorites.Checked = $false }
+            & $fill $current.Name $current.Pkg
+        } finally { $btnRefresh.Enabled = $true }
+    })
 
     $btnFavorite.Add_Click({
         if (-not $btnFavorite.Enabled) { return }
@@ -3474,7 +3558,10 @@ function Show-AppPicker {
         if (-not $btnRemove.Enabled) { return }
         $entry = $shown[$lb.SelectedIndex]
         if ($entry.BuiltIn) { $script:hiddenBuiltInApps[$entry.Pkg] = $true }
-        else { $script:customApps.Remove($entry.Name) }
+        else {
+            $script:customApps.Remove($entry.Name)
+            [void]$script:appFavoriteOrder.Remove($entry.Id)
+        }
         Save-Settings
         $result.FavoritesChanged = $true
         # 要先选中下一项再移除，避免连点时误删相邻的收藏。
@@ -3494,6 +3581,62 @@ function Show-AppPicker {
         if ($added) { $result.FavoritesChanged = $true; & $fill $added $pkg }
     })
 
+    $dragFormat = 'ScrcpyHelper.AppFavorite'
+    $drag = @{ Start=$null; Source=$null; Index=-1 }
+    $lb.Add_MouseDown({
+        param($sender, $eventArgs)
+        $drag.Source = $null
+        if (-not $chkFavorites.Checked -or $eventArgs.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+        $index = $sender.IndexFromPoint($eventArgs.Location)
+        if ($index -lt 0) { return }
+        $drag.Start = $eventArgs.Location
+        $drag.Source = $shown[$index].Id
+        $drag.Index = $index
+    })
+    $lb.Add_MouseMove({
+        param($sender, $eventArgs)
+        if (-not $drag.Source -or $eventArgs.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+        $threshold = [System.Windows.Forms.SystemInformation]::DragSize
+        if ([Math]::Abs($eventArgs.X - $drag.Start.X) -lt $threshold.Width / 2 -and
+            [Math]::Abs($eventArgs.Y - $drag.Start.Y) -lt $threshold.Height / 2) { return }
+
+        $data = New-Object System.Windows.Forms.DataObject
+        $data.SetData($dragFormat, $false, $drag.Source)
+        $drag.Source = $null
+        $effect = $sender.DoDragDrop($data, [System.Windows.Forms.DragDropEffects]::Move)
+        if ($effect -eq [System.Windows.Forms.DragDropEffects]::None -and $drag.Index -lt $shown.Count) {
+            $sender.SelectedIndex = $drag.Index
+        }
+    })
+    $getDropIndex = {
+        param($sender, $eventArgs)
+        if (-not $chkFavorites.Checked -or -not $eventArgs.Data.GetDataPresent($dragFormat, $false)) { return -1 }
+        $point = $sender.PointToClient([System.Drawing.Point]::new($eventArgs.X, $eventArgs.Y))
+        return $sender.IndexFromPoint($point)
+    }
+    $showDrop = {
+        param($sender, $eventArgs)
+        $index = & $getDropIndex $sender $eventArgs
+        $eventArgs.Effect = [System.Windows.Forms.DragDropEffects]::None
+        if ($index -ge 0) {
+            $eventArgs.Effect = [System.Windows.Forms.DragDropEffects]::Move
+            $sender.SelectedIndex = $index
+        }
+    }
+    $lb.Add_DragEnter($showDrop)
+    $lb.Add_DragOver($showDrop)
+    $lb.Add_DragDrop({
+        param($sender, $eventArgs)
+        $index = & $getDropIndex $sender $eventArgs
+        if ($index -lt 0) { return }
+        $sourceId = [string]$eventArgs.Data.GetData($dragFormat, $false)
+        $source = $shown | Where-Object { $_.Id -ceq $sourceId } | Select-Object -First 1
+        if ($source -and (Move-AppFavorite $sourceId $shown[$index].Id)) {
+            $result.FavoritesChanged = $true
+            & $fill $source.Name $source.Pkg
+        }
+    })
+
     $pick = {
         if ($lb.SelectedIndex -lt 0) { return }
         $result.SelectedApp = $shown[$lb.SelectedIndex]
@@ -3507,7 +3650,7 @@ function Show-AppPicker {
         $sender.SelectedIndex = $index
         & $pick
     })
-    $dlg.Controls.AddRange(@($lbl, $txt, $chkFavorites, $lb, $lblEmpty, $btnGo, $btnFavorite, $btnRemove, $btnManual, $btnClose))
+    $dlg.Controls.AddRange(@($lbl, $btnRefresh, $txt, $chkFavorites, $lblSortHint, $lblStatus, $lb, $lblEmpty, $btnGo, $btnFavorite, $btnRemove, $btnManual, $btnClose))
     $lblEmpty.BringToFront()
     $dlg.AcceptButton = $btnGo
     $dlg.CancelButton = $btnClose
@@ -3736,18 +3879,15 @@ function Show-NewDisplay {
         $cb.BeginUpdate()
         $cb.SelectedIndex = -1
         $cb.Items.Clear()
-        foreach ($appMap in @($apps, $script:customApps)) {
-            $builtIn = [object]::ReferenceEquals($appMap, $apps)
-            foreach ($name in $appMap.psbase.Keys) {
-                $pkg = $appMap[$name]
-                if ($builtIn -and $script:hiddenBuiltInApps.ContainsKey($pkg)) { continue }
-                $label = if (-not $builtIn -and $apps.Contains($name)) { "$name ($pkg)" } else { $name }
-                $item = [pscustomobject]@{ Name=$name; Target="+$pkg"; Label=$label; Temporary=$false }
-                $index = $cb.Items.Add($item)
-                if ($item.Target -eq $current.Target) {
-                    if ($matchingTargetIndex -lt 0) { $matchingTargetIndex = $index }
-                    if ($item.Name -eq $current.Name) { $selectedIndex = $index }
-                }
+        foreach ($favorite in @(Get-AppFavorites)) {
+            $name = $favorite.Name
+            $pkg = $favorite.Pkg
+            $label = if (-not $favorite.BuiltIn -and $apps.Contains($name)) { "$name ($pkg)" } else { $name }
+            $item = [pscustomobject]@{ Name=$name; Target="+$pkg"; Label=$label; Temporary=$false }
+            $index = $cb.Items.Add($item)
+            if ($item.Target -eq $current.Target) {
+                if ($matchingTargetIndex -lt 0) { $matchingTargetIndex = $index }
+                if ($item.Name -eq $current.Name) { $selectedIndex = $index }
             }
         }
         if ($selectedIndex -lt 0 -and $current.Temporary) {

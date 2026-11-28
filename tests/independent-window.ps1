@@ -5,7 +5,7 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path (Split-Path $PSScriptRoot) 'scrcpy-helper.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join "`n") }
 foreach ($name in @(
-    'Show-NewDisplay','Show-AppPicker','Add-AppFavorite','Get-NewDisplayArgs','Get-DisplayCompatibilityArgs','Get-HwDecArgs',
+    'Show-NewDisplay','Show-AppPicker','Read-PhoneAppList','Get-AppFavorites','Move-AppFavorite','Add-AppFavorite','Get-NewDisplayArgs','Get-DisplayCompatibilityArgs','Get-HwDecArgs',
     'Get-VideoArgs','Get-ControlArgs','New-Lbl','New-Combo','New-Chk','New-Caption','New-Txt'
 )) {
     $definition = $ast.Find({ param($node)
@@ -24,6 +24,8 @@ function Check($Condition, [string]$Message) {
 $apps = [ordered]@{ 'Test app' = 'com.example.app' }
 $script:customApps = [ordered]@{}
 $script:hiddenBuiltInApps = @{}
+$script:appFavoriteOrder = [Collections.Generic.List[string]]::new()
+$script:phoneAppListCache = @{}
 $cMuted = [Drawing.Color]::Gray
 $cWhite = [Drawing.Color]::White
 $form = @{}
@@ -144,12 +146,14 @@ foreach ($preset in @(
     }
 }
 function Invoke-UiCommand {
-    param($Owner, $Exe, $Options, $StatusText)
+    param($Owner, $Exe, $Options, $StatusText, $TimeoutMs)
     Check (($Options -join '|') -eq '-s|test-device|--list-apps') 'App picker did not list apps from the selected device'
-    if ($fixture.FailedList) { return @{ Started=$false; Error='Device offline' } }
+    Check ($TimeoutMs -eq 60000) 'Phone app discovery did not use its own timeout'
+    $fixture.PhoneQueries++
+    if ($fixture.FailedList) { return @{ Started=$true; TimedOut=$true; Error='Timed out' } }
     return @{ Started=$true; Stdout=" - Test app com.example.second`n - Another app com.example.third"; Stderr='' }
 }
-function Test-CommandSuccess($Result) { return $Result.Started }
+function Test-CommandSuccess($Result) { return ($Result.Started -and -not $Result.TimedOut) }
 function Get-CommandDetail($Result) { return $Result.Error }
 function Show-InputDialog { return $fixture.Inputs.Dequeue() }
 
@@ -169,7 +173,9 @@ $fixture = @{
             Check ($appsCombo.SelectedItem.Target -ceq '+com.example.app') 'Adding a favorite changed the selected app'
             Check ($appsCombo.Items.Target -ccontains '+com.example.third') 'The newly added favorite did not appear in the app dropdown'
             & $more.Action
-            Check ($fixture.Starts -eq 0 -and $fixture.Saves -eq 1) 'Selecting an app launched or saved it prematurely'
+            Check ($fixture.Starts -eq 0 -and $fixture.Saves -eq 2) 'Selecting an app launched it or did not save the order'
+            Check ($fixture.PhoneQueries -eq 1) 'Reopening More apps did not reuse the device list'
+            Check (($appsCombo.Items.Target -join '|') -ceq '+com.example.third|+com.example.app|+com.example.second') 'The dropdown did not show the same favorite order as the picker'
             Check ($appsCombo.SelectedItem.Target -ceq '+com.example.second') 'Selecting an installed app lost its package'
             Check ($appsCombo.GetItemText($appsCombo.SelectedItem) -ceq 'Test app (com.example.second)') 'Same-name apps were not distinguished in the dropdown'
             & $window.AcceptButton.Action
@@ -194,12 +200,28 @@ $fixture = @{
             }
             $search.Text = 'com.example.third'
             Check ($favorite.Text -ceq '已在常用' -and -not $favorite.Enabled -and $picker.AcceptButton.Enabled) 'A saved app could not still be selected on reopening'
+            $search.Text = ''
+            $filter = $picker.Controls | Where-Object { $_ -is [Windows.Forms.CheckBox] }
+            $list = $picker.Controls | Where-Object { $_ -is [Windows.Forms.ListBox] }
+            $filter.Checked = $true
+            Check ($list.Items[0] -like '*com.example.app') 'Favorites did not start in the default order'
+            $data = [Windows.Forms.DataObject]::new()
+            $data.SetData('ScrcpyHelper.AppFavorite', $false, 'custom:Another app')
+            $point = $list.PointToScreen([Drawing.Point]::new(6, 6))
+            $eventArgs = [Windows.Forms.DragEventArgs]::new($data, 0, $point.X, $point.Y, [Windows.Forms.DragDropEffects]::Move, [Windows.Forms.DragDropEffects]::None)
+            $enter = $list.GetType().GetMethod('OnDragEnter', [Reflection.BindingFlags]'Instance,NonPublic')
+            [void]$enter.Invoke($list, @($eventArgs))
+            Check ($eventArgs.Effect -eq [Windows.Forms.DragDropEffects]::Move) 'Favorites did not accept a drag over an app row'
+            $drop = $list.GetType().GetMethod('OnDragDrop', [Reflection.BindingFlags]'Instance,NonPublic')
+            [void]$drop.Invoke($list, @($eventArgs))
+            Check ($list.Items[0] -like '*com.example.third' -and ($script:appFavoriteOrder -join '|') -ceq 'custom:Another app|builtin:com.example.app') 'Dragging did not reorder and save favorites'
+            $filter.Checked = $false
             $search.Text = 'com.example.second'
             Check ($picker.AcceptButton.Enabled) 'Package-name search did not find the matching app'
             & $picker.AcceptButton.Action
         }
     }
-    Visits=0
+    Visits=0; PhoneQueries=0
 }
 try {
     & $click
@@ -211,10 +233,12 @@ try {
 }
 
 $script:customApps.Clear()
+$script:appFavoriteOrder.Clear()
+$script:phoneAppListCache.Clear()
 $script:customApps['Keys'] = 'com.example.saved'
 $script:customApps['To remove'] = 'com.example.fourth'
 $fixture = @{
-    Scans=0; Pickers=0; Starts=0; Saves=0; FailedList=$false; BuiltInAction=''
+    Scans=0; Pickers=0; Starts=0; Saves=0; FailedList=$false; BuiltInAction=''; PhoneQueries=0
     Inputs=[Collections.Queue]::new()
     DialogActions=@{
         '独立窗口' = {
@@ -226,9 +250,10 @@ $fixture = @{
             & $more.Action
             Check ($appsCombo.SelectedItem.Target -ceq '+com.example.saved') 'Managing favorites changed the selected app'
             Check ($appsCombo.Items.Target -cnotcontains '+com.example.fourth') 'The removed favorite stayed in the dropdown'
+            $script:phoneAppListCache.Clear()
             $fixture.FailedList = $true
             & $more.Action
-            Check ($fixture.Heading -ceq '读取手机应用列表失败') 'Phone app query failure was not reported'
+            Check ($fixture.PhoneQueries -eq 4) 'The app picker did not retry both fresh and cached requests'
             $fixture.FailedList = $false
             $fixture.BuiltInAction = 'remove'
             & $more.Action
@@ -256,6 +281,15 @@ $fixture = @{
             Check ($filter.Text -ceq '只看常用') 'More apps did not offer a favorites filter'
             if ($fixture.FailedList) {
                 Check ($filter.Checked -and $list.Items.Count -eq 2) 'Query failure hid saved or built-in favorites'
+                Check ($picker.Controls.Text -ccontains '读取手机应用列表超时。') 'The timeout was not reported within More apps'
+                $refresh = $picker.Controls | Where-Object { $_.Text -ceq '刷新应用列表' }
+                $search.Text = 'com.example.second'
+                $fixture.FailedList = $false
+                & $refresh.Action
+                Check (-not $filter.Checked -and $list.Items.Count -eq 1 -and $search.Text -ceq 'com.example.second') 'Retry did not restore matching phone apps'
+                $fixture.FailedList = $true
+                & $refresh.Action
+                Check ($list.Items.Count -eq 1 -and $picker.Controls.Text -ccontains '读取手机应用列表超时。') 'A failed refresh discarded the last good device list'
                 return
             }
             if ($fixture.BuiltInAction -eq 'empty') {
