@@ -1,10 +1,12 @@
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path (Split-Path $PSScriptRoot) 'scrcpy-helper.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join [Environment]::NewLine) }
 foreach ($name in @('Resume-CameraSession','Read-CamZoom','Start-CamProc','Start-Scrcpy',
-        'Test-SettingsZoom','Split-WindowsArguments','Fm-WinArg','Remove-CamSession','Format-Zoom')) {
+        'Test-SettingsZoom','Split-WindowsArguments','Fm-WinArg','Remove-CamSession','Format-Zoom',
+        'New-SegSwitch','Enable-DoubleBuffer','New-Lbl','New-Caption','New-Combo','New-Chk','Get-CamRemembered','Get-CamZoom')) {
     $definition = $ast.Find({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true)
@@ -115,3 +117,69 @@ try {
 }
 
 Write-Host 'Camera reconnect zoom regression passed.'
+
+function Invoke-MainFlow {
+    param([scriptblock]$Body, $Source, [switch]$WithDevices)
+    & $Body @('test-camera')
+}
+function Resolve-TargetForFeature { return 'test-camera' }
+function Get-CameraSizes {
+    return @{
+        back=@('1920x1080', '1600x900'); front=@('1280x720', '960x540')
+        zoom=@{ back=@(1, 8); front=@(1.5, 3) }
+    }
+}
+function Set-CardStyle {}
+function New-PrimaryBtn { return [Windows.Forms.Button]::new() }
+function New-Dialog {
+    $dialog = [pscustomobject]@{ AcceptButton=$null; Controls=$cameraDialog.Controls }
+    $dialog | Add-Member ScriptMethod ShowDialog { return [Windows.Forms.DialogResult]::Cancel }
+    return $dialog
+}
+function New-EscCancel {
+    # Exercise the real WinForms handler without showing a modal window or opening scrcpy.
+    Assert-CameraControls @('1920x1080', '1600x900') '1600x900' 1 8 4
+    $onMouseClick = [Windows.Forms.Control].GetMethod('OnMouseClick', [Reflection.BindingFlags]'Instance,NonPublic')
+    $frontClick = [Windows.Forms.MouseEventArgs]::new('Left', 1, $segFacing.Width - 1, 1, 0)
+    $onMouseClick.Invoke($segFacing, @($frontClick))
+    Check ($camState.Facing -ceq 'front') 'Camera selection did not change to front'
+    Assert-CameraControls @('1280x720', '960x540') '960x540' 1.5 3 2
+
+    $backClick = [Windows.Forms.MouseEventArgs]::new('Left', 1, 1, 1, 0)
+    $onMouseClick.Invoke($segFacing, @($backClick))
+    Check ($camState.Facing -ceq 'back') 'Camera selection did not change back to rear'
+    Assert-CameraControls @('1920x1080', '1600x900') '1600x900' 1 8 4
+    $cameraDialog.Tag = $true
+}
+function Assert-CameraControls($Sizes, $Selected, $MinZoom, $MaxZoom, $Zoom) {
+    Check (($cbRes.Items -join '|') -ceq ($Sizes -join '|')) 'Camera resolution choices did not follow the lens'
+    Check ($cbRes.Vals[$cbRes.SelectedIndex] -ceq $Selected) 'Camera resolution did not restore the lens preference'
+    Check ($nudZoom.Minimum -eq $MinZoom -and $nudZoom.Maximum -eq $MaxZoom) 'Camera zoom bounds did not follow the lens'
+    Check ($nudZoom.Value -eq $Zoom) 'Camera zoom did not restore the lens preference'
+}
+
+$cameraClick = $ast.Find({ param($node)
+    $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
+    $node.Member.Value -eq 'Add_Click' -and $node.Expression.VariablePath.UserPath -eq 'btnCamera'
+}, $true).Arguments[0].ScriptBlock.GetScriptBlock()
+$settings.camFacing = 'back'
+$script:camResByDevice = @{
+    'test-camera|back'='1600x900'; 'test-camera|front'='960x540'
+    'test-camera|back|zoom'='4'; 'test-camera|front|zoom'='2'
+}
+$cWhite = [Drawing.Color]::White
+$cSoft = $cLine = [Drawing.Color]::LightGray
+$cText2 = $cMuted = [Drawing.Color]::Gray
+$form = [Windows.Forms.Form]::new()
+$cameraDialog = [Windows.Forms.Form]::new()
+$tt = [Windows.Forms.ToolTip]::new()
+try {
+    & $cameraClick
+    Check ($cameraDialog.Tag -eq $true) 'Camera dialog did not exercise lens switching'
+} finally {
+    $tt.Dispose()
+    $cameraDialog.Dispose()
+    $form.Dispose()
+}
+
+Write-Host 'Camera lens switching regression passed.'

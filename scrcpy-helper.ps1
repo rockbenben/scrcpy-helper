@@ -7368,19 +7368,6 @@ try {
             Orient = $(if ($settings.camOrientation -eq 'port') { 'port' } else { 'land' })
         }
 
-        $cardCam = New-Object System.Windows.Forms.Panel
-        $cardCam.Location = New-Object System.Drawing.Point(16, 12); $cardCam.Size = New-Object System.Drawing.Size(284, 72)
-        Set-CardStyle $cardCam 10 $cWhite $cLine
-        $lCam = New-Lbl '摄像头' 12 10; $lCam.ForeColor = $cText2; $lCam.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
-        $lVer = New-Caption 'Android 12+' 206 11
-        $segFacing = New-SegSwitch @('后置镜头', '前置镜头') @('back', 'front') $camState.Facing 12 33 260 30 ({
-            param($val)
-            $camState.Facing = [string]$val
-            & $fillRes $camState.Facing
-            & $fillZoom $camState.Facing
-        }.GetNewClosure())
-        $cardCam.Controls.AddRange(@($lCam, $lVer, $segFacing))
-
         $cardOrient = New-Object System.Windows.Forms.Panel
         $cardOrient.Location = New-Object System.Drawing.Point(16, 94); $cardOrient.Size = New-Object System.Drawing.Size(284, 98)
         Set-CardStyle $cardOrient 10 $cWhite $cLine
@@ -7445,6 +7432,20 @@ try {
             if ($v -lt $lo) { $v = $lo }; if ($v -gt $hi) { $v = $hi }
             $nudZoom.Value = $v
         }
+
+        $cardCam = New-Object System.Windows.Forms.Panel
+        $cardCam.Location = New-Object System.Drawing.Point(16, 12); $cardCam.Size = New-Object System.Drawing.Size(284, 72)
+        Set-CardStyle $cardCam 10 $cWhite $cLine
+        $lCam = New-Lbl '摄像头' 12 10; $lCam.ForeColor = $cText2; $lCam.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
+        $lVer = New-Caption 'Android 12+' 206 11
+        # GetNewClosure 会捕获当时的变量值，先定义刷新函数才能让切换镜头时调用它们。
+        $segFacing = New-SegSwitch @('后置镜头', '前置镜头') @('back', 'front') $camState.Facing 12 33 260 30 ({
+            param($val)
+            $camState.Facing = [string]$val
+            & $fillRes $camState.Facing
+            & $fillZoom $camState.Facing
+        }.GetNewClosure())
+        $cardCam.Controls.AddRange(@($lCam, $lVer, $segFacing))
         & $fillRes $camState.Facing
         & $fillZoom $camState.Facing
 
