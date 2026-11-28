@@ -5,7 +5,8 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Join-Path (Split-Path $PSScriptRoot) 'scrcpy-helper.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join "`n") }
 foreach ($name in @(
-    'Show-NewDisplay','Show-AppPicker','Read-PhoneAppList','Get-AppFavorites','Move-AppFavorite','Add-AppFavorite','Get-NewDisplayArgs','Get-DisplayCompatibilityArgs','Get-HwDecArgs',
+    'Show-NewDisplay','Show-AppPicker','Read-PhoneAppList','Get-AppFavorites','Move-AppFavorite','Add-AppFavorite','Remove-AppFavorite',
+    'Get-AppPickerEntries','Get-AppPickerEntryAtIndex','Get-AppPickerSelectionIndex','Get-NewDisplayArgs','Get-DisplayCompatibilityArgs','Get-HwDecArgs',
     'Get-VideoArgs','Get-ControlArgs','New-Lbl','New-Combo','New-Chk','New-Caption','New-Txt',
     'Invoke-UiCommand','Invoke-ShortCommand'
 )) {
@@ -162,7 +163,7 @@ function Invoke-UiCommand {
     Check ($TimeoutMs -eq 60000) 'Phone app discovery did not use its own timeout'
     $fixture.PhoneQueries++
     if ($fixture.FailedList) { return @{ Started=$true; TimedOut=$true; Error='Timed out' } }
-    return @{ Started=$true; Stdout=" - Test app com.example.second`n - Another app com.example.third"; Stderr='' }
+    return @{ Started=$true; Stdout=" - Test app com.example.second`n - Another app com.example.third`n - Phone label com.example.app"; Stderr='' }
 }
 function Test-CommandSuccess($Result) { return ($Result.Started -and -not $Result.TimedOut) }
 function Get-CommandDetail($Result) { return $Result.Error }
@@ -197,8 +198,11 @@ $fixture = @{
             if ($fixture.Visits -eq 1) { return }
             $search = $picker.Controls | Where-Object { $_ -is [Windows.Forms.TextBox] }
             $favorite = $picker.Controls | Where-Object { $_.Text -cin @('加入常用','已在常用') }
+            $list = $picker.Controls | Where-Object { $_ -is [Windows.Forms.ListBox] }
             $search.Text = '['
             Check (-not $picker.AcceptButton.Enabled -and -not $favorite.Enabled) 'An unmatched search allowed selection or saving'
+            $search.Text = '  pHoNe LaBeL  '
+            Check ($list.Items.Count -eq 1 -and $list.SelectedItem -like 'Test app*com.example.app' -and -not $favorite.Enabled) 'Searching for the phone label did not find the single built-in row'
             if ($fixture.Visits -eq 2) {
                 $search.Text = 'com.example.third'
                 Check $favorite.Enabled 'A new app could not be added from More apps'
@@ -213,7 +217,6 @@ $fixture = @{
             Check ($favorite.Text -ceq '已在常用' -and -not $favorite.Enabled -and $picker.AcceptButton.Enabled) 'A saved app could not still be selected on reopening'
             $search.Text = ''
             $filter = $picker.Controls | Where-Object { $_ -is [Windows.Forms.CheckBox] }
-            $list = $picker.Controls | Where-Object { $_ -is [Windows.Forms.ListBox] }
             $filter.Checked = $true
             Check ($list.Items[0] -like '*com.example.app') 'Favorites did not start in the default order'
             $data = [Windows.Forms.DataObject]::new()
@@ -226,7 +229,10 @@ $fixture = @{
             $drop = $list.GetType().GetMethod('OnDragDrop', [Reflection.BindingFlags]'Instance,NonPublic')
             [void]$drop.Invoke($list, @($eventArgs))
             Check ($list.Items[0] -like '*com.example.third' -and ($script:appFavoriteOrder -join '|') -ceq 'custom:Another app|builtin:com.example.app') 'Dragging did not reorder and save favorites'
+            Check ($list.SelectedItem -like '*com.example.third') 'Dragging did not keep the moved favorite selected'
+            $list.SelectedIndex = 1
             $filter.Checked = $false
+            Check ($list.SelectedItem -like '*com.example.app') 'Changing the filter did not keep the selected app'
             $search.Text = 'com.example.second'
             Check ($picker.AcceptButton.Enabled) 'Package-name search did not find the matching app'
             & $picker.AcceptButton.Action
@@ -366,7 +372,8 @@ $fixture = @{
             & $manualAdd.Action
             Check ($fixture.Saves -eq 3 -and $fixture.Heading -ceq '这个应用已在常用列表中') 'A favorite named Values bypassed package deduplication'
             & $remove.Action
-            Check (-not $script:customApps.Contains('Values') -and $fixture.Saves -eq 4 -and -not $remove.Enabled) 'Removal did not clear the selection or update favorites'
+            Check (-not $script:customApps.Contains('Values') -and $fixture.Saves -eq 4) 'Removal did not update favorites'
+            Check ($list.Items.Count -gt 0 -and $list.SelectedIndex -eq -1 -and -not $remove.Enabled -and -not $picker.AcceptButton.Enabled) 'Removal selected a neighboring favorite'
             $search.Text = 'com.example.fourth'
             Check ($remove.Enabled) 'A saved app missing from the phone list could not be removed'
             & $remove.Action

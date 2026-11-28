@@ -3389,23 +3389,21 @@ function Move-AppFavorite {
 }
 
 function Add-AppFavorite {
-    param($owner, [string]$name, [string]$pkg, [switch]$FromPhone)
+    param([string]$name, [string]$pkg, [switch]$FromPhone)
     $builtInName = foreach ($key in $apps.psbase.Keys) {
         if ($apps[$key] -eq $pkg) { $key; break }
     }
     if (($builtInName -and -not $script:hiddenBuiltInApps.ContainsKey($pkg)) -or $script:customApps.psbase.Values -contains $pkg) {
-        [void](Show-ResultDialog $owner '更多应用' '这个应用已在常用列表中' $pkg '' @('ok'))
-        return
+        return @{ Error='AlreadyFavorite' }
     }
     if ($builtInName) {
         $script:hiddenBuiltInApps.Remove($pkg)
         Save-Settings
-        return $builtInName
+        return @{ Name=$builtInName }
     }
     if ($apps.Contains($name) -or $script:customApps.Contains($name)) {
         if (-not $FromPhone) {
-            [void](Show-ResultDialog $owner '更多应用' '这个显示名称已被使用' '请用其他名称添加该应用。' '' @('ok'))
-            return
+            return @{ Error='NameInUse' }
         }
         # 手机上的不同应用可以同名，用包名区分，避免覆盖已有条目。
         $name = "$name ($pkg)"
@@ -3413,7 +3411,17 @@ function Add-AppFavorite {
     }
     $script:customApps[$name] = $pkg
     Save-Settings
-    return $name
+    return @{ Name=$name }
+}
+
+function Remove-AppFavorite {
+    param($entry)
+    if ($entry.BuiltIn) { $script:hiddenBuiltInApps[$entry.Pkg] = $true }
+    else {
+        $script:customApps.Remove($entry.Name)
+        [void]$script:appFavoriteOrder.Remove($entry.Id)
+    }
+    Save-Settings
 }
 
 function Read-PhoneAppList {
@@ -3449,6 +3457,56 @@ function Read-PhoneAppList {
 }
 
 # ---------------- 从手机已装 App 和常用应用里挑一个（可搜索） ----------------
+function Get-AppPickerEntries {
+    param($installed, $builtInApps, $favorites, [string]$query, [switch]$FavoritesOnly)
+    $query = $query.Trim()
+    $entries = if ($FavoritesOnly) { $favorites } else {
+        $listedPackages = @{}
+        $all = @(
+            foreach ($entry in $favorites) {
+                $listedPackages[$entry.Pkg] = $true
+                $entry
+            }
+            foreach ($name in $builtInApps.psbase.Keys) {
+                $pkg = $builtInApps[$name]
+                if (-not $listedPackages.ContainsKey($pkg)) {
+                    $listedPackages[$pkg] = $true
+                    [pscustomobject]@{ Name=$name; Pkg=$pkg; Favorite=$false; BuiltIn=$true }
+                }
+            }
+            foreach ($pkg in $installed.psbase.Keys) {
+                if (-not $listedPackages.ContainsKey($pkg)) {
+                    [pscustomobject]@{ Name=$installed[$pkg]; Pkg=$pkg; Favorite=$false; BuiltIn=$false }
+                }
+            }
+        )
+        $all | Sort-Object Name, Pkg
+    }
+    return @(
+        foreach ($entry in $entries) {
+            $phoneName = [string]$installed[$entry.Pkg]
+            if (-not $query -or $entry.Name.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                $entry.Pkg.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                $phoneName.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $entry }
+        }
+    )
+}
+
+function Get-AppPickerEntryAtIndex {
+    param($entries, [int]$index)
+    if ($index -ge 0 -and $index -lt $entries.Count) { return $entries[$index] }
+}
+
+function Get-AppPickerSelectionIndex {
+    param($entries, [string]$preferredName, [string]$preferredPackage, [switch]$ClearSelection)
+    if ($ClearSelection -or $entries.Count -eq 0) { return -1 }
+    for ($index = $entries.Count - 1; $index -ge 0; $index--) {
+        $entry = $entries[$index]
+        if ($entry.Name -eq $preferredName -and $entry.Pkg -eq $preferredPackage) { return $index }
+    }
+    return 0
+}
+
 function Show-AppPicker {
     param($owner, $serial)
     $appList = @{ Current=(Read-PhoneAppList $owner $serial) }
@@ -3476,7 +3534,7 @@ function Show-AppPicker {
     $result = @{ SelectedApp=$null; FavoritesChanged=$false }
 
     $syncButtons = {
-        $selectedApp = if ($lb.SelectedIndex -ge 0 -and $lb.SelectedIndex -lt $shown.Count) { $shown[$lb.SelectedIndex] }
+        $selectedApp = Get-AppPickerEntryAtIndex $shown $lb.SelectedIndex
         $btnGo.Enabled = $null -ne $selectedApp
         $btnFavorite.Enabled = $btnGo.Enabled -and -not $selectedApp.Favorite
         $btnFavorite.Text = if ($selectedApp.Favorite) { '已在常用' } else { '加入常用' }
@@ -3484,46 +3542,17 @@ function Show-AppPicker {
     }
     $fill = {
         param([string]$preferredName, [string]$preferredPackage, [switch]$ClearSelection)
-        $query = $txt.Text.Trim()
-        $installed = $appList.Current.Apps
         $favorites = @(Get-AppFavorites)
-        $entries = if ($chkFavorites.Checked) { $favorites } else {
-            $listedPackages = @{}
-            $all = @(
-                foreach ($entry in $favorites) {
-                    $listedPackages[$entry.Pkg] = $true
-                    $entry
-                }
-                foreach ($name in $apps.psbase.Keys) {
-                    $pkg = $apps[$name]
-                    if (-not $listedPackages.ContainsKey($pkg)) {
-                        $listedPackages[$pkg] = $true
-                        [pscustomobject]@{ Name=$name; Pkg=$pkg; Favorite=$false; BuiltIn=$true }
-                    }
-                }
-                foreach ($pkg in $installed.psbase.Keys) {
-                    if (-not $listedPackages.ContainsKey($pkg)) {
-                        [pscustomobject]@{ Name=$installed[$pkg]; Pkg=$pkg; Favorite=$false; BuiltIn=$false }
-                    }
-                }
-            )
-            $all | Sort-Object Name, Pkg
-        }
-        $preferredIndex = -1
+        $entries = @(Get-AppPickerEntries $appList.Current.Apps $apps $favorites $txt.Text -FavoritesOnly:$chkFavorites.Checked)
         $lb.BeginUpdate(); $lb.Items.Clear(); $shown.Clear()
         foreach ($entry in $entries) {
-            $phoneName = [string]$installed[$entry.Pkg]
-            if ($query -and $entry.Name.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
-                $entry.Pkg.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
-                $phoneName.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
-            $index = $lb.Items.Add("$($entry.Name)   ·   $($entry.Pkg)")
+            [void]$lb.Items.Add("$($entry.Name)   ·   $($entry.Pkg)")
             [void]$shown.Add($entry)
-            if ($entry.Name -eq $preferredName -and $entry.Pkg -eq $preferredPackage) { $preferredIndex = $index }
         }
         $lb.EndUpdate()
-        $hasApps = $shown.Count -gt 0
-        if ($hasApps -and -not $ClearSelection) { $lb.SelectedIndex = [Math]::Max(0, $preferredIndex) }
-        $lblEmpty.Visible = -not $hasApps
+        $index = Get-AppPickerSelectionIndex $shown $preferredName $preferredPackage -ClearSelection:$ClearSelection
+        if ($index -ge 0) { $lb.SelectedIndex = $index }
+        $lblEmpty.Visible = $shown.Count -eq 0
         $lblSortHint.Visible = $chkFavorites.Checked
         $lblStatus.Text = $appList.Current.Status
         if ($tt) { $tt.SetToolTip($lblStatus, $appList.Current.Detail) }
@@ -3532,13 +3561,13 @@ function Show-AppPicker {
     & $fill
     $txt.Add_TextChanged({ & $fill })
     $chkFavorites.Add_CheckedChanged({
-        $current = if ($lb.SelectedIndex -ge 0) { $shown[$lb.SelectedIndex] }
+        $current = Get-AppPickerEntryAtIndex $shown $lb.SelectedIndex
         & $fill $current.Name $current.Pkg
     })
     $lb.Add_SelectedIndexChanged($syncButtons)
     $btnRefresh.Add_Click({
         if (-not $btnRefresh.Enabled) { return }
-        $current = if ($lb.SelectedIndex -ge 0) { $shown[$lb.SelectedIndex] }
+        $current = Get-AppPickerEntryAtIndex $shown $lb.SelectedIndex
         $btnRefresh.Enabled = $false
         try {
             $appList.Current = Read-PhoneAppList $dlg $serial -Refresh
@@ -3546,21 +3575,31 @@ function Show-AppPicker {
         } finally { $btnRefresh.Enabled = $true }
     })
 
+    $addFavorite = {
+        param([string]$name, [string]$pkg, [switch]$FromPhone)
+        $added = Add-AppFavorite $name $pkg -FromPhone:$FromPhone
+        switch ($added.Error) {
+            'AlreadyFavorite' {
+                [void](Show-ResultDialog $dlg '更多应用' '这个应用已在常用列表中' $pkg '' @('ok'))
+                return
+            }
+            'NameInUse' {
+                [void](Show-ResultDialog $dlg '更多应用' '这个显示名称已被使用' '请用其他名称添加该应用。' '' @('ok'))
+                return
+            }
+        }
+        $result.FavoritesChanged = $true
+        & $fill $added.Name $pkg
+    }
     $btnFavorite.Add_Click({
         if (-not $btnFavorite.Enabled) { return }
-        $entry = $shown[$lb.SelectedIndex]
-        $added = Add-AppFavorite $dlg $entry.Name $entry.Pkg -FromPhone
-        if ($added) { $result.FavoritesChanged = $true; & $fill $added $entry.Pkg }
+        $entry = Get-AppPickerEntryAtIndex $shown $lb.SelectedIndex
+        & $addFavorite $entry.Name $entry.Pkg -FromPhone
     })
     $btnRemove.Add_Click({
         if (-not $btnRemove.Enabled) { return }
-        $entry = $shown[$lb.SelectedIndex]
-        if ($entry.BuiltIn) { $script:hiddenBuiltInApps[$entry.Pkg] = $true }
-        else {
-            $script:customApps.Remove($entry.Name)
-            [void]$script:appFavoriteOrder.Remove($entry.Id)
-        }
-        Save-Settings
+        $entry = Get-AppPickerEntryAtIndex $shown $lb.SelectedIndex
+        Remove-AppFavorite $entry
         $result.FavoritesChanged = $true
         # 要先选中下一项再移除，避免连点时误删相邻的收藏。
         & $fill -ClearSelection
@@ -3575,8 +3614,7 @@ function Show-AppPicker {
             [void](Show-ResultDialog $dlg '手动添加' '请输入有效的包名' '例如 com.ss.android.lark。' '' @('ok'))
             return
         }
-        $added = Add-AppFavorite $dlg $name.Trim() $pkg
-        if ($added) { $result.FavoritesChanged = $true; & $fill $added $pkg }
+        & $addFavorite $name.Trim() $pkg
     })
 
     $dragFormat = 'ScrcpyHelper.AppFavorite'
@@ -3636,8 +3674,9 @@ function Show-AppPicker {
     })
 
     $pick = {
-        if ($lb.SelectedIndex -lt 0) { return }
-        $result.SelectedApp = $shown[$lb.SelectedIndex]
+        $entry = Get-AppPickerEntryAtIndex $shown $lb.SelectedIndex
+        if (-not $entry) { return }
+        $result.SelectedApp = $entry
         $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
     }
     $btnGo.Add_Click($pick)
